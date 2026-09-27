@@ -283,9 +283,7 @@ class RequestIdentitySnapshot:
         }
 
     def canonical_turn_metadata(self) -> str:
-        return json.dumps(
-            self.turn_metadata(), ensure_ascii=True, separators=(",", ":")
-        )
+        return json.dumps(self.turn_metadata(), ensure_ascii=True, separators=(",", ":"))
 
     def with_turn_state(self, value: str | None) -> "RequestIdentitySnapshot":
         return replace(self, turn_state=(str(value).strip() if value else None))
