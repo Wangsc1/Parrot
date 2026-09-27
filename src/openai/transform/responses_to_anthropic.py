@@ -571,6 +571,16 @@ def translate_response(
     from ... import search_hosted_codec
     hosted = search_hosted_codec.anthropic_to_responses(message.get("content") or [])
     chat_obj = chat_to_anthropic.translate_response(message, model=model)
+    # The Chat bridge deliberately omits Anthropic thinking. Restore only the
+    # readable text for Responses' existing summary bridge (including its drop
+    # policy); signatures/redacted blocks are not OpenAI encrypted_content.
+    thinking = "".join(
+        block["thinking"] for block in message.get("content") or []
+        if isinstance(block, dict) and block.get("type") == "thinking"
+        and isinstance(block.get("thinking"), str)
+    )
+    if thinking:
+        chat_obj["choices"][0]["message"]["reasoning_content"] = thinking
     return responses_to_chat.translate_response(
         chat_obj,
         model=model,
