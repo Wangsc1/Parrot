@@ -211,7 +211,10 @@ def test_atomic_100_concurrent_first_create_has_one_uuid(identity_store, m):
     assert len(rows) == 1
 
 
-def test_snapshot_http_ws_parity_no_raw_id_leak_and_official_shapes(identity_store, m):
+@pytest.mark.parametrize("downstream_source", [None, "subagent"])
+def test_snapshot_http_ws_parity_no_raw_id_leak_and_official_shapes(
+    identity_store, m, downstream_source,
+):
     identity = m["identity"]
     account = _account("workspace-a")
     identity.normalize_account_identity(account, protocol_profile=_PROFILE_ID)
@@ -228,10 +231,15 @@ def test_snapshot_http_ws_parity_no_raw_id_leak_and_official_shapes(identity_sto
             "session_id": raw_anchor,
         },
     }
+    downstream_headers = {}
+    if downstream_source is not None:
+        downstream_metadata = json.dumps({"thread_source": downstream_source})
+        downstream_headers["x-codex-turn-metadata"] = downstream_metadata
+        body["client_metadata"]["x-codex-turn-metadata"] = downstream_metadata
     context = identity.resolve_request_identity_context(account, body)
     snapshot = context.snapshot()
-    http_headers, http_body = identity.project_snapshot(snapshot, {}, body)
-    ws_headers, ws_frame = identity.project_snapshot(snapshot, {}, body)
+    http_headers, http_body = identity.project_snapshot(snapshot, downstream_headers, body)
+    ws_headers, ws_frame = identity.project_snapshot(snapshot, downstream_headers, body)
     assert http_headers == ws_headers
     assert http_body == ws_frame
     assert "x-codex-installation-id" not in http_headers
@@ -243,6 +251,8 @@ def test_snapshot_http_ws_parity_no_raw_id_leak_and_official_shapes(identity_sto
     metadata = json.loads(http_headers["x-codex-turn-metadata"])
     nested = json.loads(http_body["client_metadata"]["x-codex-turn-metadata"])
     assert metadata == nested == snapshot.turn_metadata()
+    assert metadata["thread_source"] == "user"
+    assert json.loads(ws_frame["client_metadata"]["x-codex-turn-metadata"])["thread_source"] == "user"
     assert "prompt_cache_key" not in metadata
     wire = json.dumps({"headers": http_headers, "body": http_body})
     for raw in (raw_key, raw_anchor, raw_installation):

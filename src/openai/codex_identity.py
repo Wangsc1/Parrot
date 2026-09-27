@@ -278,6 +278,7 @@ class RequestIdentitySnapshot:
             "window_number": self.window_number,
             "context_window_id": self.context_window_id,
             "request_kind": self.request_kind,
+            "thread_source": "user",
             "turn_started_at_unix_ms": self.turn_started_at_unix_ms,
         }
 
