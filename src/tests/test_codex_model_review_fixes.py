@@ -15,7 +15,7 @@ from src.openai.responses_ws_runtime import build_oauth_responses_ws_frame, map_
 from src.state_store import StateStore
 
 KEY = "openai:models@example.test:workspace-test"
-VERSION = "0.157.0-alpha.10"
+VERSION = "0.159.0"
 
 
 @pytest.fixture
@@ -249,7 +249,7 @@ async def test_whole_query_full_identity_cache_and_semver_are_separate(env, pin)
             codexCliVersion=version, codexProtocolProfile=f"rust-v{version}"))
     channel = await sync(env, [record(minimal_client_version="0.155.0")])
     url, kwargs = env["calls"][-1]
-    assert url.endswith("client_version=" + ("0.153.4" if pin else "0.157.0"))
+    assert url.endswith("client_version=" + version.split("-", 1)[0])
     assert kwargs["headers"]["version"] == version
     assert kwargs["headers"]["user-agent"].startswith(f"codex_cli_rs/{version} ")
     assert not oauth_manager._model_sync_due(oauth_manager.get_account(KEY))
@@ -268,7 +268,11 @@ async def test_whole_query_full_identity_cache_and_semver_are_separate(env, pin)
             await request(channel, "gpt-6-sol")
     else:
         assert (await request(channel, "gpt-6-sol"))[1]["model"] == "gpt-6-sol"
-        assert constants.codex_version_meets_minimum(VERSION, "0.157.0") is False
+        # Keep the old prerelease-vs-stable regression independent of latest.
+        prerelease = "0.157.0-alpha.10"
+        config.update(lambda cfg: cfg["openaiOAuth"].update(codexProfileAutoUpdate=False,
+            codexCliVersion=prerelease, codexProtocolProfile=f"rust-v{prerelease}"))
+        assert constants.codex_version_meets_minimum(prerelease, "0.157.0") is False
         channel = await sync(env, [record(minimal_client_version="0.157.0")])
         with pytest.raises(GuardError, match="below model"):
             await request(channel, "gpt-6-sol")

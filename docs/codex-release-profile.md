@@ -1,25 +1,25 @@
-# Codex 发布档案：rust-v0.157.0-alpha.10
+# Codex 发布档案：rust-v0.159.0
 
-本次按“最新已发布版本（含 alpha）”选择 `0.157.0-alpha.10`，不是 npm stable `0.156.0`，也不是 main 的占位版本。权威 tag commit：`2170d8b3c77883dbe743078fb8bbb017f27caa9c`。
+当前选择正式发布版 `0.159.0`，权威 tag commit：`687a119f0fcaace47e1f1abcc77cec6c813fd6da`。本次解决旧客户端目录缺少 `gpt-6.1-sol` 的问题；只更新发布档案及配套升级契约，不改变下游提示词优先级、转发策略或安装方式。
 
 ## 来源与复核
 
-`src/openai/codex_profiles/rust-v0.157.0-alpha.10.json` 记录模型目录 `codex-rs/models-manager/models.json`、Cargo 版本、请求构建、模型参数解析、metadata 源文件的 SHA-256；每个新档案模型另有规范化源记录 hash 与 instructions 原始 UTF-8 hash。运行时按 hash 校验 instructions。
+`src/openai/codex_profiles/rust-v0.159.0.json` 记录模型目录 `codex-rs/models-manager/models.json`、Cargo 版本、请求构建、模型参数解析、metadata 源文件的 SHA-256；每个新档案模型另有规范化源记录 hash 与 instructions 原始 UTF-8 hash。运行时按 hash 校验 instructions。
 
 使用该 tag 的完整本地源码（不会读取运行配置或联网）：
 
 ```sh
-python3 scripts/codex_release_profile.py /path/to/codex-rust-v0.157.0-alpha.10 --check
+python3 scripts/codex_release_profile.py /path/to/codex-rust-v0.159.0 --check
 ```
 
-脚本逐字节重建并比较 profile 与 11 个 instructions 文件。去掉 `--check` 才会更新仓库档案。源路径和 HEAD 都必须对应该发布版。
+脚本逐字节重建并比较 profile 与 10 个随档案保存的 instructions 文件（保留既有档案结构和兜底策略，不将 CLI 文案变化当作新模型接入前提）。去掉 `--check` 才会更新仓库档案。源路径和 HEAD 都必须对应该发布版。
 
-最新目录的 11 个模型全部逐项提取；旧目录独有的 `gpt-5.4-mini` / `gpt-5.2` 保留 `rust-v0.153.4` 明示基线（来源 tag 与基线文件 hash 单独记录），不冒充最新版目录内容。基线不是账户授权/模型枚举；实际可用名单仍来自认证账户目录。
+发布目录的 10 个模型逐项提取。以此前 `rust-v0.157.0-alpha.10` 档案作为兼容基线：保留被新内置目录移除的 `gpt-5.4`，并保留 `gpt-5.4-mini` / `gpt-5.2` 的原始 `rust-v0.153.4` 来源，不改写旧文件。基线不是账户授权/模型枚举。`gpt-6.1-sol` 不在静态发布目录中，由认证账户目录动态发现、保存能力并路由，无需硬编码名单。
 
 ## 请求行为
 
-- 新增 `gpt-6-sol` / `gpt-6-luna`：最低客户端 `0.155.0`，Lite，默认 `medium` reasoning / `low` verbosity。Sol 支持 `ultra`，Luna 最高 `max`。
-- 11 个模型使用发布目录的 literal `model_messages.instructions_template`，不做已被上游废弃的 personality 插值；Astra instructions 经复核与旧 tag 逐字节相同，其余模型补齐此前缺失的档案 instructions。
+- 模型发现端点、Responses 请求字段、Lite 形状、WS beta 和 reasoning 档位解析不需要为 `gpt-6.1-sol` 新增分支。该模型实时目录提供 Lite、默认 low、low/medium/high/xhigh/max/ultra；具体能力以每个账户的最新目录为准。
+- 保留既有档案的 literal `model_messages.instructions_template` 数据结构，不改注入策略：下游显式 instructions/system、已有 Lite prefix 和 WS continuation 优先；缺省时才执行现有兜底。
 - `ultra` 不是原生 wire effort。最新 profile 启用 `ModelInfo::resolve_reasoning_effort` 的回退策略，按账户目录优先的有效模型能力解析：Astra 为 `xhigh`，缺省 multi-agent effort 的 Sol 等为 `max`（如有效档位不含 max，则取最后一个非 ultra 档位；均无则 medium）。只做请求归一化，不运行多 Agent orchestrator。
 - 账户目录显式 `supportVerbosity=false` 时删除 verbosity，保留 structured output；`supportsReasoningSummaryParameter=false` 时删除 summary。支持 summary 的模型对 `summary=none` 按官方方式省略该字段。旧 pin 中未声明能力仍保持旧透传边界。
 - Lite 继续使用 `additional_tools` + developer instructions prefix、确定性 ID、`reasoning.context=all_turns`，顶层省略 instructions/tools，关闭 parallel tool calls；非 Lite 保留传统形状。下游显式 instructions 与官方已有 prefix/WS continuation 优先。
@@ -28,9 +28,15 @@ python3 scripts/codex_release_profile.py /path/to/codex-rust-v0.157.0-alpha.10 -
 
 ## 升级与 pin
 
-默认配置加载通过 `current.json` 将旧配套版本/profile 迁移并写回。UA/version 保留完整 `0.157.0-alpha.10` 发布身份；`/models?client_version=` 按官方 `whole_client_version()` 使用 `0.157.0`（去 prerelease/build），不是另一种发布身份。已有 installation UUID 和凭证不旋转。显式 `codexProfileAutoUpdate=false` 保留 `0.153.4` / `rust-v0.153.4`；旧 profile 与 instructions 不修改。版本门槛比较遵循 SemVer：alpha 不满足同核正式版，但满足较旧正式版。
+默认配置加载通过 `current.json` 将旧配套版本/profile 迁移并写回。UA/version 与 `/models?client_version=` 在此正式版均使用 `0.159.0`；对于保留的 alpha pin，query 仍按官方 `whole_client_version()` 去除 prerelease/build。已有 installation UUID 和凭证不旋转。显式 `codexProfileAutoUpdate=false` 保留用户选择的配套旧版（包括 `0.153.4` 和 `0.157.0-alpha.10`）；旧 profile 与 instructions 不修改。版本门槛比较遵循 SemVer：alpha 不满足同核正式版，但满足较旧正式版。
 
 只有 OpenAI 模型目录成功同步 TTL 为五分钟；Claude/xAI/Cursor/Antigravity/WorkBuddy 保留六小时。OpenAI 目录 schema 2 保存 query 版本；旧 schema 强制一次完整拉取，避免 ETag/304 永久保留遗漏数据，后续继续条件缓存。失败重试、额度缓存、refresh/revoke 不在本档案变更范围。
+
+源码自更新和 Docker 均携带 `src/openai/codex_profiles/`，更新重启后首次加载持久化新配套版本；无需用户手改 config。版本/profile 与旧同步记录不符时立即判为需刷新，并且不发送旧版本 ETag。同步成功后账户目录、渠道可用名单与模型中心会按现有路径更新。升级测试覆盖新旧配置层、默认/自动跟随/显式 pin、凭证和 installation UUID 保留、仍在 TTL 内的旧缓存刷新，以及远端新模型 HTTP/WS 工具调用请求。
+
+## Ultrafast 与 Ultra
+
+`service_tier="ultrafast"` 是速度/服务档位，不是 `reasoning.effort="ultra"`。Parrot 已解析账户 service_tiers、透传 HTTP/WS 请求及 routing hint，并在模型详情和日志显示 Ultrafast；只有账户目录列出的档位才可选。现有 Fast 强制开关仍表示 `priority`，不擅自改成 Ultrafast。对一个账户只返回 priority 的观察不能推广为其他账户也无 Ultrafast。
 
 ## 请求/发现复核修正
 
@@ -41,8 +47,8 @@ python3 scripts/codex_release_profile.py /path/to/codex-rust-v0.157.0-alpha.10 -
 
 ## 最初调查所列的其他请求面
 
-依据同一已验证 tag 的本地源码，不再次联网选版本：
+以下既有兼容边界继续保留；0.159.0 的数字形式 reasoning effort 可原生透传，新增 response.interrupt 由原生 WS 控制帧路径透传。它们不要求对普通新模型请求添加字段；跨协议/HTTP 回退不能据此宣称支持原生 WS 中断语义：
 
-- **WS prewarm/复用/turn_state**：Parrot 已保留 `generate=false`、previous_response_id delta 和同一 native WS 上的连续 create；已有 turn/owner scoped 的响应 header/event 捕获与回放。这些是代理必须正确保留的协议状态，并非可因“不完整客户端”排除的部分。自动主动预热、跨下游连接建上游池不是最新模型调用的硬门槛，本次不新增。官方 `core/src/client.rs:1381–1413,1931–1971` 明确区分预热、full 与 incremental。
-- **HTTP zstd**：Parrot 当前不主动压缩请求。官方 `core/src/client.rs:1581–1589` 按 enable_request_compression、Codex auth、OpenAI provider 三重条件选择 Zstd/None；这是可关闭的传输优化，不是 Lite 或最新模型的强制 wire 门槛，不伪造 content-encoding 或增依赖。
-- **metadata mcp_attribution**：官方 `core/src/responses_metadata.rs:360–363` 仅在 include_internal 且有 attribution 时写入，并限制 16 KiB。Parrot 没有凭真实 MCP 执行构建 attribution 的产品上下文，不应合成；已有调用方 client_metadata 非身份键在 HTTP/WS 继续透传。缺省无此字段不是最新模型不可调用的证据。
+- **WS prewarm/复用/turn_state**：Parrot 已保留 `generate=false`、previous_response_id delta 和同一 native WS 上的连续 create；已有 turn/owner scoped 的响应 header/event 捕获与回放。这些是代理必须正确保留的协议状态，并非可因“不完整客户端”排除的部分。自动主动预热、跨下游连接建上游池不是最新模型调用的硬门槛，本次不新增。官方 `core/src/client.rs` 明确区分预热、full 与 incremental。
+- **HTTP zstd**：Parrot 当前不主动压缩请求。官方 `core/src/client.rs` 按 enable_request_compression、Codex auth、OpenAI provider 三重条件选择 Zstd/None；这是可关闭的传输优化，不是 Lite 或最新模型的强制 wire 门槛，不伪造 content-encoding 或增依赖。
+- **metadata mcp_attribution**：官方 `core/src/responses_metadata.rs` 仅在 include_internal 且有 attribution 时写入，并限制 16 KiB。Parrot 没有凭真实 MCP 执行构建 attribution 的产品上下文，不应合成；已有调用方 client_metadata 非身份键在 HTTP/WS 继续透传。缺省无此字段不是最新模型不可调用的证据。

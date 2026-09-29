@@ -415,15 +415,21 @@ def test_dependency_restore_reverts_only_own_changes(tmp_path):
 def test_live_request_lease_retains_string_only_caller_and_releases_abandonment(logs):
     from src import drain
     from src.tests.conftest import _ORIG_TO_THREAD
+
+    def insert_without_retaining_handle():
+        # A string-only caller discards the handle. Returning it through the
+        # executor lets its Future/worker pin it even after the await resumes;
+        # one event-loop tick does not synchronize that worker's teardown.
+        log_db.insert_pending('string-only', '127.0.0.1', 'test', 'm', True,
+                              1, 0, {}, {}, created_at=time.time()-1900)
+
     async def scenario():
         lease = await drain.enter('synthetic-request')
-        await _ORIG_TO_THREAD(log_db.insert_pending, 'string-only', '127.0.0.1', 'test', 'm', True,
-                             1, 0, {}, {}, created_at=time.time()-1900)
-        assert 'string-only' in log_db._request_handles
+        await _ORIG_TO_THREAD(insert_without_retaining_handle)
+        assert lease.log_handles['string-only'] is log_db._request_handles['string-only']
         assert log_db.cleanup_stale_pending(1800) == 0
         await lease.aclose()
-        # Let the completed executor Future release its result handle.
-        await asyncio.sleep(0)
+        assert lease.closed and not lease.log_handles
         assert 'string-only' not in log_db._request_handles
         assert log_db.cleanup_stale_pending(1800) == 1
     asyncio.run(scenario())

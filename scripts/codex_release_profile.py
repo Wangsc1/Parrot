@@ -2,7 +2,7 @@
 """Reproduce/check the reviewed Codex release profile from a local tag worktree.
 
 No network, application imports, config access, or writes to the source tree.
-The two retired model baselines remain explicit data, not a model-name heuristic.
+Retired model baselines remain explicit data, not a model-name heuristic.
 """
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ import subprocess
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1] / "src/openai/codex_profiles"
-TAG = "rust-v0.157.0-alpha.10"
-COMMIT = "2170d8b3c77883dbe743078fb8bbb017f27caa9c"
-BASELINE = "rust-v0.153.4"
+TAG = "rust-v0.159.0"
+COMMIT = "687a119f0fcaace47e1f1abcc77cec6c813fd6da"
+BASELINE = "rust-v0.157.0-alpha.10"
 SOURCE_FILES = (
     "codex-rs/Cargo.toml",
     "codex-rs/models-manager/models.json",
@@ -97,7 +97,7 @@ def generate(source: Path) -> dict[Path, bytes]:
     # newly discovered models or claiming they came from the latest source.
     for slug, policy in baseline["models"].items():
         if slug not in profile["models"]:
-            profile["models"][slug] = {**policy, "sourceCodexTag": BASELINE}
+            profile["models"][slug] = {**policy, "sourceCodexTag": policy.get("sourceCodexTag", BASELINE)}
     artifacts[ROOT / f"{TAG}.json"] = (json.dumps(profile, ensure_ascii=False, indent=2) + "\n").encode()
     return artifacts
 

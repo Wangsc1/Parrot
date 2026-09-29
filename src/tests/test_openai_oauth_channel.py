@@ -603,7 +603,7 @@ def test_channel_responses_ingress(m):
     assert h["chatgpt-account-id"] == "acct-123"
     assert "openai-beta" not in h
     assert h["originator"] == "codex_cli_rs"
-    assert h["version"] == "0.157.0-alpha.10"
+    assert h["version"] == "0.159.0"
     assert h["accept"] == "text/event-stream"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["authorization"].startswith("Bearer ")
@@ -862,7 +862,7 @@ def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
         "gpt-5.6-luna", ingress_protocol="responses",
     ))
     h = {k.lower(): v for k, v in req.headers.items()}
-    assert h["version"] == "0.157.0-alpha.10"
+    assert h["version"] == "0.159.0"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["x-openai-internal-codex-responses-lite"] == "true"
     payload = json.loads(req.body)
@@ -1622,8 +1622,8 @@ def test_config_backfills_openai_oauth_from_legacy_provider(m):
         "mode": "per-oauth-account",
         "newIdentityGenerationVersion": 1,
     }
-    assert merged["openaiOAuth"]["codexCliVersion"] == "0.157.0-alpha.10"
-    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.157.0-alpha.10"
+    assert merged["openaiOAuth"]["codexCliVersion"] == "0.159.0"
+    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.159.0"
     assert merged["openaiOAuth"]["codexProfileAutoUpdate"] is True
     assert "defaultModels" not in merged["openaiOAuth"]
     assert "codexUpstreamUrl" not in merged["openaiOAuth"]

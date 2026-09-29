@@ -19,7 +19,7 @@ from src.openai import codex_constants as constants, codex_identity
 from src.openai.responses_ws_runtime import build_oauth_responses_ws_frame
 from src.state_store import StateStore
 
-VERSION = "0.157.0-alpha.10"
+VERSION = "0.159.0"
 PROFILE = f"rust-v{VERSION}"
 OLD = {"codexCliVersion": "0.153.4", "codexProtocolProfile": "rust-v0.153.4"}
 ROOT = Path(__file__).parents[2]
@@ -69,25 +69,27 @@ def load(provider=None, accounts=None, *, legacy=False):
 
 @pytest.mark.parametrize("auto", [None, True, False])
 @pytest.mark.parametrize("legacy", [False, True])
-def test_existing_config_upgrades_or_pins_without_rotating_identity(auto, legacy, monkeypatch):
-    provider = dict(OLD)
+@pytest.mark.parametrize("old_version", ["0.153.4", "0.157.0-alpha.10"])
+def test_existing_config_upgrades_or_pins_without_rotating_identity(auto, legacy, monkeypatch, old_version):
+    previous = {"codexCliVersion": old_version, "codexProtocolProfile": f"rust-v{old_version}"}
+    provider = dict(previous)
     if auto is not None:
         provider["codexProfileAutoUpdate"] = auto
     now = datetime.now(timezone.utc)
     acc = account("gpt-5.5", records=[{"id": "gpt-5.5", "useResponsesLite": False}])
     acc.update({
         "last_model_sync": now.isoformat(),
-        "last_model_sync_client_version": OLD["codexCliVersion"],
-        "last_model_sync_profile": OLD["codexProtocolProfile"],
+        "last_model_sync_client_version": previous["codexCliVersion"],
+        "last_model_sync_profile": previous["codexProtocolProfile"],
         "models_etag": "old-client-etag",
-        "models_etag_client_version": OLD["codexCliVersion"],
-        "models_etag_profile": OLD["codexProtocolProfile"],
+        "models_etag_client_version": previous["codexCliVersion"],
+        "models_etag_profile": previous["codexProtocolProfile"],
     })
-    codex_identity.normalize_account_identity(acc, protocol_profile=OLD["codexProtocolProfile"])
+    codex_identity.normalize_account_identity(acc, protocol_profile=previous["codexProtocolProfile"])
     original = copy.deepcopy(acc)
     loaded = load(provider, [acc], legacy=legacy)
-    expected_version = "0.153.4" if auto is False else VERSION
-    expected_profile = OLD["codexProtocolProfile"] if auto is False else PROFILE
+    expected_version = old_version if auto is False else VERSION
+    expected_profile = previous["codexProtocolProfile"] if auto is False else PROFILE
     for cfg in (loaded, json.loads(Path(config.CONFIG_PATH).read_text()), config.reload()):
         selected = cfg["openaiOAuth"]
         assert selected["codexCliVersion"] == expected_version
@@ -120,24 +122,23 @@ def test_latest_profile_packaged_hashes_and_baselines():
     profile = constants.current_codex_protocol_profile()
     assert (profile.profile_id, profile.client_version) == (PROFILE, VERSION)
     manifest = json.loads((PROFILES / f"{PROFILE}.json").read_text())
-    assert manifest["source"]["codexCommit"] == "2170d8b3c77883dbe743078fb8bbb017f27caa9c"
-    baseline_raw = (PROFILES / "rust-v0.153.4.json").read_bytes()
-    assert hashlib.sha256(baseline_raw).hexdigest() == manifest["source"]["baselineProfilesSha256"]["rust-v0.153.4"]
+    assert manifest["source"]["codexCommit"] == "687a119f0fcaace47e1f1abcc77cec6c813fd6da"
+    baseline_raw = (PROFILES / "rust-v0.157.0-alpha.10.json").read_bytes()
+    assert hashlib.sha256(baseline_raw).hexdigest() == manifest["source"]["baselineProfilesSha256"]["rust-v0.157.0-alpha.10"]
     fresh = {model for model, row in manifest["models"].items() if row["sourceCodexTag"] == PROFILE}
-    assert len(fresh) == 11
+    assert len(fresh) == 10
     assert {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"} <= fresh
     for model in fresh:
         row = manifest["models"][model]
         raw = (PROFILES / row["baseInstructionsFile"]).read_bytes()
         assert hashlib.sha256(raw).hexdigest() == row["baseInstructionsSha256"]
         assert profile.model_policy(model).base_instructions == raw.decode()
-    assert set(manifest["models"]) - fresh == {"gpt-5.2", "gpt-5.4-mini"}
+    assert set(manifest["models"]) - fresh == {"gpt-5.2", "gpt-5.4-mini", "gpt-5.4"}
     old = json.loads(baseline_raw)
     for model in set(manifest["models"]) - fresh:
-        assert manifest["models"][model] == {**old["models"][model], "sourceCodexTag": "rust-v0.153.4"}
-    # Astra's literal instructions are byte-identical across these tags; do not
-    # manufacture a difference just to make an upgrade assertion pass.
-    assert profile.model_policy("gpt-6-astra").base_instructions == constants.codex_protocol_profile(OLD).model_policy("gpt-6-astra").base_instructions
+        assert manifest["models"][model] == old["models"][model]
+    # Runtime behavior stays account-first; new remote IDs need no static row.
+    assert profile.model_policy("gpt-6.1-sol") is None
 
 
 def test_latest_profile_matches_authoritative_release_source():
@@ -162,9 +163,11 @@ def test_latest_profile_matches_authoritative_release_source():
 
 @pytest.mark.parametrize("current,minimum,expected", [
     (VERSION, "0.155.0", True), ("0.153.4", "0.155.0", False),
-    (VERSION, "0.157.0", False), (VERSION, "0.157.0-alpha.9", True),
-    (VERSION, "0.157.0-alpha.11", False), (VERSION, VERSION, True),
-    ("0.157.0+build.1", VERSION, True), ("0.157.0-alpha.01", VERSION, None),
+    (VERSION, "0.159.0", True), (VERSION, "0.159.0-alpha.9", True),
+    (VERSION, "0.160.0-alpha.1", False), (VERSION, VERSION, True),
+    ("0.157.0-alpha.10", "0.157.0", False),
+    ("0.157.0-alpha.10", "0.157.0-alpha.11", False),
+    ("0.159.0+build.1", VERSION, True), ("0.157.0-alpha.01", VERSION, None),
     ("0.157.0-alpha..1", VERSION, None), ("01.157.0", VERSION, None),
 ])
 def test_semver_release_and_prerelease_gates(current, minimum, expected):
@@ -276,6 +279,94 @@ async def test_latest_ultra_uses_effective_catalog_not_static_profile(monkeypatc
     if target is None:
         with pytest.raises(ValueError, match="requires explicit model-scoped"):
             await request(monkeypatch, "catalog-ultra", {"reasoning": {"effort": "ultra"}}, records=records, pin=True, transport=transport)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_version", ["0.153.4", "0.157.0-alpha.10"])
+@pytest.mark.parametrize("transport", ["http", "websocket"])
+@pytest.mark.parametrize("service_tier", [None, "ultrafast"])
+async def test_upgrade_refreshes_fresh_old_catalog_and_routes_remote_sol(
+    monkeypatch, old_version, transport, service_tier,
+):
+    from src import model_pricing
+
+    model = "gpt-6.1-sol"
+    old_profile = f"rust-v{old_version}"
+    acc = account("gpt-6-sol", [{"id": "gpt-6-sol", "useResponsesLite": True}])
+    acc["account_model_catalog"].update(schema=2, clientVersion=old_version.split("-", 1)[0])
+    acc.update(last_model_sync=datetime.now(timezone.utc).isoformat(),
+               last_model_sync_client_version=old_version, last_model_sync_profile=old_profile,
+               models_etag="previous-version-etag", models_etag_client_version=old_version,
+               models_etag_profile=old_profile, disabledModels=["operator-disabled-model"])
+    codex_identity.normalize_account_identity(acc, protocol_profile=old_profile)
+    identity = copy.deepcopy(acc["codexIdentity"])
+    loaded = load({"codexCliVersion": old_version, "codexProtocolProfile": old_profile}, [acc])
+    saved = loaded["oauthAccounts"][0]
+    # A still-fresh, complete schema-2 cache must not postpone this upgrade.
+    assert oauth_manager._model_sync_due(saved)
+    assert saved["codexIdentity"]["installationId"] == identity["installationId"]
+    calls = []
+
+    class Response:
+        status_code = 200
+        headers = {"etag": "new-client-etag"}
+        def raise_for_status(self): pass
+        def json(self):
+            return {"models": [{
+                "slug": model, "visibility": "list", "use_responses_lite": True,
+                "minimal_client_version": "0.153.0", "context_window": 272000,
+                "max_context_window": 872000, "default_reasoning_level": "low",
+                "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high", "xhigh", "max", "ultra")],
+                "multi_agent_reasoning_effort": "xhigh",
+                "service_tiers": [{"id": "priority", "name": "Fast"}, {"id": "ultrafast", "name": "Ultrafast"}],
+            }]}
+
+    def fetch(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+    async def token(*args, **kwargs): return "test-access"
+    async def refresh_metadata(): return None
+    monkeypatch.setattr(oauth_model_discovery.network, "get_sync", fetch)
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
+    monkeypatch.setattr(oauth_manager, "ensure_channel_token", token)
+    monkeypatch.setattr(oauth_manager, "mock_mode_enabled", lambda: False)
+    monkeypatch.setattr(model_pricing, "refresh_metadata_after_model_sync", refresh_metadata)
+    results = await oauth_manager.oauth_model_sync_once(notify_changes=False)
+    assert len(results) == 1 and results[0]["action"] == "updated"
+    assert calls[0][0].endswith("client_version=0.159.0")
+    assert "If-None-Match" not in calls[0][1]["headers"]
+    config.reload()
+    saved = config.get()["oauthAccounts"][0]
+    assert saved["models"] == [model]
+    assert saved["disabledModels"] == ["operator-disabled-model"]
+    assert saved["codexIdentity"]["installationId"] == identity["installationId"]
+    assert saved["access_token"] == acc["access_token"]
+    assert saved["last_model_sync_client_version"] == VERSION
+    assert not oauth_manager._model_sync_due(saved)
+    channel = OpenAIOAuthChannel(saved)
+    assert channel.list_client_models() == [model]
+    assert channel.supports_model(model) == model
+    assert not channel.codex_model_policy(model).from_profile
+    body = {"model": model, "instructions": "Caller-owned instructions.",
+            "input": [{"role": "user", "content": "hello"},
+                      {"type": "function_call", "call_id": "call-1", "name": "echo", "arguments": "{}"},
+                      {"type": "function_call_output", "call_id": "call-1", "output": "ok"}],
+            "tools": [{"type": "function", "name": "echo", "parameters": {"type": "object"}}],
+            "reasoning": {"effort": "max"}}
+    if service_tier:
+        body["service_tier"] = service_tier
+    req = await channel.build_upstream_request(body, model, ingress_protocol="responses", responses_transport=transport)
+    payload = json.loads(req.body)
+    if transport == "websocket":
+        payload = build_oauth_responses_ws_frame(payload, model, channel=channel)
+    assert req.headers["version"] == VERSION
+    assert payload["model"] == model and payload["reasoning"]["effort"] == "max"
+    assert payload["input"][0]["tools"][0]["name"] == "echo"
+    assert payload["input"][1]["content"][0]["text"] == "Caller-owned instructions."
+    assert [item["call_id"] for item in payload["input"] if item.get("type") in {"function_call", "function_call_output"}] == ["call-1", "call-1"]
+    if service_tier:
+        assert payload["service_tier"] == "ultrafast"
+        assert req.headers[constants.CODEX_ROUTING_HINT_HEADER] == f"model={model};tier=ultrafast"
 
 
 @pytest.mark.parametrize("provider,ttl", [("openai", 300), ("claude", 21600), ("xai", 21600), ("cursor", 21600), ("antigravity", 21600), ("workbuddy", 21600)])
