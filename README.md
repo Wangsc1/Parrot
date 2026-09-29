@@ -818,6 +818,9 @@ Parrot/
 ### OAuth 账户被标 `auth_error`
 refresh_token 已失效。在 TG bot「🔐 管理 OAuth」→ 点该账户 →「🔄 刷新 Token」；若还是失败则删除后重新添加。
 
+### Antigravity 账户返回 403 `Verify your account to continue.`
+Google 要求该账户完成账号验证（`VALIDATION_REQUIRED`），TG 配额一行显示「需完成 Google 账号验证」。token 刷新照常成功，不会标 `auth_error`；删号重加、重新授权都解不开。用 `docker exec -i parrot python3 - < scripts/antigravity_validation_link.py` 只读取出该账户最新的验证链接（已补好 `authuser`），在只登录该账号的无痕窗口中打开。完整步骤见 [Antigravity 账号验证](docs/antigravity-validation-required.md)。
+
 ### OpenAI OAuth 请求老是 503 `non-JSON response` ❓
 已修复（v0.x 起）。如升级后仍遇到，检查 OAuth 渠道的 `upstream_stream_only` 属性是否为 True（源码部署场景）。
 
