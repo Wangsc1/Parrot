@@ -85,6 +85,7 @@ class CursorSession:
         self.alive = True
         self._stop = threading.Event()
         self.done_sent = False
+        self._done_lock = threading.Lock()
         self.batch_state: Literal["streaming", "collecting", "flushed"] = "streaming"
         self.pending_execs: list[PendingExec] = []
         self._flushed: list[PendingExec] = []
@@ -113,11 +114,16 @@ class CursorSession:
                 return self.events.get(timeout=remaining or 0.25)
             except Empty:
                 if not self.alive and not self.done_sent:
-                    return self._done("session closed")
+                    self._push_done(SessionEvent(type="done", error="session closed"))
                 if time.monotonic() > self._inactivity_deadline and self.alive:
                     self._fail("inactivity timeout")
                     self.close()
-                    return SessionEvent(type="done", error="inactivity timeout", retry_hint="timeout")
+                # Consume the single queued terminal, including one published
+                # at the timeout boundary; never return a synthetic duplicate.
+                try:
+                    return self.events.get_nowait()
+                except Empty:
+                    pass
 
     def send_tool_results(self, results: list[dict[str, str | bool]]) -> None:
         remaining: list[PendingExec] = []
@@ -163,13 +169,12 @@ class CursorSession:
         self.close()
 
     def close(self) -> None:
-        was_alive = self.alive
-        self.alive = False
-        self._stop.set()
-        if was_alive and not self.done_sent:
+        if self.alive and not self.done_sent:
             # Publish the intentional close before transport EOF can race the worker's
             # fallback "bridge connection lost" result.
             self._push_done(SessionEvent(type="done", error="session closed"))
+        self.alive = False
+        self._stop.set()
         self._stream.close()
         current = threading.current_thread()
         for thread in (self._worker, self._heartbeat):
@@ -207,9 +212,9 @@ class CursorSession:
         except Exception as exc:  # noqa: BLE001
             self._fail(str(exc), http_status=self._stream.status)
         finally:
-            self.alive = False
-            self._stop.set()
-            self._stream.close()
+            # Publish the contextual terminal before making death observable or
+            # joining transport threads. next()/close() must not win this window
+            # with a generic 'session closed' or duplicate the terminal.
             if not self.done_sent:
                 if self.pending_execs:
                     self._fail("session closed with pending tool calls")
@@ -219,6 +224,9 @@ class CursorSession:
                     self._fail("bridge connection lost")
                 else:
                     self._push_done(SessionEvent(type="done"))
+            self.alive = False
+            self._stop.set()
+            self._stream.close()
 
     def _heartbeat_loop(self) -> None:
         while self.alive:
@@ -355,10 +363,11 @@ class CursorSession:
         )
 
     def _push_done(self, event: SessionEvent) -> None:
-        if self.done_sent:
-            return
-        self.done_sent = True
-        self.events.put(event)
+        with self._done_lock:
+            if self.done_sent:
+                return
+            self.done_sent = True
+            self.events.put(event)
 
     def _done(self, error: str) -> SessionEvent:
         event = SessionEvent(type="done", error=error)

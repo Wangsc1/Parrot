@@ -49,6 +49,8 @@ class ScriptedH2Stream:
         self.timeout = 0.5
         self.poll_timeouts = poll_timeouts
         self.closed = False
+        self._read_closed = False
+        self._read_error: OSError | None = None
         self.close_count = 0
         self.server_hostname = ""
         self.headers: list[tuple[str, str]] = []
@@ -124,14 +126,24 @@ class ScriptedH2Stream:
                 self.poll_timeouts -= 1
                 raise TimeoutError("scripted poll timeout")
             deadline = time.monotonic() + self.timeout
-            while not self._incoming and not self.closed:
+            while not self._incoming and not self.closed and not self._read_closed:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError
                 self._condition.wait(remaining)
             if self._incoming:
                 return self._incoming.popleft()
+            if self._read_error is not None:
+                raise self._read_error
             return b""
+
+    def end_read(self, error: OSError | None = None) -> None:
+        # Model remote EOF/read failure without racing a local full socket
+        # close against the reader's in-flight HTTP/2 SETTINGS/WINDOW ACKs.
+        with self._condition:
+            self._read_closed = True
+            self._read_error = error
+            self._condition.notify_all()
 
     def close(self) -> None:
         with self._condition:
@@ -335,7 +347,7 @@ def test_session_pending_tool_close_emits_one_done_and_preserves_reason(monkeypa
         exec_id="exec", exec_msg_id=1, tool_call_id="call", tool_name="tool",
         decoded_args="{}",
     ))
-    routed.close()
+    routed.end_read()
     done = session.next(timeout=1)
     assert done.type == "done"
     assert done.error == "session closed with pending tool calls"
@@ -555,3 +567,46 @@ def test_direct_connector_real_local_tls_h2(monkeypatch, tmp_path):
     assert captured["body"] == b"direct-body"
     assert dict(captured["headers"])[":path"] == "/direct"
     _wait_no_cursor_threads()
+
+
+@pytest.mark.parametrize("read_error", [None, OSError("closed"), OSError("connection reset by peer")],
+                         ids=["eof", "io-closed", "io-reset"])
+def test_session_pending_tool_terminal_precedes_transport_cleanup(monkeypatch, read_error):
+    routed = ScriptedH2Stream(mode="session", response=b"")
+    monkeypatch.setattr(network, "open_sync_stream", lambda *args, **kwargs: routed)
+    session = _new_session()
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+    original_close = session._stream.close
+
+    def slow_close():
+        if threading.current_thread() is session._worker:
+            cleanup_entered.set()
+            assert allow_cleanup.wait(2)
+        original_close()
+
+    try:
+        deadline = time.monotonic() + 1
+        while not routed.body and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert routed.body
+        session.pending_execs.append(PendingExec(
+            exec_id="exec", exec_msg_id=1, tool_call_id="call", tool_name="tool",
+            decoded_args="{}",
+        ))
+        monkeypatch.setattr(session._stream, "close", slow_close)
+        routed.end_read(read_error)
+        assert cleanup_entered.wait(1)
+        done = session.next(timeout=1)
+        assert done.type == "done"
+        assert done.error == (str(read_error) if read_error else "session closed with pending tool calls")
+        assert done.retry_hint == ("unavailable" if str(read_error) == "connection reset by peer" else None)
+        # Repeated caller close cannot overwrite the worker's chosen reason.
+        allow_cleanup.set()
+        session.close()
+        session.close()
+        assert session.events.empty()
+        _wait_no_cursor_threads()
+    finally:
+        allow_cleanup.set()
+        session.close()

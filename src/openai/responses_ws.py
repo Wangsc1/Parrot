@@ -799,6 +799,16 @@ class _ResponsesWsConnection:
             await _send_request_invalid_error_frame(_ResponsesWsLane(self, sid), "WebSocket pending control budget exceeded.",
                 code="websocket_queue_full", status=429)
 
+    def _cancel_lanes(self):
+        # Fan out before awaiting reader cleanup: a ready persistence worker
+        # must not dispatch another upstream turn after the connection cancels.
+        self.closed = True
+        tasks = [lane.task for lane in self.lanes.values() if lane.task is not None]
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        return tasks
+
     async def run(self):
         # Reads are connection-owned, never concurrent across lane workers.
         # Re-arm at a turn boundary to apply the between-turn idle timeout.
@@ -816,6 +826,9 @@ class _ResponsesWsConnection:
                     done, _ = await asyncio.wait(
                         {reader, activity}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
                     )
+                except asyncio.CancelledError:
+                    self._cancel_lanes()
+                    raise
                 finally:
                     activity.cancel()
                     await asyncio.gather(activity, return_exceptions=True)
@@ -842,15 +855,18 @@ class _ResponsesWsConnection:
         except WebSocketDisconnect:
             pass
         finally:
-            self.closed = True
+            tasks = self._cancel_lanes()
             if reader is not None:
                 reader.cancel()
-                await asyncio.gather(reader, return_exceptions=True)
-            tasks = [lane.task for lane in self.lanes.values()]
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self.history.clear()
+                tasks.append(reader)
+
+            async def finish_connection():
+                await asyncio.gather(*tasks, return_exceptions=True)
+                self.history.clear()
+
+            # Reader exceptions and repeated ASGI cancellation must not let the
+            # physical owner return before lane finalizers return their leases.
+            await await_ws_owned(finish_connection())
 
 
 async def handle_responses_ws(websocket: WebSocket) -> None:

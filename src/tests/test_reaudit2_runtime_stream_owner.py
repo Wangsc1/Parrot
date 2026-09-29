@@ -247,10 +247,12 @@ async def test_cancel_outer_retry_open_update_aborts_unstarted_http_stream_befor
         "queued-retry-terminal",
     ],
 )
+@pytest.mark.parametrize("repeat_cancel", [False, True], ids=["single-cancel", "repeated-cancel"])
 async def test_responses_ws_cancel_during_preaccept_log_update_terminalizes_all_owners_once(
     monkeypatch,
     queued,
     blocked_write,
+    repeat_cancel,
 ):
     logs = _StrictLogFakes()
     insert_pending = logs.insert_pending
@@ -464,10 +466,28 @@ async def test_responses_ws_cancel_during_preaccept_log_update_terminalizes_all_
         return func(*args, **kwargs)
 
     monkeypatch.setattr(responses_ws.asyncio, "to_thread", controlled_to_thread)
-    websocket = _FakeDownstreamWebSocket()
+
+    reader_stopped = asyncio.Event()
+
+    class PersistentDownstream(_FakeDownstreamWebSocket):
+        async def receive(self):
+            if self.receive_calls:
+                # The connection mux owns a persistent reader after first create.
+                # A second receive is not an assertion failure/disconnect.
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    reader_stopped.set()
+            return await super().receive()
+
+    websocket = PersistentDownstream()
     task = asyncio.create_task(responses_ws.handle_responses_ws(websocket))
     await retry_worker_entered.wait()
     task.cancel()
+    if repeat_cancel:
+        await asyncio.wait_for(reader_stopped.wait(), 1)
+        task.cancel()
+        assert not task.done()  # The persistence owner is still blocked.
     allow_retry_worker.set()
 
     with pytest.raises(asyncio.CancelledError):
