@@ -28,7 +28,7 @@ import threading
 
 from . import (
     affinity, blacklist, channel_state, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
-    local_web_tools, log_db, model_metadata, model_pricing, model_reroute, model_state, notifier, oauth_manager, quota_errors, scorer, state_db,
+    local_web_tools, log_db, model_metadata, model_pricing, model_reroute, model_state, notifier, oauth_errors, oauth_manager, quota_errors, scorer, state_db,
     token_counter, upstream,
 )
 from .channel.base import Channel, UpstreamDispatchMetadata
@@ -54,6 +54,7 @@ from .providers import registry as provider_registry
 from .providers.antigravity_errors import parse_antigravity_429
 from .protocols import finalize as finalize_policy
 from .protocols import errors as protocol_errors
+from .protocols.usage import openai_envelope_containers
 from .protocols.runtime import (
     AttemptResult,
     DEFAULT_TRANSIENT_RETRY_DELAYS_S,
@@ -2211,14 +2212,59 @@ async def run_failover(
     # 并发饱和的候选：scheduler filter 挑出来的 + main loop 中竞态占满的
     saturated_extras: list[tuple[Channel, str]] = []
 
-    while idx < len(pending):
+    queued_candidates = list(schedule_result.saturated)
+    while True:
+        slot_reserved = False
+        if idx >= len(pending):
+            # Waiting only acquires capacity. Once admitted, a queued candidate
+            # uses the same attempt, recovery, settlement and release path below.
+            # Consume the original wait set once; a retry that loses capacity
+            # may enqueue that same candidate again without replenishing retries.
+            waiting = queued_candidates + saturated_extras
+            queued_candidates = []
+            saturated_extras = []
+            if not waiting:
+                break
+            seen = set()
+            candidate_keys = []
+            for queued_ch, queued_model in waiting:
+                identity = (queued_ch.key, queued_model)
+                if identity not in seen:
+                    seen.add(identity)
+                    candidate_keys.append((
+                        channel_state.effect_key(queued_ch), (queued_ch, queued_model),
+                    ))
+            cc_cfg = cfg.get("concurrency") or {}
+            queue_wait_s = float(cc_cfg.get("queueWaitSeconds", 30))
+            if queue_wait_s <= 0:
+                break
+            # Queue time remains outside each upstream round's total budget.
+            reserved = await concurrency.acquire_from_candidates(candidate_keys, queue_wait_s)
+            if reserved is None:
+                queue_err_msg = (
+                    f"All candidate channels saturated; queue wait {queue_wait_s:.0f}s timed out."
+                )
+                await asyncio.to_thread(
+                    log_db.finish_error, request_id, queue_err_msg, retry_count,
+                    final_channel_key=None, final_channel_type=None, final_model=None,
+                    connect_ms=None, first_token_ms=None, total_ms=None,
+                    request_elapsed_ms=_elapsed_ms(start_monotonic),
+                    http_status=429, affinity_hit=affinity_hit, upstream_protocol=None,
+                )
+                return _json_error_for_ingress(
+                    ingress_protocol, 429, "rate_limit_error", queue_err_msg,
+                )
+            _reserved_key, candidate = reserved
+            pending.append(candidate)
+            slot_reserved = True
+
         ch, resolved_model = pending[idx]
         attempt_order += 1
         last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
         last_ch_protocol = getattr(ch, "protocol", "anthropic")
 
         # 并发 slot 获取（快速路径；filter 过但竞态满了 → 放到 saturated 备选）
-        acquired = await concurrency.try_acquire(channel_state.effect_key(ch))
+        acquired = slot_reserved or await concurrency.try_acquire(channel_state.effect_key(ch))
         if not acquired:
             # 竞态：filter 时还有位置，现在满了 → 作为排队备选
             # 注：_filter_candidates 已把饱和的挑走，这里主要兜底并发 filter 后瞬间占满的情况
@@ -2555,7 +2601,13 @@ async def run_failover(
                         idx += 1
                         continue
                 email = getattr(ch, "email", "?")
-                disable_auth = getattr(ch, "provider", "") != "workbuddy" or getattr(exc, "auth_error", False)
+                refresh_error = oauth_errors.describe_oauth_error(
+                    exc, provider=getattr(ch, "provider", ""), operation="refresh_token",
+                )
+                # A failed refresh is not proof of invalid credentials. Network,
+                # rate-limit, upstream and local persistence failures must not
+                # turn into a permanent auth_error disabled account.
+                disable_auth = refresh_error.auth_error
                 try:
                     with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
                         if disable_auth and current:
@@ -2649,266 +2701,6 @@ async def run_failover(
             )
         retry_count += 1
         idx += 1
-
-    # 排队等位：pending 全部失败 / 全部饱和 → 汇总 saturated 候选去排队等任一空位
-    # （scheduler 已挑出的 + main loop 竞态占满的）
-    saturated_all: list[tuple[Channel, str]] = list(schedule_result.saturated) + saturated_extras
-    # 去重：同 (ch.key, model) 保留首次出现，保持原优先级
-    if saturated_all:
-        seen = set()
-        deduped: list[tuple[Channel, str]] = []
-        for ch, m in saturated_all:
-            k = (ch.key, m)
-            if k in seen:
-                continue
-            seen.add(k)
-            deduped.append((ch, m))
-        saturated_all = deduped
-
-    if saturated_all:
-        cc_cfg = cfg.get("concurrency") or {}
-        queue_wait_s = float(cc_cfg.get("queueWaitSeconds", 30))
-        # Queue wait is outside every upstream round and cannot consume a round total budget.
-        queue_timeout = queue_wait_s
-        if queue_timeout > 0:
-            candidate_keys: list[tuple[str, object]] = [
-                (channel_state.effect_key(ch), (ch, m)) for ch, m in saturated_all
-            ]
-            acquired = await concurrency.acquire_from_candidates(candidate_keys, queue_timeout)
-            if acquired is not None:
-                _ch_key, payload = acquired
-                ch, resolved_model = payload  # type: ignore[assignment]
-                release_done2 = False
-                slot_phase_complete2 = False
-                pending_stream_result2: AttemptResult | None = None
-                attempt_body: dict | None = None
-
-                def _release_q(_key=channel_state.effect_key(ch)):
-                    nonlocal release_done2
-                    if release_done2:
-                        return
-                    release_done2 = True
-                    if attempt_body is not None:
-                        release_request_turn_serialization(attempt_body)
-                    concurrency.release(_key)
-
-                attempt_order += 1
-                last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
-                last_ch_protocol = getattr(ch, "protocol", "anthropic")
-                _attempt_proxy2: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
-                attempt_started_monotonic2 = time.monotonic()
-                attempt_id = None
-                attempt_handed_off2 = False
-                use_responses_ws2 = _should_use_responses_upstream_ws(
-                    ch, ingress_protocol=ingress_protocol, cfg=cfg,
-                )
-                try:
-                    async def _record_queued_attempt() -> None:
-                        nonlocal attempt_id
-                        attempt_id = await asyncio.to_thread(
-                            log_db.record_retry_attempt,
-                            request_id, attempt_order, ch.key, ch.type,
-                            resolved_model, time.time(), proxy_name=_attempt_proxy2,
-                            upstream_protocol=getattr(ch, "protocol", "anthropic"),
-                            client_visible_model=client_visible_model,
-                        )
-
-                    await await_ws_owned(_record_queued_attempt())
-                    effective_is_stream = is_stream
-                    attempt_body = _attempt_body_for_channel(
-                        body, ch.key, bound_channel_key, portable_body,
-                    )
-                    attempt_body["_codex_turn_serialization_required"] = True
-                    attempt_handed_off2 = True
-                    if use_responses_ws2:
-                        result = await _try_openai_oauth_responses_ws_channel(
-                            ch, resolved_model, attempt_body, effective_is_stream, deadline_ts, start_time,
-                            fp_query, attempt_body.get("messages") or [], api_key_name, client_ip,
-                            request_id, retry_count, affinity_hit, client_key=client_key,
-                            retry_attempt_id=attempt_id,
-                            start_monotonic=start_monotonic,
-                            attempt_start_monotonic=attempt_started_monotonic2,
-                        )
-                    else:
-                        result = await _try_channel(
-                            ch, resolved_model, attempt_body, effective_is_stream, deadline_ts, start_time,
-                            fp_query, attempt_body.get("messages") or [], api_key_name, client_ip,
-                            request_id, retry_count, affinity_hit,
-                            ingress_protocol=ingress_protocol,
-                            client_key=client_key,
-                            retry_attempt_id=attempt_id,
-                            start_monotonic=start_monotonic,
-                            attempt_start_monotonic=attempt_started_monotonic2,
-                            terminal_release=_release_q,
-                        )
-                    result = _request_invalid_result_if_needed(result, ch)
-                    pending_stream_result2 = result
-                    last_result = result
-                    if not result.success and not result.stream_started:
-                        structured_attempts.append(
-                            _structured_attempt_error(result, attempt_order, ch),
-                        )
-                    if _attempt_proxy2 and not result.proxy_name:
-                        result.proxy_name = _attempt_proxy2
-                    retry_update = asyncio.to_thread(
-                        log_db.update_retry_attempt,
-                        attempt_id,
-                        final_round_id=result.round_id,
-                        connect_ms=result.connect_ms,
-                        first_byte_ms=result.first_byte_ms,
-                        idle_ms=result.idle_ms,
-                        attempt_elapsed_ms=(
-                            None if result.stream_started else _elapsed_ms(attempt_started_monotonic2)
-                        ),
-                        request_upload_ms=result.request_upload_ms,
-                        response_headers_wait_ms=result.response_headers_wait_ms,
-                        response_body_first_byte_wait_ms=result.response_body_first_byte_wait_ms,
-                        total_ms=result.total_ms,
-                        ended_at=(None if result.stream_started else time.time()),
-                        outcome=("open" if result.stream_started else result.outcome),
-                        error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
-                        proxy_name=result.proxy_name,
-                        bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
-                        bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
-                        response_body=getattr(result, "full_response_text", None),
-                        usage=getattr(result, "usage", None),
-                        usage_observed=getattr(result, "usage_observed", None),
-                    )
-                    try:
-                        await await_ws_owned(retry_update)
-                    except asyncio.CancelledError:
-                        if not result.success and not result.stream_started:
-                            await await_ws_owned(_finish_cancelled_failover_attempt(
-                                request_id=request_id,
-                                retry_count=retry_count,
-                                ch=ch,
-                                resolved_model=resolved_model,
-                                attempt_id=attempt_id,
-                                attempt_started_monotonic=attempt_started_monotonic2,
-                                start_monotonic=start_monotonic,
-                                affinity_hit=affinity_hit,
-                                proxy_name=result.proxy_name,
-                                upstream_transport=("ws" if use_responses_ws2 else "http"),
-                                result=result,
-                                terminalize_retry=False,
-                            ))
-                        raise
-                    slot_phase_complete2 = True
-                except asyncio.CancelledError:
-                    if not attempt_handed_off2:
-                        await await_ws_owned(_finish_cancelled_failover_attempt(
-                            request_id=request_id,
-                            retry_count=retry_count,
-                            ch=ch,
-                            resolved_model=resolved_model,
-                            attempt_id=attempt_id,
-                            attempt_started_monotonic=attempt_started_monotonic2,
-                            start_monotonic=start_monotonic,
-                            affinity_hit=affinity_hit,
-                            proxy_name=_attempt_proxy2,
-                            upstream_transport=("ws" if use_responses_ws2 else "http"),
-                        ))
-                    raise
-                finally:
-                    if not slot_phase_complete2:
-                        await _abort_pending_stream_result(pending_stream_result2)
-                        _release_q()
-
-                if not result.stream_started:
-                    _release_q()
-
-                if result.success or result.stream_started:
-                    if result.success and not result.stream_started and fp_query:
-                        affinity.upsert(
-                            fp_query, channel_state.effect_key(ch), resolved_model,
-                            prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
-                        )
-                    try:
-                        if result.success and body.get(search_tool_policy.ROUND_KEY):
-                            result.response._parrot_search_candidate = (ch, resolved_model)
-                            result.response._parrot_search_attempt_handle = attempt_id
-                        _attach_release_to_response(result.response, _release_q)
-                        _transfer_pending_stream_result(result)
-                        return result.response
-                    except BaseException:
-                        await _abort_pending_stream_result(result)
-                        _release_q()
-                        raise
-                _release_q()
-                if result.outcome == "request_invalid":
-                    status = int(result.http_status or 400)
-                    msg = result.error_detail or "invalid request"
-                    request_elapsed_ms = _elapsed_ms(start_monotonic)
-                    await asyncio.to_thread(
-                        log_db.finish_error, request_id, msg[:4000], retry_count,
-                        final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
-                        connect_ms=result.connect_ms, first_token_ms=result.first_byte_ms,
-                        idle_ms=result.idle_ms, total_ms=result.total_ms,
-                        final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
-                        http_status=status, affinity_hit=affinity_hit,
-                        response_signals=getattr(result, "response_signals", None),
-                        http_header_model=getattr(result, "http_header_model", None),
-                        response_body=result.full_response_text,
-                        usage=result.usage,
-                        usage_observed=result.usage_observed,
-                        upstream_protocol=getattr(ch, "protocol", "anthropic"),
-                        **_request_stage_kwargs(result),
-                    )
-                    return _json_error_for_ingress(
-                        ingress_protocol,
-                        status,
-                        protocol_errors.legacy_anthropic_error_type_for_http_status(status),
-                        msg,
-                        code=(
-                            getattr(result, "error_code", None)
-                            or (
-                                protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
-                                if _is_context_length_exceeded_error(msg)
-                                else None
-                            )
-                        ),
-                    )
-                # 排队拿到的这次也失败了 → 落入"全失败"分支
-                plan_excluded_handled = (
-                    not result.openai_oauth_html_403
-                    and quota_errors.is_zhipu_plan_excluded_message(result.error_detail)
-                    and _apply_zhipu_quota_cooldown(ch, resolved_model, result)
-                )
-                codex_handled = _apply_codex_error_policy(ch, resolved_model, result)
-                if not result.openai_oauth_html_403 and not plan_excluded_handled and not codex_handled:
-                    plan = finalize_policy.error_plan(
-                        result.outcome,
-                        failure_policy="runtime",
-                        http_status=result.http_status,
-                    )
-                    finalize_policy.apply_error_health_effects(
-                        plan,
-                        scorer=scorer,
-                        cooldown=cooldown,
-                        channel_key=channel_state.effect_key(ch),
-                        model=resolved_model,
-                        error_detail=result.error_detail,
-                        connect_ms=_scorer_connect_ms(result),
-                        cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
-                    )
-                retry_count += 1
-            else:
-                # 队列超时 → 直接返回 429 rate_limit_error，不混入上游失败
-                request_elapsed_ms = _elapsed_ms(start_monotonic)
-                queue_err_msg = (
-                    f"All candidate channels saturated; queue wait {queue_wait_s:.0f}s timed out."
-                )
-                await asyncio.to_thread(
-                    log_db.finish_error, request_id, queue_err_msg, retry_count,
-                    final_channel_key=None, final_channel_type=None, final_model=None,
-                    connect_ms=None, first_token_ms=None, total_ms=None,
-                    request_elapsed_ms=request_elapsed_ms,
-                    http_status=429, affinity_hit=affinity_hit,
-                    upstream_protocol=None,
-                )
-                return _json_error_for_ingress(
-                    ingress_protocol, 429, "rate_limit_error", queue_err_msg,
-                )
 
     # 全失败
     err_detail = (last_result.error_detail if last_result else "no candidates") or "unknown"
@@ -3263,8 +3055,8 @@ class _WsResponsesTracker:
         self._frames.append(text)
         self._output_builder.feed((f"event: {typ}\ndata: " + json.dumps(evt, ensure_ascii=False) + "\n\n").encode("utf-8"))
         response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
-        usage_present = "usage" in evt or (
-            isinstance(response_obj, dict) and "usage" in response_obj
+        usage_present = any(
+            "usage" in container for container in openai_envelope_containers(evt)
         )
         normalized = model_pricing.normalize_response_billing(evt)
         if normalized.service_tier is not None:
@@ -4938,6 +4730,8 @@ async def _consume_non_stream(
 ) -> AttemptResult:
     if start_monotonic is None:
         start_monotonic = time.monotonic()
+    if (translator_ctx or {}).get("response_translator") == "chat_to_responses":
+        translator_ctx = {**translator_ctx, "request_body": body or translator_ctx.get("request_body") or {}}
     # stream-only 上游分流：OpenAI OAuth (chatgpt.com/backend-api/codex) 只返回 SSE，
     # 下游若请求非流式，这里把 SSE 聚合成完整 JSON 再走原有 translator / 落库链路。
     if getattr(ch, "upstream_stream_only", False):
@@ -5297,6 +5091,8 @@ async def _consume_stream(
         start_monotonic = time.monotonic()
     if attempt_start_monotonic is None:
         attempt_start_monotonic = start_monotonic
+    if (translator_ctx or {}).get("response_translator") == "chat_to_responses":
+        translator_ctx = {**translator_ctx, "request_body": body or translator_ctx.get("request_body") or {}}
     if (body or {}).get("_parrot_search_round") and getattr(ch, "protocol", "") == "openai-chat":
         # Chat names are delta strings. Complete only tool fragments before an
         # ingress bridge commits an immutable Responses/Anthropic tool name.
@@ -5719,8 +5515,12 @@ async def _consume_stream(
         terminal_chunks: list[bytes] = []
         if stream_translator is not None:
             terminal_chunks = list(stream_translator.close())
+        upstream.observe_downstream_error(tracker, terminal_chunks)
         async def settle_terminal() -> None:
-            await _finalize_success()
+            if getattr(tracker, "saw_stream_error", False):
+                await _emit_error_and_finalize("api_error", tracker.stream_error_message or "response conversion failed", outcome="stream_upstream_error")
+            else:
+                await _finalize_success()
             await _close_terminal_resources_and_release()
 
         await await_ws_owned(settle_terminal())
@@ -5901,12 +5701,7 @@ async def _consume_stream(
             # 再落库 success，最后 yield 终态帧。这样 close()/Store 阶段若异常，
             # 不会先把日志标成成功；而 success 已落库后客户端在终态帧期间断开，
             # state["finalized"] 也会避免误标成 client disconnected。
-            terminal_chunks: list[bytes] = []
-            if stream_translator is not None:
-                terminal_chunks = list(stream_translator.close())
-            # terminal owner 在客户端恰好于终态帧附近断开时也必须完成 retry、
-            # proxy 和 request_log 三者落账，不能留下半完成 pending。
-            await await_ws_owned(_finalize_success())
+            terminal_chunks = await _finalize_terminal_success()
             for out in terminal_chunks:
                 yield out
         except asyncio.CancelledError:

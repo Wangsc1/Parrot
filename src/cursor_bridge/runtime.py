@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import select
+import socket
 import threading
 import uuid
 from collections import defaultdict
@@ -25,6 +27,7 @@ from .openai_messages import terminal_tool_messages
 
 _ACCOUNT_HEADER = "X-Parrot-Cursor-Account"
 _SESSION_HEADER = "X-Parrot-Cursor-Session"
+_PRINCIPAL_HEADER = "X-Parrot-Cursor-Principal"
 
 
 class _Server(ThreadingHTTPServer):
@@ -36,6 +39,10 @@ class _Server(ThreadingHTTPServer):
         super().__init__(address, _Handler)
 
 
+    def service_actions(self) -> None:
+        self.runtime.reap_sessions()
+
+
 class CursorBridgeRuntime:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -43,8 +50,9 @@ class CursorBridgeRuntime:
         self._thread: threading.Thread | None = None
         self._secret = secrets.token_urlsafe(32)
         self._clients: dict[str, CursorClient] = {}
-        self._tool_sessions: dict[tuple[str, str], str] = {}
-        self._session_tools: dict[tuple[str, str], set[str]] = defaultdict(set)
+        self._tool_sessions: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+        self._session_tools: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+        self._active_sessions: dict[tuple[str, str], str] = {}
 
     def ensure_started(self) -> None:
         with self._lock:
@@ -113,49 +121,88 @@ class CursorBridgeRuntime:
         with self._lock:
             return self._clients.get(account_key)
 
-    def session_for(self, account_key: str, body: dict[str, Any], explicit: str = "") -> str:
+    def session_for(self, account_key: str, body: dict[str, Any], explicit: str = "", *, principal: str = "") -> str:
         messages = body.get("messages") if isinstance(body.get("messages"), list) else []
-        tool_ids = [
-            str(message.get("tool_call_id") or "")
-            for message in terminal_tool_messages(messages)
-            if message.get("tool_call_id")
-        ]
+        tool_ids = [str(message.get("tool_call_id")) for message in terminal_tool_messages(messages)
+                    if message.get("tool_call_id")]
+        stable = "stable-" + hashlib.sha256(json.dumps([account_key, principal, explicit]).encode()).hexdigest()[:32] if explicit else ""
         with self._lock:
-            matches = {
-                self._tool_sessions[(account_key, tool_id)]
-                for tool_id in tool_ids
-                if (account_key, tool_id) in self._tool_sessions
-            }
-        if len(matches) == 1:
-            return next(iter(matches))
-        if explicit:
-            material = f"{account_key}:{explicit}".encode("utf-8")
-            return "stable-" + hashlib.sha256(material).hexdigest()[:32]
-        return "turn-" + uuid.uuid4().hex
+            candidates = [self._tool_sessions[(account_key, principal, tool_id)]
+                          for tool_id in tool_ids if (account_key, principal, tool_id) in self._tool_sessions]
+            matches = set.intersection(*(set(ids) for ids in candidates)) if candidates else set()
+            if candidates and not matches:
+                raise CursorError("Tool results belong to different conversations", code="invalid_request", status=400)
+            if stable in matches:
+                return stable
+            if len(matches) == 1:
+                return next(iter(matches))
+            if len(matches) > 1:
+                raise CursorError("Ambiguous tool call ID; supply the conversation anchor", code="invalid_request", status=400)
+        return stable or "turn-" + uuid.uuid4().hex
 
-    def register_tool_call(self, account_key: str, session_id: str, tool_call_id: str) -> None:
+    def begin_session(self, account_key, body, explicit, principal):
+        with self._lock:
+            session_id = self.session_for(account_key, body, explicit, principal=principal)
+            if (account_key, session_id) in self._active_sessions:
+                if terminal_tool_messages(body.get("messages") or []):
+                    raise CursorError("Tool response is already being consumed", code="conversation_busy", status=409)
+                session_id = "turn-" + uuid.uuid4().hex
+            owner = uuid.uuid4().hex
+            self._active_sessions[(account_key, session_id)] = owner
+            return session_id, owner
+
+    def end_session(self, account_key, session_id, owner):
+        with self._lock:
+            if self._active_sessions.get((account_key, session_id)) == owner:
+                self._active_sessions.pop((account_key, session_id), None)
+
+    def register_tool_call(self, account_key: str, session_id: str, tool_call_id: str, *, principal: str = "") -> None:
         if not tool_call_id:
             return
         with self._lock:
-            self._tool_sessions[(account_key, tool_call_id)] = session_id
-            self._session_tools[(account_key, session_id)].add(tool_call_id)
+            self._tool_sessions[(account_key, principal, tool_call_id)].add(session_id)
+            self._session_tools[(account_key, principal, session_id)].add(tool_call_id)
 
-    def finish_session(self, account_key: str, session_id: str, *, cancel: bool = False) -> None:
+    def _forget_tools(self, account_key, session_id):
+        for key in list(self._session_tools):
+            if key[0] != account_key or key[2] != session_id:
+                continue
+            for tool_id in self._session_tools.pop(key):
+                index = (account_key, key[1], tool_id)
+                sessions = self._tool_sessions.get(index, set())
+                sessions.discard(session_id)
+                if not sessions:
+                    self._tool_sessions.pop(index, None)
+
+    def finish_session(self, account_key: str, session_id: str, *, cancel: bool = False, owner: str | None = None) -> None:
         with self._lock:
+            if owner is not None and self._active_sessions.get((account_key, session_id)) != owner:
+                return
             client = self._clients.get(account_key)
-            tool_ids = self._session_tools.pop((account_key, session_id), set())
-            for tool_id in tool_ids:
-                self._tool_sessions.pop((account_key, tool_id), None)
-        if client is not None:
-            client.discard_conversation(session_id, cancel=cancel)
+            self._forget_tools(account_key, session_id)
+            # The runtime lock prevents a replacement request claiming this ID
+            # between owner validation and cancellation of its actual instance.
+            if client is not None:
+                client.discard_conversation(session_id, cancel=cancel)
+
+    def reap_sessions(self):
+        with self._lock:
+            for account, client in list(self._clients.items()):
+                if not hasattr(client, "reap_conversations"):
+                    continue
+                protected = {sid for acc, sid in self._active_sessions if acc == account}
+                for sid in client.reap_conversations(protected=protected):
+                    self._forget_tools(account, sid)
 
     def drop_account(self, account_key: str) -> None:
         with self._lock:
             client = self._clients.pop(account_key, None)
-            sessions = [key for key in self._session_tools if key[0] == account_key]
-            for key in sessions:
-                for tool_id in self._session_tools.pop(key, set()):
-                    self._tool_sessions.pop((account_key, tool_id), None)
+            for key in list(self._session_tools):
+                if key[0] == account_key:
+                    self._forget_tools(account_key, key[2])
+            for key in list(self._active_sessions):
+                if key[0] == account_key:
+                    self._active_sessions.pop(key, None)
         if client is not None:
             client.close()
 
@@ -168,6 +215,7 @@ class CursorBridgeRuntime:
             self._clients.clear()
             self._tool_sessions.clear()
             self._session_tools.clear()
+            self._active_sessions.clear()
         if server is not None:
             server.shutdown()
             server.server_close()
@@ -241,7 +289,44 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         explicit = str(self.headers.get(_SESSION_HEADER) or body.get("session_id") or "").strip()
-        session_id = self.runtime.session_for(account_key, body, explicit)
+        principal = str(self.headers.get(_PRINCIPAL_HEADER) or "")
+        try:
+            session_id, owner = self.runtime.begin_session(account_key, body, explicit, principal)
+        except CursorError as exc:
+            self._json(exc.status, exc.to_openai_error())
+            return
+        stopped = threading.Event()
+        disconnected = threading.Event()
+
+        def watch_disconnect():
+            while not stopped.wait(0.05):
+                try:
+                    readable, _, _ = select.select([self.connection], [], [], 0)
+                    if readable and not self.connection.recv(1, socket.MSG_PEEK) and not stopped.is_set():
+                        disconnected.set()
+                except (OSError, ValueError):
+                    if not stopped.is_set():
+                        disconnected.set()
+                if disconnected.is_set() and not stopped.is_set():
+                    self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)
+
+        watcher = threading.Thread(target=watch_disconnect, name="cursor-http-disconnect", daemon=True)
+        watcher.start()
+        try:
+            self._complete(client, account_key, session_id, owner, principal, body, stopped)
+        except (BrokenPipeError, ConnectionResetError):
+            self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)
+        except BaseException:
+            self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)
+            raise
+        finally:
+            stopped.set()
+            watcher.join(timeout=1)
+            if disconnected.is_set():
+                self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)
+            self.runtime.end_session(account_key, session_id, owner)
+
+    def _complete(self, client, account_key, session_id, owner, principal, body, watcher_stop):
         try:
             result = client.chat_completions(
                 model=str(body.get("model") or ""),
@@ -253,9 +338,11 @@ class _Handler(BaseHTTPRequestHandler):
                 long_context=bool(body.get("cursor_long_context", False)),
             )
         except CursorError as exc:
+            self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)
             self._json(exc.status, exc.to_openai_error())
             return
         except (ValueError, KeyError, TypeError) as exc:
+            self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)
             self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_request"}})
             return
 
@@ -264,16 +351,20 @@ class _Handler(BaseHTTPRequestHandler):
             tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
             for call in tool_calls or []:
                 if isinstance(call, dict):
-                    self.runtime.register_tool_call(account_key, session_id, str(call.get("id") or ""))
+                    self.runtime.register_tool_call(account_key, session_id, str(call.get("id") or ""), principal=principal)
             if not tool_calls:
-                self.runtime.finish_session(account_key, session_id)
+                self.runtime.finish_session(account_key, session_id, owner=owner)
+            # A completed HTTP turn may legitimately close its socket while
+            # the native tool session remains paused for the next request.
+            watcher_stop.set()
             self._json(200, result)
             return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
         paused_for_tools = False
         try:
@@ -283,9 +374,10 @@ class _Handler(BaseHTTPRequestHandler):
                     delta = choice.get("delta") if isinstance(choice, dict) else None
                     for call in (delta.get("tool_calls") if isinstance(delta, dict) else []) or []:
                         if isinstance(call, dict):
-                            self.runtime.register_tool_call(account_key, session_id, str(call.get("id") or ""))
+                            self.runtime.register_tool_call(account_key, session_id, str(call.get("id") or ""), principal=principal)
                     if isinstance(choice, dict) and choice.get("finish_reason") == "tool_calls":
                         paused_for_tools = True
+                        watcher_stop.set()
                 self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
                 self.wfile.flush()
             self.wfile.write(b"data: [DONE]\n\n")
@@ -296,12 +388,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             finally:
-                self.runtime.finish_session(account_key, session_id, cancel=True)
+                self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)
         except (BrokenPipeError, ConnectionResetError):
-            self.runtime.finish_session(account_key, session_id, cancel=True)
+            self.runtime.finish_session(account_key, session_id, cancel=True, owner=owner)
         finally:
+            result.close()
             if not paused_for_tools:
-                self.runtime.finish_session(account_key, session_id)
+                self.runtime.finish_session(account_key, session_id, owner=owner)
 
 
 runtime = CursorBridgeRuntime()
@@ -335,6 +428,7 @@ def drop_account(account_key: str) -> None:
 __all__ = [
     "_ACCOUNT_HEADER",
     "_SESSION_HEADER",
+    "_PRINCIPAL_HEADER",
     "base_url",
     "bearer_secret",
     "drop_account",

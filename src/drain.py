@@ -13,7 +13,8 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from contextvars import ContextVar
 from typing import AsyncIterator
 
 from fastapi.responses import JSONResponse
@@ -30,6 +31,8 @@ _started_at: float | None = None
 _active_requests: int = 0
 _condition: asyncio.Condition | None = None
 _condition_loop: asyncio.AbstractEventLoop | None = None
+_deadline: float | None = None
+_current_lease: ContextVar[DrainLease | None] = ContextVar("parrot_request_lease", default=None)
 
 
 @dataclass
@@ -38,11 +41,13 @@ class DrainLease:
 
     label: str = "request"
     closed: bool = False
+    log_handles: dict = field(default_factory=dict, repr=False)
 
     async def aclose(self) -> None:
         if self.closed:
             return
         self.closed = True
+        self.log_handles.clear()
         await _decrement_active(self.label)
 
 
@@ -103,6 +108,29 @@ def shutdown_timeout_seconds() -> int:
     return max(0, value)
 
 
+def retain_log_handle(handle) -> None:
+    """to_thread copies this request context; keep string-only log callers live."""
+    lease = _current_lease.get()
+    if lease is not None and not lease.closed:
+        lease.log_handles[handle.request_id] = handle
+
+
+def release_log_handle(request_id: str) -> None:
+    lease = _current_lease.get()
+    if lease is not None:
+        lease.log_handles.pop(request_id, None)
+
+
+def remaining_seconds() -> float:
+    """One monotonic admission/drain deadline, never restarted by lifespan."""
+    return max(0.0, _deadline - time.monotonic()) if _deadline is not None else float(shutdown_timeout_seconds())
+
+
+def expedite() -> None:
+    global _deadline
+    _deadline = time.monotonic()
+
+
 def begin(reason_text: str = "shutdown") -> None:
     """Enter draining mode.
 
@@ -111,7 +139,7 @@ def begin(reason_text: str = "shutdown") -> None:
     enough for Parrot's single-process/single-event-loop runtime.
     """
 
-    global _draining, _shutdown_requested, _reason, _started_at
+    global _draining, _shutdown_requested, _reason, _started_at, _deadline
     first = not _draining
     _draining = True
     _shutdown_requested = True
@@ -119,18 +147,21 @@ def begin(reason_text: str = "shutdown") -> None:
     if _started_at is None:
         _started_at = time.time()
     if first:
+        _deadline = time.monotonic() + shutdown_timeout_seconds()
         print(f"[drain] entering draining mode reason={reason_text} active={_active_requests}")
 
 
 def reset_for_tests() -> None:
     """Reset global state for unit tests only."""
 
-    global _draining, _shutdown_requested, _reason, _started_at, _active_requests
+    global _draining, _shutdown_requested, _reason, _started_at, _active_requests, _deadline
     _draining = False
     _shutdown_requested = False
     _reason = None
     _started_at = None
     _active_requests = 0
+    _deadline = None
+    _current_lease.set(None)
 
 
 async def enter(label: str = "request") -> DrainLease:
@@ -138,7 +169,9 @@ async def enter(label: str = "request") -> DrainLease:
     cond = await _condition_for_current_loop()
     async with cond:
         _active_requests += 1
-        return DrainLease(label=label)
+        lease = DrainLease(label=label)
+        _current_lease.set(lease)
+        return lease
 
 
 @asynccontextmanager

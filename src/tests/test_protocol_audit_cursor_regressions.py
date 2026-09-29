@@ -292,10 +292,12 @@ def test_c01_simple_system_user_control_keeps_existing_wire_text():
 
 
 def test_c01_unknown_terminal_result_is_rebuilt_instead_of_silently_ignored():
-    client, sessions = local_client()
+    client, sessions = local_client([
+        SessionEvent(type="toolCall", exec=pending()), SessionEvent(type="batchReady"),
+    ])
     try:
-        client.chat_completions(model="local-model", messages=HISTORY[:4], session_id="stable")
-        sessions[0].pending_execs = [pending()]
+        # Consume the first HTTP turn to its real pause boundary before replying.
+        list(client.chat_completions(model="local-model", messages=HISTORY[:4], session_id="stable"))
         messages = HISTORY[:6] + [{"role": "tool", "tool_call_id": "other", "content": "UNKNOWN_RESULT"}]
         client.chat_completions(model="local-model", messages=messages, session_id="stable")
         assert len(sessions) == 2
@@ -306,11 +308,14 @@ def test_c01_unknown_terminal_result_is_rebuilt_instead_of_silently_ignored():
 
 
 def test_c01_parallel_results_can_arrive_in_parts_without_resending_answered_ids():
-    client, sessions = local_client()
+    client, sessions = local_client([
+        SessionEvent(type="toolCall", exec=pending()),
+        SessionEvent(type="toolCall", exec=pending("c2")), SessionEvent(type="batchReady"),
+        SessionEvent(type="batchReady"),
+    ])
     try:
-        client.chat_completions(model="local-model", messages=HISTORY[:4], session_id="stable")
-        sessions[0].pending_execs = [pending(), pending("c2")]
-        client.chat_completions(model="local-model", messages=HISTORY[:6], session_id="stable")
+        list(client.chat_completions(model="local-model", messages=HISTORY[:4], session_id="stable"))
+        list(client.chat_completions(model="local-model", messages=HISTORY[:6], session_id="stable"))
         messages = HISTORY[:6] + [{"role": "tool", "tool_call_id": "c2", "content": "SECOND_RESULT"}]
         client.chat_completions(model="local-model", messages=messages, session_id="stable")
         assert len(sessions) == 1

@@ -281,13 +281,20 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    updater.begin_shutdown()       # 禁止新更新，通知受控外部命令退出
+    update_checker.begin_shutdown()
     for t in _tasks:
         t.cancel()
     await asyncio.gather(*_tasks, return_exceptions=True)
+    await update_checker.stop()     # 等真实同步 worker，不是只等 to_thread wrapper
+    await updater.stop()
     await _http_client.aclose()
+    state_db.close()                # 最后 flush/验证/关闭快照
 ```
 
-所有循环都有 `try/except Exception` 包着，一个任务挂了不影响其他；但 `asyncio.CancelledError` 不捕获（允许 cancel 正常退出）。
+上例是生命周期顺序示意，实际清单与关闭顺序以 `server.py` 为准。`cancel/gather` 仅收束 asyncio 任务，不代表 executor 或独立线程已停止；更新检查登记同步 worker，updater 使用操作锁/恢复线程作为 join 屏障，长命令在关停时终止并 reap 子进程，之后才允许 StateStore 关闭。正在执行的外部 I/O、磁盘写入仍需完成/失败返回；不能超时后假称 worker 已退出。
+
+请求 drain、Uvicorn 等待和 lifespan 使用同一截止，不再次分配 80 秒；到期取消请求并等待其 finalizer，最终保留状态 flush。Compose 提供 150 秒外层宽限，自定义长操作/慢盘应同步扩大运维停止期限。
 
 ## API Provider usage refresh
 

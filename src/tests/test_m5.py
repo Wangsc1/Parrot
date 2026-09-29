@@ -108,6 +108,7 @@ async def test_probe_api_success_and_failure(m):
         return _httpx.Response(200, json={
             "id": "m", "type": "message", "role": "assistant",
             "content": [{"type": "text", "text": "2"}],
+            "stop_reason": "end_turn",
             "usage": {"input_tokens": 5, "output_tokens": 1},
         })
 
@@ -199,6 +200,7 @@ async def test_recovery_run_once(m):
         async def post(self, *a, **kw):
             return _httpx.Response(200, json={"id":"x","type":"message","role":"assistant",
                                               "content":[{"type":"text","text":"ok"}],
+                                              "stop_reason":"end_turn",
                                               "usage":{"input_tokens":1,"output_tokens":1}})
     orig = _httpx.AsyncClient
     _httpx.AsyncClient = FakeClient

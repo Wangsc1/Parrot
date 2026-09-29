@@ -386,7 +386,8 @@ def test_stream_tool_arguments_accumulate_across_protocol_chunks():
     chunks += list(chat_to_anth.close())
     events = _events(chunks)
     deltas = [d for e, d in events if e == "content_block_delta"]
-    assert [d["delta"]["partial_json"] for d in deltas] == ['{"q"', ':"ping"}']
+    # Recovery/validation must finish before immutable Anthropic JSON is published.
+    assert [d["delta"]["partial_json"] for d in deltas] == ['{"q":"ping"}']
     assert chat_to_anth.get_downstream_anthropic_assistant()["content"][0]["input"] == {"q": "ping"}
 
     # OpenAI Responses SSE → Anthropic SSE.
@@ -398,7 +399,8 @@ def test_stream_tool_arguments_accumulate_across_protocol_chunks():
     chunks += list(resp_to_anth.close())
     events = _events(chunks)
     deltas = [d for e, d in events if e == "content_block_delta"]
-    assert [d["delta"]["partial_json"] for d in deltas] == ['{"q"', ':"ping"}']
+    # Recovery/validation must finish before immutable Anthropic JSON is published.
+    assert [d["delta"]["partial_json"] for d in deltas] == ['{"q":"ping"}']
     assert resp_to_anth.get_downstream_anthropic_assistant()["content"][0]["input"] == {"q": "ping"}
 
     # Anthropic SSE → OpenAI Chat SSE: Anthropic partial_json chunks are emitted

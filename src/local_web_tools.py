@@ -16,6 +16,7 @@ from fastapi.responses import Response, StreamingResponse
 from . import config, log_db
 
 from .protocols import errors as protocol_errors
+from .async_owned import await_owned
 
 
 ANTHROPIC_WEB_SEARCH_TOOL_TYPES = frozenset({
@@ -1041,6 +1042,55 @@ def maybe_wrap_anthropic_json_response_as_sse(response: Response) -> Response:
     return StreamingResponse(_iter_anthropic_message_sse(obj), media_type="text/event-stream", headers=headers)
 
 
+class _OwnedTaskIterator:
+    """Own a prestarted task even when the response is closed before first next()."""
+    def __init__(self, task, iterator):
+        self.task, self.iterator = task, iterator
+        self._close_task = None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._close_task is not None:
+            raise StopAsyncIteration
+        try:
+            return await self.iterator.__anext__()
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self):
+        if self._close_task is None:
+            async def close():
+                if not self.task.done():
+                    self.task.cancel()
+                try:
+                    await self.iterator.aclose()
+                finally:
+                    await asyncio.gather(self.task, return_exceptions=True)
+                    if not self.task.cancelled() and self.task.exception() is None:
+                        response = self.task.result()
+                        inner = getattr(response, "body_iterator", None)
+                        if inner is not None and hasattr(inner, "aclose"):
+                            await inner.aclose()
+            self._close_task = asyncio.create_task(close())
+        # Repeated asyncio/ASGI cancellation must not orphan the task's finalizer.
+        await await_owned(self._close_task)
+
+
+class _OwnedTaskResponse(StreamingResponse):
+    def __init__(self, task, iterator):
+        self._owned_iterator = _OwnedTaskIterator(task, iterator)
+        super().__init__(self._owned_iterator, media_type="text/event-stream")
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._owned_iterator.aclose()
+
+
 def stream_anthropic_response_task_with_pings(
     task: "asyncio.Task[Response]",
     *,
@@ -1073,7 +1123,7 @@ def stream_anthropic_response_task_with_pings(
         async for chunk in _iter_response_as_anthropic_sse(response):
             yield chunk
 
-    return StreamingResponse(_iter(), media_type="text/event-stream")
+    return _OwnedTaskResponse(task, _iter())
 
 
 def _responses_error_payload_from_response(response: Response, body: bytes) -> dict[str, Any]:
@@ -1226,7 +1276,7 @@ def stream_responses_response_task_with_pings(
         if body:
             yield body
 
-    return StreamingResponse(_iter(), media_type="text/event-stream")
+    return _OwnedTaskResponse(task, _iter())
 
 
 def tool_reference_text(item: dict[str, Any]) -> str:

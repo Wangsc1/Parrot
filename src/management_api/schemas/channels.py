@@ -76,7 +76,7 @@ ChannelCreateRequest = Annotated[
 
 
 class ChannelUpdateRequest(StrictSchema):
-    name: str | None = Field(default=None, min_length=1)
+    name: str | None = Field(default=None, min_length=1, max_length=64)
     baseUrl: ChannelInputUrl | None = None
     apiPath: str | None = Field(default=None, max_length=4096)
     apiKey: SecretStr | None = Field(

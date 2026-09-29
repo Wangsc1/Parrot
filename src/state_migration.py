@@ -72,6 +72,18 @@ def _file_digest(path: str) -> str:
     return digest.hexdigest()
 
 
+def content_revision(fingerprint: dict[str, Any]) -> str:
+    """Migration identity, independent of timestamps/path and volatile SHM locks.
+
+    Keep the full revision below for copy-race detection. Derive this from file
+    entries as well for manifests written before content_revision existed.
+    """
+    files = [{key: row.get(key) for key in ("suffix", "size", "sha256")}
+             for row in fingerprint.get("files", []) if row.get("suffix") != "-shm"]
+    return hashlib.sha256(json.dumps(files, sort_keys=True,
+                                    separators=(",", ":")).encode()).hexdigest()
+
+
 def source_fingerprint(path: str) -> dict[str, Any]:
     """Stable identity of main plus all relevant real sidecars."""
     absolute = os.path.abspath(path)

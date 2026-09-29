@@ -46,8 +46,10 @@ def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
 
 
 def _status_from_stop(stop_reason: Optional[str], *, has_tool: bool) -> tuple[str, Optional[dict]]:
-    if stop_reason == "max_tokens":
+    if stop_reason in {"max_tokens", "model_context_window_exceeded"}:
         return "incomplete", {"reason": "max_output_tokens"}
+    if stop_reason == "pause_turn":
+        return "incomplete", {"reason": "pause_turn"}
     return "completed", None
 
 

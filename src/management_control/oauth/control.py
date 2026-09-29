@@ -48,6 +48,7 @@ from .models import (
     OAuthMutationResult,
     OAuthProvider,
     OAuthQuotaResetPlan,
+    OAuthQuotaResetResult,
     OAuthRuntimeError,
     OAuthSettings,
     OAuthUsageDisplayMode,
@@ -597,9 +598,51 @@ class OAuthControl(
         self._audit(context, "oauth.quota.reset-plan", account_id)
         return result
 
+    @staticmethod
+    def _quota_reset_receipt(raw, *, upstream: bool) -> tuple[str, str | None, str | None]:
+        """Project business facts only; never retry a consumed reset or expose raw errors."""
+        raw = raw if isinstance(raw, dict) else {}
+        local_actions = {
+            "reset", "already_enabled", "cleared_runtime_state", "reset_failed",
+            "noop_missing", "noop_user", "noop_auth_error", "state_conflict", "invalid_state",
+        }
+        if not upstream:
+            action = raw.get("action")
+            action = action if isinstance(action, str) and action in local_actions else "unknown"
+            return action, None, action
+        outcome = raw.get("outcome")
+        outcome = outcome if isinstance(outcome, str) and outcome in {
+            "reset", "alreadyRedeemed", "noCredit", "nothingToReset",
+        } else None
+        if outcome is None:
+            action = raw.get("action")
+            action = action if isinstance(action, str) and action in {
+                "noop_missing", "noop_user", "noop_auth_error", "not_openai",
+            } else "unknown"
+            return action, None, action
+        if outcome not in {"reset", "alreadyRedeemed"}:
+            return outcome, outcome, None
+        quota = raw.get("quota_action")
+        action = quota.get("action") if isinstance(quota, dict) else None
+        known_actions = {
+            "resumed", "kept_enabled", "still_over_quota", "disabled",
+            "wham_limit_keep_disabled", "wham_limit_disabled", "quota_unknown_keep_disabled",
+            "refresh_failed_keep_disabled", "state_update_failed_keep_disabled",
+            "resume_failed", "disable_failed", "state_conflict", "invalid_state",
+            "noop_missing", "noop_user", "noop_auth_error",
+        }
+        action = action if isinstance(action, str) and action in known_actions else "unknown"
+        if raw.get("refresh_error"):
+            action = "refresh_failed_keep_disabled"
+        runtime = raw.get("runtime_clear")
+        if isinstance(runtime, dict) and runtime.get("required_state_cleared") is False:
+            action = "runtime_state_clear_failed"
+        complete = action in {"resumed", "kept_enabled"}
+        return (outcome if complete else "partial"), outcome, action
+
     def reset_quota(
         self, context: ManagementContext, account_id: str, plan_token: str,
-    ) -> OAuthMutationResult:
+    ) -> OAuthQuotaResetResult:
         self._require(context, Capability.DESTRUCTIVE)
         try:
             # Exact URL identity and every observation are checked before the
@@ -623,22 +666,27 @@ class OAuthControl(
             )
             try:
                 if plan.payload["provider"] == "openai":
-                    asyncio.run(self.backend.redeem_openai_reset_credit(
+                    raw_result = asyncio.run(self.backend.redeem_openai_reset_credit(
                         account_id, str(plan.payload["idempotency_key"]),
                     ))
                 else:
-                    self.backend.reset_quota(account_id)
+                    raw_result = self.backend.reset_quota(account_id)
             except Exception as exc:
                 raise ManagementError(
-                    ManagementErrorCode.UPSTREAM_ERROR, retryable=True,
+                    ManagementErrorCode.UPSTREAM_ERROR, retryable=False,
                 ) from exc
-            result = OAuthMutationResult(
-                account_id, _revision(self._account(account_id)), "reset",
+            status, outcome, local_action = self._quota_reset_receipt(
+                raw_result, upstream=plan.payload["provider"] == "openai",
+            )
+            current = self.backend.get_account_exact(account_id)
+            result = OAuthQuotaResetResult(
+                account_id, _revision(current) if isinstance(current, dict) else plan.revision,
+                status, outcome, local_action,
             )
         except BaseException:
             self._audit(context, "oauth.quota.reset", account_id, "failed")
             raise
-        self._audit(context, "oauth.quota.reset", account_id)
+        self._audit(context, "oauth.quota.reset", account_id, result.status)
         return result
 
     @audit_failures("oauth.errors.clear", target_arg="account_id")

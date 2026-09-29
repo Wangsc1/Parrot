@@ -34,8 +34,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from pathlib import Path
+import signal
+import sysconfig
+import uuid
 import shlex
 import shutil
 import subprocess
@@ -45,6 +50,7 @@ import time
 from typing import Optional
 
 from . import __version__, config, network, notifier, state_db
+from . import update_supervisor
 
 
 # ─── 形态检测 ────────────────────────────────────────────────────
@@ -176,6 +182,23 @@ def reset_state() -> None:
 # ─── 更新锁（防并发）─────────────────────────────────────────────
 
 _op_lock = threading.Lock()
+_stopping = threading.Event()
+_resume_thread: threading.Thread | None = None
+
+
+def begin_shutdown() -> None:
+    """Stop admitting updates and interrupt bounded command/poll waits."""
+    _stopping.set()
+
+
+async def stop() -> None:
+    begin_shutdown()
+    while _op_lock.locked() or (_resume_thread is not None and getattr(_resume_thread, "is_alive", lambda: False)()):
+        await asyncio.sleep(0.02)
+
+
+def start() -> None:
+    _stopping.clear()
 
 
 # 中间态卡死超时（秒）：备份/拉取/重启/健康检查若超过此时长没推进，判定为卡死。
@@ -219,15 +242,27 @@ def is_busy() -> bool:
 
 def _run(cmd: list[str], *, cwd: Optional[str] = None, timeout: int = 300) -> tuple[int, str]:
     """执行固定参数命令，返回 (returncode, combined_output)。绝不走 shell。"""
+    if _stopping.is_set():
+        return 130, "update interrupted by shutdown"
     try:
-        p = subprocess.run(
-            cmd, cwd=cwd, timeout=timeout,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True,
-        )
-        return p.returncode, (p.stdout or "").strip()
-    except subprocess.TimeoutExpired:
-        return 124, f"timeout after {timeout}s: {' '.join(cmd)}"
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                out, _ = p.communicate(timeout=0.2)
+                return p.returncode, (out or "").strip()
+            except subprocess.TimeoutExpired:
+                if not _stopping.is_set() and time.monotonic() < deadline:
+                    continue
+                try: os.killpg(p.pid, signal.SIGTERM)
+                except ProcessLookupError: pass
+                try: p.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try: os.killpg(p.pid, signal.SIGKILL)
+                    except ProcessLookupError: pass
+                    p.communicate()
+                return (130, "update interrupted by shutdown") if _stopping.is_set() else (124, f"timeout after {timeout}s")
     except FileNotFoundError as exc:
         return 127, f"command not found: {exc}"
     except Exception as exc:
@@ -247,7 +282,7 @@ def wait_healthy(timeout: int = 90) -> tuple[bool, str]:
     url = _health_url()
     deadline = time.time() + timeout
     last = ""
-    while time.time() < deadline:
+    while time.time() < deadline and not _stopping.is_set():
         try:
             resp = network.get_sync(url, timeout=5)
             if resp.status_code == 200:
@@ -255,7 +290,7 @@ def wait_healthy(timeout: int = 90) -> tuple[bool, str]:
             last = f"http {resp.status_code}"
         except Exception as exc:
             last = type(exc).__name__
-        time.sleep(3)
+        _stopping.wait(0.2)
     return False, f"health timeout ({last})"
 
 
@@ -284,29 +319,67 @@ def _src_current_commit() -> str:
     return out.strip() if rc == 0 else ""
 
 
+def _source_data_excludes() -> list[str]:
+    """Protect custom runtime files even if an operator put them under src/."""
+    app = Path(_app_dir()).resolve()
+    cfg = config.get()
+    runtime, durable, legacy = state_db._paths()
+    paths = [config.path(), _backup_root(), runtime, durable, legacy, state_db._manifest_path(runtime)]
+    if Path(config.DATA_DIR).resolve() != app:
+        paths.append(config.DATA_DIR)
+    for value in (cfg.get("logDir", "logs"),
+                  (cfg.get("images") or {}).get("dbPath", "image_logs.db"),
+                  ((cfg.get("openai") or {}).get("store") or {}).get("dbPath", "openai_response_store.db")):
+        paths.append(value if os.path.isabs(value) else os.path.join(config.DATA_DIR, value))
+    excluded = []
+    for path in paths:
+        resolved = Path(path).resolve()
+        if resolved != app and resolved.is_relative_to(app):
+            relative = str(resolved.relative_to(app))
+            excluded.extend(relative + suffix for suffix in ("", ".bak", ".bak.1", ".bak.2", ".bak.3", ".lock", "-wal", "-shm", "-journal"))
+    return excluded
+
+
+def _source_restore_args(commit: str, excludes=()) -> list[str]:
+    # Reset --hard would also overwrite a tracked operator config/state file.
+    return ["restore", "--source", commit, "--staged", "--worktree", "--", ".",
+            *(f":(exclude){path}" for path in excludes)]
+
+
 def _src_backup(target_tag: str) -> tuple[bool, str, str]:
     """源码备份：tar 打包当前源码 + 记录 commit。返回 (ok, backup_ref, detail)。"""
     ts = time.strftime("%Y%m%d-%H%M%S")
     ref = f"src-{__version__}-{ts}"
     dest = os.path.join(_backup_root(), ref + ".tar.gz")
     app = _app_dir()
-    # 只打包源码，排除运行时数据（data/venv/.git/__pycache__/*.db）
-    cmd = [
-        "tar", "czf", dest,
-        "--exclude=./data", "--exclude=./venv", "--exclude=./.git",
-        "--exclude=./__pycache__", "--exclude=*.db", "--exclude=*.db-wal",
-        "--exclude=*.db-shm", "--exclude=./logs", "--exclude=./backups",
-        "-C", app, ".",
-    ]
-    rc, out = _run(cmd, timeout=180)
-    if rc != 0:
-        return False, "", f"tar failed: {out[:300]}"
+    excludes = _source_data_excludes()
+    try:
+        update_supervisor.backup_code(app, dest, excludes)
+    except Exception as exc:
+        return False, "", f"source archive failed: {type(exc).__name__}"
     commit = _src_current_commit()
     meta = {"ref": ref, "tar": dest, "commit": commit, "version": __version__,
-            "target_tag": target_tag, "mode": "src", "ts": ts}
-    with open(os.path.join(_backup_root(), ref + ".json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+            "target_tag": target_tag, "mode": "src", "ts": ts,
+            "created_at": time.time(), "excludes": excludes}
+    monitor = Path(_backup_root()) / (ref + ".monitor.py")
+    shutil.copyfile(update_supervisor.__file__, monitor)
+    os.chmod(monitor, 0o600)
+    update_supervisor.write_json(Path(_backup_root()) / (ref + ".json"), meta)
     return True, ref, f"backup ok ({dest})"
+
+
+def _prepare_source_dependencies() -> dict:
+    ref = load_state().get("backup_ref") or ""
+    meta_path = Path(_backup_root()) / (ref + ".json")
+    meta = json.loads(meta_path.read_text())
+    paths = sysconfig.get_paths()
+    snapshot = update_supervisor.snapshot_dependencies(
+        str(Path(_backup_root()) / (ref + ".deps")),
+        list(dict.fromkeys(paths[key] for key in ("purelib", "platlib", "scripts"))),
+    )
+    meta["dependencies"] = str(Path(snapshot["root"]) / "snapshot.json")
+    update_supervisor.write_json(meta_path, meta)
+    return snapshot
 
 
 def _src_pull(target_tag: str, prev_commit: str = "") -> tuple[bool, str]:
@@ -319,12 +392,18 @@ def _src_pull(target_tag: str, prev_commit: str = "") -> tuple[bool, str]:
     rc, out = _git(["fetch", "--all", "--tags", "--prune"], timeout=180)
     if rc != 0:
         return False, f"git fetch failed: {out[:300]}"
-    # 优先按 tag checkout；tag 不存在则尝试 origin/<tag>
-    rc, out = _git(["checkout", "-f", target_tag], timeout=120)
+    # Change tracked source, never operator-owned runtime paths (even tracked ones).
+    target_ref = target_tag
+    excludes = _source_data_excludes()
+    rc, out = _git(_source_restore_args(target_ref, excludes), timeout=120)
     if rc != 0:
-        rc2, out2 = _git(["reset", "--hard", f"origin/{target_tag}"], timeout=120)
+        target_ref = f"origin/{target_tag}"
+        rc2, out2 = _git(_source_restore_args(target_ref, excludes), timeout=120)
         if rc2 != 0:
             return False, f"checkout {target_tag} failed: {out[:200]} / {out2[:200]}"
+    rc, out = _git(["reset", "--soft", target_ref], timeout=30)
+    if rc != 0:
+        return False, f"source revision update failed: {out[:200]}"
     # 依赖变更才装：优先用备份 commit 作 diff 基准；缺失则回退 HEAD@{1}；
     # 再不行就保守地"装一次"（宁可多装也不漏依赖导致启动失败）。
     need_install = False
@@ -341,71 +420,111 @@ def _src_pull(target_tag: str, prev_commit: str = "") -> tuple[bool, str]:
         # Install into the interpreter actually running the service, including
         # .venv/custom venv/system installs. Never silently skip missing pip,
         # escalate privileges, or bypass externally-managed-environment guards.
-        rc3, out3 = _run([sys.executable, "-m", "pip", "install", "-r",
-                          os.path.join(_app_dir(), "requirements.txt")], timeout=600)
-        if rc3 == 0:
-            rc3, out3 = _run([sys.executable, "-m", "pip", "check"], timeout=60)
+        snapshot = None
+        try:
+            snapshot = _prepare_source_dependencies()
+            rc3, out3 = _run([sys.executable, "-m", "pip", "install", "-r",
+                              os.path.join(_app_dir(), "requirements.txt")], timeout=600)
+            if rc3 == 0:
+                rc3, out3 = _run([sys.executable, "-m", "pip", "check"], timeout=60)
+        except Exception as exc:
+            rc3, out3 = 1, f"dependency backup/install failed: {type(exc).__name__}"
+        finally:
+            if snapshot is not None:
+                update_supervisor.seal_dependencies(snapshot)
         if rc3 != 0:
             restored = False
             if rollback_commit:
-                rc4, _ = _git(["reset", "--hard", rollback_commit], timeout=120)
+                rc4, _ = _git(_source_restore_args(rollback_commit, _source_data_excludes()), timeout=120)
                 restored = rc4 == 0
+                if restored:
+                    _git(["reset", "--soft", rollback_commit], timeout=30)
+            ref = load_state().get("backup_ref")
+            if ref:
+                restored, repair = _src_rollback(ref)
+            elif snapshot is not None:
+                update_supervisor.restore_dependencies(str(Path(snapshot["root"]) / "snapshot.json"))
             return False, (f"dependency install/check failed: {out3[-300:]}; "
-                           f"source restored={restored}; dependencies may require manual repair")
+                           f"source/dependency rollback={restored}")
+    save_state(target_code_digest=update_supervisor.code_digest(_app_dir(), _source_data_excludes()))
     return True, f"checked out {target_tag}"
 
 
 def _src_restart() -> tuple[bool, str]:
-    """触发重启。systemd 用 systemctl（detached，不在进程树里）；bare 用 exec 自替换。"""
-    mode = _detect_mode()
-    if mode == MODE_SYSTEMD:
-        svc = _cfg()["serviceName"]
-        # detached：systemctl restart 会 SIGTERM 当前进程，但命令本身由 systemd 执行，
-        # 即使当前进程被杀，重启动作照常完成。用 Popen 不等待。
-        try:
-            # 延迟一拍再触发，确保 StateStore snapshots 事务提交 + 当前 TG 响应发出
-            def _delayed_systemctl():
-                time.sleep(1.5)
-                subprocess.Popen(
-                    ["systemctl", "restart", svc],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            threading.Thread(target=_delayed_systemctl, daemon=True).start()
-            return True, f"systemctl restart {svc} dispatched"
-        except Exception as exc:
-            return False, f"systemctl restart failed: {exc}"
-    else:
-        # bare：延迟 exec 自替换，给 HTTP 响应留出返回时间
-        def _delayed_exec():
-            time.sleep(2)
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-        threading.Thread(target=_delayed_exec, daemon=True).start()
-        return True, "self-exec restart scheduled"
+    """Dispatch an independent, stdlib-only monitor before stopping this process."""
+    try:
+        st = load_state()
+        ref = st.get("backup_ref") or ""
+        root = Path(_backup_root())
+        meta = json.loads((root / (ref + ".json")).read_text())
+        monitor = root / (ref + ".monitor.py")
+        if not monitor.is_file():
+            shutil.copyfile(update_supervisor.__file__, monitor)
+            os.chmod(monitor, 0o600)
+        update_id = uuid.uuid4().hex
+        result_path = str(root / (ref + ".result.json"))
+        mode = st.get("mode") or _detect_mode()
+        plan = {
+            "update_id": update_id, "result_path": result_path,
+            "app": _app_dir(), "archive": meta["tar"], "excludes": meta.get("excludes", []),
+            "dependencies": meta.get("dependencies"), "mode": mode,
+            "target_code_digest": st.get("target_code_digest"),
+            "service": _cfg()["serviceName"], "old_pid": os.getpid(),
+            "old_identity": update_supervisor.process_identity(os.getpid()),
+            "command": [sys.executable, *sys.argv], "environment": dict(os.environ),
+            "health_url": _health_url(), "health_timeout": _cfg()["healthTimeoutSeconds"],
+            "stop_timeout": _cfg()["gracefulStopSeconds"],
+            "target_version": st.get("target_tag") or st.get("to_version"),
+            "from_version": st.get("from_version") or meta["version"],
+            "rollback_commands": ([["git", "-C", _app_dir(), *_source_restore_args(meta["commit"], meta.get("excludes", []))],
+                                   ["git", "-C", _app_dir(), "reset", "--soft", meta["commit"]]]
+                                  if meta.get("commit") else []),
+        }
+        plan_path = str(root / (ref + ".plan.json"))
+        update_supervisor.write_json(plan_path, plan)
+        save_state(supervisor_id=update_id, supervisor_result=result_path)
+        command = [sys.executable, "-S", str(monitor), plan_path]
+        if mode == MODE_SYSTEMD:
+            # setsid alone does NOT escape the service's KillMode=control-group.
+            # A transient one-shot unit survives the target unit's stop/restart.
+            rc, detail = _run(["systemd-run", "--quiet", "--collect",
+                               f"--unit=parrot-update-{update_id}",
+                               f"--uid={os.getuid()}", f"--gid={os.getgid()}",
+                               *command], timeout=15)
+            return rc == 0, "source update monitor dispatched" if rc == 0 else detail
+        with open(_update_log_path(), "a") as output:
+            subprocess.Popen(command, cwd=_app_dir(), stdout=output, stderr=output,
+                             start_new_session=True, close_fds=True)
+        return True, "source update monitor dispatched"
+    except Exception as exc:
+        return False, f"source update monitor failed: {type(exc).__name__}"
 
 
 def _src_rollback(backup_ref: str) -> tuple[bool, str]:
-    """源码回滚：从备份 tar 还原源码 + checkout 回原 commit。"""
+    """Restore code only; revert precisely the dependency files changed by pip."""
     if not backup_ref:
         return False, "no backup ref"
-    meta_path = os.path.join(_backup_root(), backup_ref + ".json")
-    if not os.path.exists(meta_path):
+    meta_path = Path(_backup_root()) / (backup_ref + ".json")
+    if not meta_path.is_file():
         return False, f"backup meta missing: {backup_ref}"
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    commit = meta.get("commit") or ""
-    if commit and _src_is_git_repo():
-        rc, out = _git(["reset", "--hard", commit], timeout=120)
-        if rc == 0:
-            return True, f"rolled back to {commit[:8]}"
-    # git 还原失败 → 从 tar 还原
-    tar = meta.get("tar") or ""
-    if tar and os.path.exists(tar):
-        rc, out = _run(["tar", "xzf", tar, "-C", _app_dir()], timeout=180)
-        if rc == 0:
-            return True, "rolled back from tar"
-        return False, f"tar restore failed: {out[:200]}"
-    return False, "rollback failed: no usable backup"
+    try:
+        meta = json.loads(meta_path.read_text())
+        restored = False
+        if meta.get("commit") and _src_is_git_repo():
+            rc, _ = _git(_source_restore_args(meta["commit"],
+                          (*meta.get("excludes", []), *_source_data_excludes())), timeout=120)
+            restored = rc == 0
+            if restored:
+                _git(["reset", "--soft", meta["commit"]], timeout=30)
+        if meta.get("tar") and os.path.isfile(meta["tar"]):
+            update_supervisor.restore_code(_app_dir(), meta["tar"],
+                                           (*meta.get("excludes", []), *_source_data_excludes()))
+            restored = True
+        if meta.get("dependencies"):
+            update_supervisor.restore_dependencies(meta["dependencies"])
+        return restored, "source/dependencies restored" if restored else "no usable code backup"
+    except Exception as exc:
+        return False, f"source/dependency restore failed: {type(exc).__name__}"
 
 
 # ─── Docker 形态执行器 ───────────────────────────────────────────
@@ -627,7 +746,13 @@ def _compose_up_inner(backup_digest: str = "", health_port: int = 0) -> str:
     image = cfg["image"]
     cdir = _docker_compose_dir()
     flag_dir = f"{cdir}/data"   # sidecar 挂的是 composeDir:composeDir，真实路径在这
-    tries = max(10, min(60, int(cfg.get("healthTimeoutSeconds", 90) or 90) // 3))
+    health_seconds = max(1, int(cfg.get("healthTimeoutSeconds", 90) or 90))
+    health_port = int(health_port or 22122)
+    if not 1 <= health_port <= 65535:
+        raise ValueError("invalid health port")
+    st = load_state()
+    target_version_q = shlex.quote(str(st.get("target_tag") or "").lstrip("vV"))
+    from_version_q = shlex.quote(str(st.get("from_version") or __version__).lstrip("vV"))
     stop_tries = max(10, min(600, int(cfg.get("gracefulStopSeconds", 100) or 100)))
     log = f"{flag_dir}/.update_log"
 
@@ -650,6 +775,12 @@ def _compose_up_inner(backup_digest: str = "", health_port: int = 0) -> str:
     #   ⑤ 失败：把镜像 tag 指回备份 digest，compose up 重建旧版本，并**再次健康验证**，
     #      确保回滚后服务真的可用；只有回滚后健康才写 ROLLBACK（成功回滚），
     #      否则写 ROLLBACK_FAILED（回滚也没起来，极端情况，需人工）。
+    health_code = ('import json,sys; d=json.load(sys.stdin); '
+                   'sys.exit(0 if d.get("status") not in ("error","draining") and '
+                   '(not sys.argv[1] or str(d.get("version", "")).lstrip("vV")==sys.argv[1]) else 1)')
+    health_command = shlex.quote(f'curl --connect-timeout 2 --max-time 3 -fsS '
+                                 f'http://127.0.0.1:{health_port}/health | '
+                                 f'python -c {shlex.quote(health_code)} "$1"')
     script = f"""set +e
 LOG={log_q}
 FLAG_DIR={flag_dir_q}
@@ -659,14 +790,23 @@ IMAGE={image_q}
 BACKUP_DIGEST={backup_digest_q}
 : > "$LOG" 2>/dev/null || true
 logln() {{ echo "[$(date -u +%H:%M:%S)] $*" >> "$LOG" 2>/dev/null || true; }}
-health_ok() {{ docker exec "$NAME" curl -fsS http://127.0.0.1:22122/health >/dev/null 2>&1; }}
+# Bound every Engine CLI wait; a wedged daemon must not block rollback forever.
+docker() {{ timeout -s TERM -k 2 30 docker "$@"; }}
+EXPECTED_VERSION={target_version_q}
+FROM_VERSION={from_version_q}
+EXPECTED_DIGEST="$(docker image inspect -f '{{{{.Id}}}}' "$IMAGE" 2>/dev/null)"
+health_ok() {{ [ -n "$EXPECTED_DIGEST" ] && timeout -s TERM -k 1 "$PROBE_TIMEOUT" docker exec "$NAME" sh -c {health_command} sh "$EXPECTED_VERSION" >/dev/null 2>&1 && [ "$(timeout -s TERM -k 1 "$PROBE_TIMEOUT" docker inspect -f '{{{{.Image}}}}' "$NAME" 2>/dev/null)" = "$EXPECTED_DIGEST" ]; }}
 wait_health() {{
-  ok=0
-  for i in $(seq 1 {tries}); do
-    sleep 3
-    if health_ok; then ok=1; break; fi
+  deadline=$(( $(date +%s) + {health_seconds} ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    left=$(( deadline - $(date +%s) ))
+    PROBE_TIMEOUT=$left
+    [ "$PROBE_TIMEOUT" -le 5 ] || PROBE_TIMEOUT=5
+    [ "$PROBE_TIMEOUT" -gt 0 ] || return 1
+    if health_ok; then return 0; fi
+    sleep 1
   done
-  return $([ "$ok" = "1" ] && echo 0 || echo 1)
+  return 1
 }}
 container_running() {{
   [ "$(docker inspect -f '{{{{.State.Running}}}}' "$NAME" 2>/dev/null || true)" = "true" ]
@@ -754,6 +894,8 @@ fail_rollback() {{
   RB_RC=$?
   echo "$RB_OUT" | tail -10 >> "$LOG" 2>/dev/null || true
   logln "回滚重建完成，验证健康…"
+  EXPECTED_VERSION="$FROM_VERSION"
+  EXPECTED_DIGEST="$BACKUP_DIGEST"
   if [ $RB_RC -eq 0 ] && wait_health; then
     logln "✅ 回滚成功，旧版本已恢复并健康"
     echo "ROLLBACK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
@@ -779,6 +921,11 @@ logln "✅ compose 校验通过（备份 digest=$BACKUP_DIGEST）"
 #    这一步必须在 rm 旧容器前完成，避免 service 名失配时先停服务再报 no such service。
 resolve_service
 logln "使用 compose service=$SVC"
+if [ -z "$EXPECTED_DIGEST" ]; then
+  logln "❌ 无法确认目标镜像身份；未停止旧容器"
+  echo "ROLLBACK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
+  exit 1
+fi
 # ③ SIGTERM + 等待优雅退出后移除旧容器；任何失败都拒绝 SIGKILL。
 if ! graceful_remove; then
   logln "❌ 旧容器未能安全停止，已中止更新"
@@ -790,10 +937,10 @@ UP_OUT="$(docker compose up -d --force-recreate --pull never "$SVC" 2>&1)"
 UP_RC=$?
 echo "$UP_OUT" | tail -20 >> "$LOG" 2>/dev/null || true
 if [ $UP_RC -ne 0 ]; then logln "❌ compose up 失败（rc=$UP_RC）"; fail_rollback; fi
-logln "新容器已启动，等待健康检查（最多 {tries*3}s）…"
+logln "新容器已启动，等待健康检查（最多 {health_seconds}s）…"
 # ④ 健康门控
 if ! wait_health; then
-  logln "❌ 健康检查未通过（{tries*3}s 内 /health 未就绪）"
+  logln "❌ 健康检查未通过（{health_seconds}s 内 /health 未就绪）"
   logln "新容器最近日志："
   docker logs --tail 30 "$NAME" >> "$LOG" 2>&1 || true
   fail_rollback
@@ -803,6 +950,9 @@ logln "✅ 更新成功，健康检查通过"
 echo "OK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
 exit 0
 """
+    result_id = st.get("result_id")
+    if result_id:
+        script = script.replace('/.update_result"', '/.update_result.' + str(result_id) + '"')
     return script
 
 
@@ -835,7 +985,7 @@ def _docker_backup(target_tag: str) -> tuple[bool, str, str]:
         return False, "", f"backup tag failed: {backup_tag}"
     meta = {"ref": ref, "image": image, "digest": digest,
             "backup_tag": backup_tag, "version": __version__,
-            "target_tag": target_tag, "mode": "docker", "ts": ts}
+            "target_tag": target_tag, "mode": "docker", "ts": ts, "created_at": time.time()}
     with open(os.path.join(_backup_root(), ref + ".json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return True, ref, f"backup tag {backup_tag} (digest {digest[:19]})"
@@ -873,7 +1023,8 @@ def _docker_sidecar_recreate(backup_digest: str = "") -> tuple[bool, str]:
     宿主有 CLI → 直接 docker run 起 sidecar；容器内 → Engine API 起 sidecar。
     backup_digest：传给 sidecar，健康检查失败时回滚到此 digest。
     """
-    inner = _compose_up_inner(backup_digest=backup_digest)
+    inner = _compose_up_inner(backup_digest=backup_digest,
+                              health_port=int((config.get().get("listen") or {}).get("port", 22122)))
     if _has_local_docker():
         cdir = _docker_compose_dir()
         cmd = [
@@ -944,9 +1095,13 @@ def _emit(stage: str, text: str) -> None:
 def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
                  notify_msg_id: Optional[int] = None) -> tuple[bool, str]:
     """第一阶段：备份 → 拉取 → staged。线程安全，幂等拒绝并发。"""
+    if _stopping.is_set():
+        return False, "服务正在关闭，未执行更新操作"
     if not _op_lock.acquire(blocking=False):
         return False, "另一个更新操作正在进行中"
     try:
+        if _stopping.is_set():
+            return False, "服务正在关闭，未执行更新操作"
         if is_busy():
             return False, "已有更新在进行中（staged/restarting）"
         mode = _detect_mode()
@@ -954,7 +1109,8 @@ def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
         append_update_log(f"开始更新：{__version__} → {target_tag}（形态 {mode}）")
         save_state(stage=STAGE_BACKING_UP, mode=mode, from_version=__version__,
                    target_tag=target_tag, to_version=target_tag,
-                   chat_id=chat_id, notify_msg_id=notify_msg_id, message="开始备份")
+                   chat_id=chat_id, notify_msg_id=notify_msg_id, message="开始备份",
+                   supervisor_id=None, supervisor_result=None, target_code_digest=None)
         _emit(STAGE_BACKING_UP, f"📦 正在备份当前版本 v{__version__} …")
 
         # 源码形态：先挡掉未提交改动
@@ -993,10 +1149,18 @@ def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
                 pass
             ok, detail = _src_pull(target_tag, prev_commit=prev_commit)
         if not ok:
+            if mode != MODE_DOCKER:
+                restored, restore_detail = _src_rollback(ref)
+                detail += f"; rollback={restored}: {restore_detail}"
             append_update_log(f"❌ 拉取失败：{detail}")
             save_state(stage=STAGE_FAILED, message=f"拉取失败: {detail}")
             _emit(STAGE_FAILED, f"❌ 拉取失败：{detail}")
             return False, detail
+        if _stopping.is_set():
+            if mode != MODE_DOCKER:
+                _src_rollback(ref)
+            save_state(stage=STAGE_FAILED, message="更新因关停中断；未进入 staged")
+            return False, "update interrupted by shutdown"
         append_update_log(f"✅ 拉取完成：{detail}")
 
         # ③ 进入 staged（停下，等用户二次确认）
@@ -1037,9 +1201,13 @@ def confirm_restart() -> tuple[bool, str]:
 
     用 _op_lock 防止「连点两次确认」触发两次备份或重启（TOCTOU）。
     """
+    if _stopping.is_set():
+        return False, "服务正在关闭，未执行更新操作"
     if not _op_lock.acquire(blocking=False):
         return False, "另一个更新操作正在进行中"
     try:
+        if _stopping.is_set():
+            return False, "服务正在关闭，未执行更新操作"
         st = load_state()
         if st.get("stage") != STAGE_STAGED:
             return False, f"当前不在 staged 态（{st.get('stage')}），无法确认重启"
@@ -1054,7 +1222,8 @@ def confirm_restart() -> tuple[bool, str]:
 
         # Durable StateStore guarantees the restarting state is verified before return.
         try:
-            save_state(stage=STAGE_RESTARTING, message="用户已确认，正在重启生效")
+            save_state(stage=STAGE_RESTARTING, message="用户已确认，正在重启生效",
+                       result_id=uuid.uuid4().hex if mode == MODE_DOCKER else None)
         except Exception as exc:
             return _restart_guard_failed(f"persist restarting state: {exc}")
 
@@ -1093,9 +1262,13 @@ def cancel_staged() -> tuple[bool, str]:
 
     用 _op_lock 防止与 confirm_restart 竞争（避免「同时取消又确认」）。
     """
+    if _stopping.is_set():
+        return False, "服务正在关闭，未执行更新操作"
     if not _op_lock.acquire(blocking=False):
         return False, "另一个更新操作正在进行中"
     try:
+        if _stopping.is_set():
+            return False, "服务正在关闭，未执行更新操作"
         st = load_state()
         if st.get("stage") != STAGE_STAGED:
             return False, f"当前不在 staged 态（{st.get('stage')}）"
@@ -1205,9 +1378,11 @@ def _read_update_result(wait_seconds: int = 60) -> str:
 
     sidecar 在 composeDir/data 下写该文件 = 容器内的 /app/data/.update_result。
     """
-    path = os.path.join(config.DATA_DIR, ".update_result")
+    result_id = load_state().get("result_id")
+    suffix = "." + str(result_id) if result_id else ""
+    path = os.path.join(config.DATA_DIR, ".update_result" + suffix)
     deadline = time.time() + max(10, wait_seconds)
-    while time.time() < deadline:
+    while time.time() < deadline and not _stopping.is_set():
         try:
             if os.path.exists(path):
                 with open(path, encoding="utf-8") as f:
@@ -1216,7 +1391,7 @@ def _read_update_result(wait_seconds: int = 60) -> str:
                     return val
         except Exception:
             pass
-        time.sleep(3)
+        _stopping.wait(0.2)
     return ""
 
 
@@ -1230,7 +1405,9 @@ def resume_after_restart() -> None:
     except Exception:
         return
     st = load_state()
-    if st.get("stage") != STAGE_RESTARTING:
+    if st.get("stage") not in (STAGE_RESTARTING, STAGE_VERIFYING) or _stopping.is_set():
+        return
+    if not _op_lock.acquire(blocking=False):
         return
 
     def _worker():
@@ -1240,11 +1417,36 @@ def resume_after_restart() -> None:
         mode = st.get("mode") or _detect_mode()
         now_ver = __version__
 
+        if mode != MODE_DOCKER and st.get("supervisor_id"):
+            deadline = time.monotonic() + timeout * 2 + _cfg()["gracefulStopSeconds"] * 2 + 30
+            result = ""
+            while time.monotonic() < deadline and not _stopping.is_set():
+                try:
+                    value = json.loads(Path(st["supervisor_result"]).read_text())
+                    if value.get("update_id") == st["supervisor_id"]:
+                        result = value.get("result", "")
+                        break
+                except (OSError, ValueError):
+                    pass
+                _stopping.wait(0.2)
+            if _stopping.is_set(): return  # preserve verifying for the next process
+            if result == "OK" and now_ver.lstrip("vV") == target.lstrip("vV"):
+                stage, message = STAGE_SUCCESS, f"更新成功 → v{now_ver}（独立监护已验证）"
+            elif result == "ROLLBACK" and now_ver.lstrip("vV") == str(st.get("from_version", "")).lstrip("vV"):
+                stage, message = STAGE_ROLLED_BACK, "独立监护已回滚源码/依赖并验证旧版本健康"
+            else:
+                stage, message = STAGE_FAILED, "独立监护未确认目标版本或回滚健康，请查看更新日志"
+            save_state(stage=stage, to_version=now_ver, message=message)
+            _emit(stage, message)
+            _notify_cross_process(message, st.get("chat_id"), st.get("notify_msg_id"))
+            return
+
         # docker 形态：sidecar 已经做过健康门控 + 回滚，这里优先读它写的结果标记。
         # 若标记为 ROLLBACK，说明新容器起不来、sidecar 已回滚（当前进程其实是旧版）。
         # 等待窗口要覆盖 sidecar 的健康门控(≤180s) + 回滚重建(~30s)，故放宽到 timeout*2+60。
         if mode == MODE_DOCKER:
             result = _read_update_result(wait_seconds=timeout * 2 + 60)
+            if _stopping.is_set(): return
             if result == "ROLLBACK":
                 save_state(stage=STAGE_ROLLED_BACK,
                            message="新版本健康检查失败，sidecar 已自动回滚")
@@ -1269,6 +1471,7 @@ def resume_after_restart() -> None:
             # OK 或无标记 → 落到下面的常规健康确认
 
         ok, detail = wait_healthy(timeout)
+        if _stopping.is_set(): return
         # 版本对比兜底：健康通过，但若当前版本仍是"更新前版本"（=回滚发生），
         # 说明 sidecar 已回滚（哪怕标记文件丢了），按回滚汇报而非误报成功。
         from_ver = (st.get("from_version") or "").lstrip("vV")
@@ -1278,6 +1481,8 @@ def resume_after_restart() -> None:
             and target_norm and now_ver.lstrip("vV") == from_ver
             and target_norm != from_ver
         )
+        if ok and now_ver.lstrip("vV") != target_norm and not rolled_back_by_version:
+            ok, detail = False, f"wrong version: expected {target}, observed {now_ver}"
         if ok and not rolled_back_by_version:
             save_state(stage=STAGE_SUCCESS, to_version=now_ver,
                        message=f"更新成功 → v{now_ver}")
@@ -1317,42 +1522,63 @@ def resume_after_restart() -> None:
             _notify_cross_process(rb_msg, st.get("chat_id"), st.get("notify_msg_id"),
                                   reply_markup=_faillog_buttons())
 
-    threading.Thread(target=_worker, daemon=True, name="updater-resume").start()
+    def _owned_worker():
+        try:
+            _worker()
+        except Exception as exc:
+            if not _stopping.is_set():
+                save_state(stage=STAGE_FAILED, message=f"更新校验失败: {type(exc).__name__}")
+        finally:
+            _op_lock.release()
+    global _resume_thread
+    try:
+        _resume_thread = threading.Thread(target=_owned_worker, daemon=True, name="updater-resume")
+        _resume_thread.start()
+    except BaseException:
+        _op_lock.release()
+        raise
 
 
 # ─── 备份清理 ────────────────────────────────────────────────────
 
+def _backup_entries() -> list[dict]:
+    root = Path(_backup_root())
+    entries = []
+    for path in root.glob("*.json"):
+        try:
+            meta = json.loads(path.read_text())
+            if meta.get("ref") != path.stem:
+                continue  # monitor plans/results are not backup metadata
+            try:
+                created = float(meta["created_at"])
+            except (KeyError, ValueError, TypeError):
+                # Historical names end in timestamp, regardless of version width.
+                stamp = meta.get("ts") or "-".join(path.stem.rsplit("-", 2)[-2:])
+                try: created = time.mktime(time.strptime(stamp, "%Y%m%d-%H%M%S"))
+                except ValueError: created = path.stat().st_mtime
+            entries.append((created, meta))
+        except (OSError, ValueError, TypeError):
+            continue
+    return [meta for _, meta in sorted(entries, key=lambda item: item[0], reverse=True)]
+
+
 def _prune_backups() -> None:
-    """保留最近 keepBackups 份，旧的删掉。"""
-    keep = _cfg()["keepBackups"]
-    root = _backup_root()
-    try:
-        metas = [f for f in os.listdir(root) if f.endswith(".json")]
-        metas.sort(reverse=True)  # 时间戳在文件名里，逆序=最新在前
-        for old in metas[keep:]:
-            ref = old[:-5]
-            for ext in (".json", ".tar.gz", ".state.db"):
-                p = os.path.join(root, ref + ext)
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
-    except Exception as exc:
-        print(f"[updater] prune backups failed: {exc}")
+    """Keep newest by creation time; never remove the current rollback anchor."""
+    keep = max(0, _cfg()["keepBackups"])
+    root = Path(_backup_root())
+    active_ref = load_state().get("backup_ref")
+    for meta in _backup_entries()[keep:]:
+        ref = meta["ref"]
+        if ref == active_ref:
+            continue
+        try:
+            for suffix in (".json", ".tar.gz", ".state.db", ".monitor.py", ".plan.json", ".result.json"):
+                (root / (ref + suffix)).unlink(missing_ok=True)
+            deps = root / (ref + ".deps")
+            if deps.is_dir(): shutil.rmtree(deps)
+        except OSError as exc:
+            print(f"[updater] prune backups failed: {exc}")
 
 
 def list_backups() -> list[dict]:
-    root = _backup_root()
-    out = []
-    try:
-        for f in sorted(os.listdir(root), reverse=True):
-            if f.endswith(".json"):
-                try:
-                    with open(os.path.join(root, f), "r", encoding="utf-8") as fp:
-                        out.append(json.load(fp))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return out
+    return _backup_entries()

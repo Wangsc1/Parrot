@@ -338,7 +338,6 @@ def request_body_from_ws_create(obj: dict) -> dict:
     body.pop("type", None)
     # Lane routing belongs to the WS transport, never to HTTP Responses bodies.
     body.pop("stream_id", None)
-    body.pop("generate", None)
     body.pop("client_metadata", None)
     return body
 
@@ -354,10 +353,12 @@ def sync_prompt_cache_key_to_ws_create(obj: dict, body: dict) -> None:
 
 def sync_translated_body_to_ws_create(obj: dict, body: dict) -> None:
     sync_prompt_cache_key_to_ws_create(obj, body)
-    if "input" in body:
-        obj["input"] = body["input"]
-    if "instructions" in body:
-        obj["instructions"] = body["instructions"]
+    # Body is authoritative after replay/translation. Preserve only the WS
+    # envelope fields deliberately removed at ingress, not stale request fields.
+    envelope = {key: obj[key] for key in ("type", "stream_id", "client_metadata") if key in obj}
+    obj.clear()
+    obj.update({key: value for key, value in body.items() if not key.startswith("_")})
+    obj.update(envelope)
 
 
 def map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel=None) -> dict:

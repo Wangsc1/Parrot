@@ -17,7 +17,25 @@ from src import updater
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def updater_lifecycle():
+    updater.start()
+    yield
+    updater.start()
+
+
+def synthetic_dependencies(monkeypatch, tmp_path):
+    from src import update_supervisor
+    lib = tmp_path / 'lib'
+    lib.mkdir()
+    snapshot = update_supervisor.snapshot_dependencies(str(tmp_path/'deps'), [str(lib)])
+    monkeypatch.setattr(updater, '_prepare_source_dependencies', lambda: snapshot)
+    monkeypatch.setattr(updater, 'load_state', lambda: {})
+    monkeypatch.setattr(updater, 'save_state', lambda **kw: None)
+
+
 def test_source_dependency_install_uses_running_interpreter(monkeypatch, tmp_path):
+    synthetic_dependencies(monkeypatch, tmp_path)
     calls = []
     monkeypatch.setattr(updater, "_app_dir", lambda: str(tmp_path))
     monkeypatch.setattr(updater, "_git", lambda args, **kw: (0, "requirements.txt" if args[0] == "diff" else ""))
@@ -29,6 +47,7 @@ def test_source_dependency_install_uses_running_interpreter(monkeypatch, tmp_pat
 
 
 def test_source_failed_dependency_install_restores_checkout(monkeypatch, tmp_path):
+    synthetic_dependencies(monkeypatch, tmp_path)
     calls = []
     monkeypatch.setattr(updater, "_app_dir", lambda: str(tmp_path))
     monkeypatch.setattr(updater, "_git", lambda args, **kw: calls.append(args) or (0, "requirements.txt" if args[0] == "diff" else "old"))
@@ -36,7 +55,9 @@ def test_source_failed_dependency_install_restores_checkout(monkeypatch, tmp_pat
     ok, detail = updater._src_pull("v-next", prev_commit="old")
     assert not ok
     assert "permission denied" in detail
-    assert ["reset", "--hard", "old"] in calls
+    assert any(args[:3] == ['restore', '--source', 'old'] for args in calls)
+    assert ['reset', '--soft', 'old'] in calls
+    assert not any('--hard' in args for args in calls)
 
 
 @pytest.mark.parametrize("cli", [True, False])

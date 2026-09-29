@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -27,13 +28,18 @@ from typing import Any, Mapping
 # ─── 单位换算 ────────────────────────────────────────────────────
 
 def _parse_util_fraction(raw: Any) -> float | None:
-    """'0.05' → 0.05；非法值返回 None。值保持 0..1 小数原样，不做 × 100。"""
+    """'0.05' → 0.05；保留正常 >1 超额值，拒绝负数和非有限值。"""
     if raw is None or raw == "":
         return None
     try:
-        return float(raw)
-    except (TypeError, ValueError):
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
         return None
+    # The public patch stores percentages. Reject overflow there too rather
+    # than persisting an infinite utilization from an otherwise finite fraction.
+    if value < 0 or not math.isfinite(value) or not math.isfinite(value * 100.0):
+        return None
+    return value
 
 
 def _parse_reset_iso(raw: Any) -> str | None:
@@ -45,7 +51,7 @@ def _parse_reset_iso(raw: Any) -> str | None:
         return None
     try:
         ts = int(float(raw))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if ts > 1_000_000_000_000:   # >1e12 明确是毫秒
         ts //= 1000

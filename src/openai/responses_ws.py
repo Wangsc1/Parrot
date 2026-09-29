@@ -405,11 +405,11 @@ class _WsTracker:
         )
         typ = str(evt.get("type") or "")
         self._output_builder.feed((f"event: {typ}\ndata: " + json.dumps(evt, ensure_ascii=False) + "\n\n").encode("utf-8"))
-        response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
-        usage_present = "usage" in evt or (
-            isinstance(response_obj, dict) and "usage" in response_obj
-        )
         normalized = model_pricing.normalize_response_billing(evt)
+        # Use the canonical envelope walk, not a separate root/response-only
+        # gate. Presence is independent of invalid service-tier metadata.
+        from ..protocols.usage import openai_envelope_containers
+        usage_present = any("usage" in part for part in openai_envelope_containers(evt))
         if normalized.service_tier is not None:
             self.actual_service_tier = normalized.service_tier
         if normalized.actual_cost_ticks is not None:
@@ -454,7 +454,7 @@ class _WsTracker:
             self.response_completed = True
 
         if typ in ("response.completed", "response.failed", "response.incomplete"):
-            resp = response_obj
+            resp = evt.get("response")
             if isinstance(resp, dict) and isinstance(resp.get("id"), str):
                 self.response_id = resp.get("id")
 
@@ -479,6 +479,40 @@ class _WsTracker:
         )
 
 
+# Local ingress budgets, independent of execution/admission capacity. Never
+# await queue space in the one socket reader: cancels must remain readable.
+_WS_LANE_QUEUE_BYTES = 4 * 1024 * 1024
+_WS_CONNECTION_QUEUE_BYTES = 16 * 1024 * 1024
+
+
+class _WsIngressQueue(asyncio.Queue):
+    def __init__(self, lane, maxsize):
+        super().__init__(maxsize=maxsize)
+        self.lane = lane
+
+    def _put(self, item):
+        size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+        lane = self.lane
+        if (lane.queued_bytes + size > _WS_LANE_QUEUE_BYTES
+                or lane.connection.queued_bytes + size > _WS_CONNECTION_QUEUE_BYTES):
+            raise asyncio.QueueFull
+        super()._put((size, item))
+        lane.queued_bytes += size
+        lane.connection.queued_bytes += size
+        if getattr(lane, "creates", None) is self:
+            lane.ready.set()
+
+    def _get(self):
+        size, item = super()._get()
+        self.lane.queued_bytes -= size
+        self.lane.connection.queued_bytes -= size
+        return item
+
+    def clear(self):
+        while not self.empty():
+            self.get_nowait()
+
+
 class _ResponsesWsLane:
     """One ordered downstream lane, isolated from other upstream sessions.
 
@@ -495,8 +529,12 @@ class _ResponsesWsLane:
         self.client = connection.websocket.client
         self.scope = getattr(connection.websocket, "scope", {})
         self.application_state = WebSocketState.CONNECTED
-        self.creates = asyncio.Queue()
-        self.controls = asyncio.Queue()
+        self.queued_bytes = 0
+        self.creates = _WsIngressQueue(self, 32)
+        self.controls = _WsIngressQueue(self, 64)
+        self.acks = _WsIngressQueue(self, 64)
+        self.processed_ids = {}
+        self.processed_sender = None
         self.ready = asyncio.Event()
         self.task = None
         self.session_task = None
@@ -522,11 +560,14 @@ class _ResponsesWsLane:
 
     async def receive_create(self):
         self.release_slot()
-        frame = await self.creates.get()
-        if self.creates.empty():
-            self.ready.clear()
+        await self.ready.wait()
+        # Keep queued bytes charged while waiting for an execution slot. Idle
+        # lanes must not reserve slots, and slot waiters must not unbudget bodies.
         await self.connection.slots.acquire()
         self.owns_slot = True
+        frame = self.creates.get_nowait()
+        if self.creates.empty():
+            self.ready.clear()
         self.terminal_sent = False
         self.tracker = _WsTracker()
         frame = copy.deepcopy(frame)
@@ -571,6 +612,10 @@ class _ResponsesWsLane:
             typ = obj.get("type")
             if typ in {"response.completed", "response.incomplete", "response.failed", "error"}:
                 self.terminal_sent = True
+                if self.active_response_id:
+                    self.processed_ids[self.active_response_id] = self.epoch
+                    while len(self.processed_ids) > 64:
+                        self.processed_ids.pop(next(iter(self.processed_ids)))
             if typ in {"response.failed", "error"} and self.parent_owner is self:
                 # Failed same-lane continuation invalidates its local parent;
                 # a failed fork must leave the source lane's cache untouched.
@@ -600,6 +645,7 @@ class _ResponsesWsLane:
             # Preserve legacy single-lane close codes (including HTTP bridges).
             await self.connection.websocket.close(code=code, reason=reason)
             self.application_state = WebSocketState.DISCONNECTED
+            self.controls.clear()
             self.controls.put_nowait({"type": "websocket.disconnect", "code": code})
             self.connection.activity.set()
             return
@@ -611,15 +657,30 @@ class _ResponsesWsLane:
                 status=code - 4000 if 4400 <= code <= 4599 else 502,
             )
         self.application_state = WebSocketState.DISCONNECTED
+        self.controls.clear()
         self.controls.put_nowait({"type": "websocket.disconnect", "code": code})
 
+    async def _forward_acks(self):
+        while True:
+            frame = await self.acks.get()
+            epoch = self.processed_ids.get(frame.get("response_id"), self.epoch)
+            if epoch != self.epoch or self.processed_sender is None:
+                continue  # Locally terminated/HTTP sessions have nothing to release.
+            try:
+                await asyncio.wait_for(self.processed_sender(_dump_frame(frame)), timeout=10)
+            except Exception:
+                # An ACK never starts work; a retired upstream needs no ACK.
+                pass
+
     async def run(self):
+        ack_task = asyncio.create_task(self._forward_acks())
         try:
             while not self.connection.closed:
                 await self.ready.wait()
                 self.epoch += 1
                 self.application_state = WebSocketState.CONNECTED
-                self.controls = asyncio.Queue()
+                self.controls.clear()
+                self.processed_sender = None
                 self.cancel_requested = False
                 self.session_task = asyncio.create_task(_handle_responses_ws_lane(self))
                 try:
@@ -642,7 +703,12 @@ class _ResponsesWsLane:
                     self.session_task = None
                     self.connection.activity.set()
         finally:
+            ack_task.cancel()
+            await asyncio.gather(ack_task, return_exceptions=True)
             self.release_slot()
+            self.creates.clear()
+            self.controls.clear()
+            self.acks.clear()
 
 
 class _ResponsesWsConnection:
@@ -653,6 +719,7 @@ class _ResponsesWsConnection:
         self.auth_context = auth_context
         self.lanes = {}
         self.history = {}
+        self.queued_bytes = 0
         self.slots = asyncio.Semaphore(16)
         self.send_lock = asyncio.Lock()
         self.activity = asyncio.Event()
@@ -695,15 +762,21 @@ class _ResponsesWsConnection:
                 lane = self.lanes[sid] = _ResponsesWsLane(self, sid)
                 lane.task = asyncio.create_task(lane.run())
             lane = self.lanes[sid]
-            lane.creates.put_nowait(frame)
+            try:
+                lane.creates.put_nowait(frame)
+            except asyncio.QueueFull:
+                await _send_request_invalid_error_frame(_ResponsesWsLane(self, sid), "WebSocket pending request budget exceeded.",
+                    code="websocket_queue_full", status=429)
+                return
             lane.ready.set()
             return
         rid = frame.get("response_id")
+        processed = frame.get("type") == "response.processed"
         lane = self.lanes.get(sid)
         if "stream_id" not in frame and rid:
-            matches = [value for value in self.lanes.values() if value.active_response_id == rid]
+            matches = [value for value in self.lanes.values() if value.active_response_id == rid or (processed and rid in value.processed_ids)]
             lane = matches[0] if len(matches) == 1 else None
-        if lane is None or (rid and lane.active_response_id != rid):
+        if lane is None or (rid and lane.active_response_id != rid and not (processed and rid in lane.processed_ids)):
             await _send_request_invalid_error_frame(
                 _ResponsesWsLane(self, sid), "No matching active response for this control frame.",
                 param="response_id" if rid else "stream_id",
@@ -717,7 +790,14 @@ class _ResponsesWsConnection:
                 await _send_request_invalid_error_frame(lane, "No response is in progress.", param="type")
             return
         frame.pop("stream_id", None)
-        lane.controls.put_nowait({"type": "websocket.receive", "text": _dump_frame(frame)})
+        try:
+            if processed:
+                lane.acks.put_nowait(frame)
+            else:
+                lane.controls.put_nowait({"type": "websocket.receive", "text": _dump_frame(frame)})
+        except asyncio.QueueFull:
+            await _send_request_invalid_error_frame(_ResponsesWsLane(self, sid), "WebSocket pending control budget exceeded.",
+                code="websocket_queue_full", status=429)
 
     async def run(self):
         # Reads are connection-owned, never concurrent across lane workers.
@@ -980,12 +1060,13 @@ async def _handle_responses_ws_lane(websocket: WebSocket) -> None:
           f"(msgs={msg_count}, tools={tool_count}) "
           f"{'★' if result.affinity_hit else ''}first={chosen}{sat_note}")
 
-    # 翻译层（first frame）：放在调度之后，才能按生效渠道/账号判断。
-    body = await translation.translate_body(body, ingress_protocol="responses", route=result)
-    _sync_translated_body_to_ws_create(first_obj, body)
-
+    handed_off = False
     try:
         try:
+            # The acquired lease owns translation too, including cancellation.
+            body = await translation.translate_body(body, ingress_protocol="responses", route=result)
+            _sync_translated_body_to_ws_create(first_obj, body)
+            handed_off = True
             accepted = await _run_ws_failover(
                 websocket, first_obj=first_obj,
                 schedule_result=result, body=body, request_id=request_id,
@@ -994,6 +1075,14 @@ async def _handle_responses_ws_lane(websocket: WebSocket) -> None:
                 start_time=start_time, start_monotonic=start_monotonic,
                 fp_query=fp_query, api_key_lease=key_lease,
             )
+        except asyncio.CancelledError:
+            if not handed_off:
+                await await_ws_owned(asyncio.to_thread(
+                    log_db.finish_error, request_id, "client disconnected", 0,
+                    http_status=499, status="cancelled", total_ms=None,
+                    request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
+                ))
+            raise
         except Exception as exc:
             traceback.print_exc()
             request_elapsed_ms = int((time.monotonic() - start_monotonic) * 1000)
@@ -1123,7 +1212,7 @@ async def _run_ws_failover(
     search_declared = any(search_tool_policy.kind(tool) for tool, _ in search_tool_policy.declarations(body))
     pairs = schedule_result.candidates or schedule_result.saturated
     native_ws = bool(pairs and _responses_ws_upstream_transport(pairs[0][0]) == "ws")
-    if search_tool_policy.needs_loop(body) or (search_declared and not native_ws):
+    if body.get("generate") is not False and (search_tool_policy.needs_loop(body) or (search_declared and not native_ws)):
         return await _run_search_ws_session(
             websocket, body=body, schedule_result=schedule_result,
             request_id=request_id, api_key_name=api_key_name, client_ip=client_ip,
@@ -1155,6 +1244,7 @@ async def _run_ws_failover(
     last_result: Optional[_WsAttemptResult] = None
     failed_candidate_statuses: list[int] = []
     local_candidate_error: str | None = None
+    local_candidate_param = "max_output_tokens"
     last_ch: Optional[Channel] = None
     last_model: Optional[str] = None
     accepted = websocket.application_state == WebSocketState.CONNECTED
@@ -1374,6 +1464,7 @@ async def _run_ws_failover(
         # transport rounds. Zero denotes the narrow generic HTML403 marker.
         if result.outcome == "candidate_guard":
             local_candidate_error = result.error_detail
+            local_candidate_param = "generate" if result.error_code == "unsupported_generate" else "max_output_tokens"
         else:
             failed_candidate_statuses.append(
                 0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
@@ -1550,6 +1641,7 @@ async def _run_ws_failover(
                     return accepted
                 if result.outcome == "candidate_guard":
                     local_candidate_error = result.error_detail
+                    local_candidate_param = "generate" if result.error_code == "unsupported_generate" else "max_output_tokens"
                 else:
                     failed_candidate_statuses.append(
                         0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
@@ -1612,7 +1704,7 @@ async def _run_ws_failover(
             await _send_context_length_error_frame(websocket, downstream_message)
         else:
             await _send_request_invalid_error_frame(
-                websocket, downstream_message, param="max_output_tokens",
+                websocket, downstream_message, param=local_candidate_param,
             )
     else:
         await _send_terminal_error_frame(websocket, downstream_message, http_status)
@@ -2001,7 +2093,7 @@ async def _try_ws_channel(
                     if next_turn is None:
                         return session_result or relay_result
                     first_obj, body, fp_query = next_turn
-                    if search_tool_policy.needs_loop(body):
+                    if body.get("generate") is not False and search_tool_policy.needs_loop(body):
                         # Prior turn capacity is already released. Move this
                         # new search turn to the common runner; do not send an
                         # internally compiled function down the native relay.
@@ -2364,6 +2456,7 @@ async def _try_ws_channel(
             return session_result or last_error
         if (isinstance(ch, OpenAIOAuthChannel) and last_error is not None
                 and last_error.http_status == 426 and not route_state["dispatched"]
+                and first_obj.get("generate") is not False
                 and recovery_retry_allowed("codexHttpFallback", cfg)):
             full = rebuild_full_request(body, api_key_name=api_key_name,
                                         channel_key=ch.key, model=resolved_model)
@@ -2610,6 +2703,11 @@ async def _try_sse_channel(
     on_terminal=None,
 ) -> _WsAttemptResult:
     ch_proto = getattr(ch, "protocol", "anthropic")
+    if first_obj.get("generate") is False or body.get("generate") is False:
+        return _WsAttemptResult(outcome="candidate_guard", http_status=400,
+            error_code="unsupported_generate",
+            error_detail="generate:false requires a native Responses WebSocket upstream",
+            upstream_protocol=ch_proto)
     cfg = config.get()
     timeouts = cfg.get("timeouts") or {}
     connect_timeout = int(timeouts.get("connect", 10))
@@ -3768,274 +3866,286 @@ async def _relay_ws_session(
                 round_timeouts=round_timeouts,
             )
 
-    pending_visible: list[str | bytes] = []
-    first_wait = round_timeouts.first_byte
-    first_read_task = asyncio.create_task(_recv_until_first_visible_ws_event(
-        upstream_ws, tracker, pending_visible, ch.key, first_wait,
-        channel=ch, deadline_ts=deadline_ts, idle_timeout=idle_timeout,
-        result=result, proxy_bytes=proxy_bytes,
-        translator_ctx=translator_ctx,
-        timing=timing, round_timeouts=round_timeouts,
-        timeout_label_seconds=first_byte_timeout,
-        commit_retryable_errors=not allow_failover_before_visible,
-    ))
-    active_downstream_task = asyncio.create_task(downstream_to_upstream())
+    if isinstance(websocket, _ResponsesWsLane):
+        websocket.processed_sender = upstream_ws.send
+    owned_tasks = set()
     try:
-        done, _ = await asyncio.wait(
-            {first_read_task, active_downstream_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-    except asyncio.CancelledError:
-        first_read_task.cancel()
-        active_downstream_task.cancel()
-        await asyncio.gather(
-            first_read_task, active_downstream_task,
-            return_exceptions=True,
-        )
-        raise
-
-    if first_read_task not in done:
-        first_read_task.cancel()
-        await asyncio.gather(first_read_task, return_exceptions=True)
-        exc = active_downstream_task.exception()
-        if exc is None or isinstance(exc, WebSocketDisconnect):
-            result.outcome = "client_disconnected"
-            result.error_detail = "client disconnected"
-        else:
-            result.outcome = "transport_error"
-            result.error_detail = f"websocket relay error: {exc}"
-        return sync_tracker_result()
-
-    try:
-        first_visible = first_read_task.result()
-    except asyncio.TimeoutError:
-        active_downstream_task.cancel()
-        await asyncio.gather(active_downstream_task, return_exceptions=True)
-        result.outcome = "first_byte_timeout"
-        result.error_detail = f"first websocket event timeout > {first_byte_timeout}s"
-        return sync_tracker_result()
-    except websockets.ConnectionClosed as exc:
-        active_downstream_task.cancel()
-        await asyncio.gather(active_downstream_task, return_exceptions=True)
-        result.outcome = "closed_before_first_byte"
-        result.error_detail = f"upstream closed before first visible websocket event: {exc}"
-        return sync_tracker_result()
-    except Exception as exc:
-        active_downstream_task.cancel()
-        await asyncio.gather(active_downstream_task, return_exceptions=True)
-        result.outcome = "closed_before_first_byte"
-        result.error_detail = f"upstream closed before first visible websocket event: {exc}"
-        return sync_tracker_result()
-
-    if first_visible is None:
-        # Stop the active-turn reader before exposing a terminal frame. A
-        # response.create arriving after that frame belongs to the next turn
-        # and must be consumed by _receive_next_response_create instead.
-        active_downstream_task.cancel()
-        await asyncio.gather(active_downstream_task, return_exceptions=True)
-        if result.ok or result.closed_after_accept:
-            # A terminal Responses frame can contain complete output without a
-            # preceding delta. Buffered metadata also includes response.created,
-            # which commits dispatch without being classified as visible output.
-            if pending_visible:
-                result.closed_after_accept = True
-                _apply_ws_snapshot(result, timing, terminal=False)
-            await finalize_accepted_request()
-            if pending_visible:
-                for item in pending_visible:
-                    try:
-                        await _send_downstream(
-                            websocket,
-                            _identity_expose_frame(item, _identity_map),
-                        )
-                    except WebSocketDisconnect:
-                        # The upstream terminal is already durable; a failed
-                        # downstream send must not become a new channel failure.
-                        return result
-            if result.outcome == "request_invalid":
-                if result.http_status == 413:
-                    await _send_request_invalid_error_frame(
-                        websocket, result.error_detail, code="message_too_big", status=413,
-                    )
-                else:
-                    await _send_context_length_error_frame(
-                        websocket, result.error_detail,
-                    )
-            # Per-request typed errors can usually leave the persistent upstream
-            # socket reusable. A committed context/size failure is closed here so
-            # both peers receive an unambiguous turn termination; transport and
-            # blacklist failures also destroy the session.
-            must_close_connection = bool(
-                result.outcome in {
-                    "connection_lifecycle", "upstream_closed", "blacklist_hit",
-                    "transport_error", "transport_timeout", "first_byte_timeout",
-                    "connection_timeout", "idle_timeout", "total_timeout",
-                }
-                or result.outcome == "request_invalid"
+        pending_visible: list[str | bytes] = []
+        first_wait = round_timeouts.first_byte
+        first_read_task = asyncio.create_task(_recv_until_first_visible_ws_event(
+            upstream_ws, tracker, pending_visible, ch.key, first_wait,
+            channel=ch, deadline_ts=deadline_ts, idle_timeout=idle_timeout,
+            result=result, proxy_bytes=proxy_bytes,
+            translator_ctx=translator_ctx,
+            timing=timing, round_timeouts=round_timeouts,
+            timeout_label_seconds=first_byte_timeout,
+            commit_retryable_errors=not allow_failover_before_visible,
+        ))
+        active_downstream_task = asyncio.create_task(downstream_to_upstream())
+        owned_tasks.update((first_read_task, active_downstream_task))
+        try:
+            done, _ = await asyncio.wait(
+                {first_read_task, active_downstream_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            if close_downstream_on_terminal or must_close_connection:
-                if result.ok:
-                    await _close_downstream(websocket, 1000, "")
-                else:
-                    close_code = _ws_close_code_for_http(
-                        _http_status_from_ws_outcome(result)
-                    )
-                    if result.outcome == "connection_lifecycle":
-                        close_code = 1011
-                    await _close_downstream(
-                        websocket,
-                        close_code,
-                        _trim_reason(result.error_detail or result.outcome),
-                    )
-            return await finalize_accepted_request()
-        return sync_tracker_result()
-
-    _apply_ws_snapshot(result, timing, terminal=False)
-    result.closed_after_accept = True
-    for item in pending_visible:
-        await _send_downstream(websocket, _identity_expose_frame(item, _identity_map))
-
-    async def upstream_to_downstream() -> None:
-        nonlocal result
-        while True:
-            step = await read_next_responses_ws_step(
-                upstream_ws,
-                tracker,
-                channel_key=ch.key,
-                deadline_ts=deadline_ts,
-                idle_timeout=idle_timeout,
-                proxy_bytes=proxy_bytes,
-                frame_transform=lambda frame: _identity_expose_frame(frame, _identity_map),
-                skip_event_types=(),
-                blacklist_before_error=True,
-                on_text_frame=lambda frame: _capture_codex_response_event(
-                    ch, translator_ctx, frame
-                ),
-                timing=timing,
-                round_timeouts=round_timeouts,
+        except asyncio.CancelledError:
+            first_read_task.cancel()
+            active_downstream_task.cancel()
+            await asyncio.gather(
+                first_read_task, active_downstream_task,
+                return_exceptions=True,
             )
-            if step.outcome in (
-                "connection_timeout", "first_byte_timeout", "idle_timeout",
-                "total_timeout", "transport_timeout",
-            ):
-                result.outcome = step.outcome
-                result.error_detail = step.error_detail
-                await finalize_accepted_request()
-                await _close_downstream(websocket, 4504, result.error_detail)
-                return
-            if step.outcome in ("upstream_closed", "connection_lifecycle"):
-                result.outcome = step.outcome
-                result.error_detail = step.error_detail
-                await finalize_accepted_request()
-                # 1006 is reserved and cannot be sent in a close frame.
-                downstream_close_code = (
-                    step.close_code if step.close_code in (1000, 1001) else 1011
-                )
-                await _close_downstream(
-                    websocket, downstream_close_code, step.close_reason,
-                )
-                return
-            if step.outcome == "blacklist_hit":
-                result.outcome = "blacklist_hit"
-                result.error_detail = step.error_detail
-                await finalize_accepted_request()
-                await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
-                return
-            if step.outcome == "request_invalid":
-                result.outcome = "request_invalid"
-                result.http_status = int(step.http_status or 400)
-                result.error_code = step.error_code
-                result.error_detail = step.error_detail or protocol_errors.responses_max_output_context_error_message()
-                await finalize_accepted_request()
-                if result.http_status == 413:
-                    await _send_request_invalid_error_frame(
-                        websocket, result.error_detail, code="message_too_big", status=413,
-                    )
-                else:
-                    await _send_context_length_error_frame(websocket, result.error_detail)
-                if close_downstream_on_terminal or (
-                    step.data is None and result.http_status == 413
-                ):
-                    await _close_downstream(
-                        websocket,
-                        _ws_close_code_for_http(result.http_status),
-                        _trim_reason(result.error_detail),
-                    )
-                return
-            terminal_error = step.outcome in {
-                "stream_upstream_error", "request_rejected", "response_incomplete",
-            }
-            if terminal_error:
-                result.outcome = step.outcome
-                result.error_code = step.error_code
-                result.http_status = step.http_status
-                result.error_detail = step.error_detail
-                await finalize_accepted_request()
-            elif step.outcome == "success":
-                result.ok = True
-                result.outcome = "success"
-                await finalize_accepted_request()
-            if step.data is not None and not step.skip_downstream:
-                await _send_downstream(websocket, step.data)
-            if terminal_error:
-                close_code = 1011 if step.data is not None else step.close_code
-                close_reason = _trim_reason(result.error_detail) if step.data is not None else step.close_reason
-                if close_downstream_on_terminal:
-                    await _close_downstream(websocket, close_code, close_reason)
-                return
-            if step.outcome == "success":
-                close_code = 1000 if step.data is not None else step.close_code
-                close_reason = "" if step.data is not None else step.close_reason
-                if close_downstream_on_terminal:
-                    await _close_downstream(websocket, close_code, close_reason)
-                return
-            if step.skip_downstream:
-                continue
+            raise
 
-    t_down = active_downstream_task
-    t_up = asyncio.create_task(upstream_to_downstream())
-    tasks = {t_down, t_up}
-    try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    except asyncio.CancelledError:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
-    if (
-        t_down in done
-        and result.outcome == "connected"
-        and not tracker.response_completed
-        and not tracker.response_failed
-    ):
-        result.outcome = "client_disconnected"
-        result.error_detail = "client disconnected"
-    for task in done:
-        exc = task.exception()
-        if exc is None or result.request_finalized:
-            continue
-        if isinstance(exc, WebSocketDisconnect):
-            if tracker.response_completed:
-                result.ok = True
-                result.outcome = "success"
-            elif tracker.response_failed:
-                result.outcome = "stream_upstream_error"
-                result.error_detail = tracker.stream_error_message or "upstream stream error"
-            else:
+        if first_read_task not in done:
+            first_read_task.cancel()
+            await asyncio.gather(first_read_task, return_exceptions=True)
+            exc = active_downstream_task.exception()
+            if exc is None or isinstance(exc, WebSocketDisconnect):
                 result.outcome = "client_disconnected"
                 result.error_detail = "client disconnected"
-            continue
-        if isinstance(exc, BusinessTimeoutError):
-            result.outcome = exc.outcome
-            result.error_detail = exc.outcome
-            continue
-        result.outcome = "transport_error"
-        result.error_detail = f"websocket relay error: {exc}"
+            else:
+                result.outcome = "transport_error"
+                result.error_detail = f"websocket relay error: {exc}"
+            return sync_tracker_result()
 
-    return await finalize_accepted_request()
+        try:
+            first_visible = first_read_task.result()
+        except asyncio.TimeoutError:
+            active_downstream_task.cancel()
+            await asyncio.gather(active_downstream_task, return_exceptions=True)
+            result.outcome = "first_byte_timeout"
+            result.error_detail = f"first websocket event timeout > {first_byte_timeout}s"
+            return sync_tracker_result()
+        except websockets.ConnectionClosed as exc:
+            active_downstream_task.cancel()
+            await asyncio.gather(active_downstream_task, return_exceptions=True)
+            result.outcome = "closed_before_first_byte"
+            result.error_detail = f"upstream closed before first visible websocket event: {exc}"
+            return sync_tracker_result()
+        except Exception as exc:
+            active_downstream_task.cancel()
+            await asyncio.gather(active_downstream_task, return_exceptions=True)
+            result.outcome = "closed_before_first_byte"
+            result.error_detail = f"upstream closed before first visible websocket event: {exc}"
+            return sync_tracker_result()
+
+        if first_visible is None:
+            # Stop the active-turn reader before exposing a terminal frame. A
+            # response.create arriving after that frame belongs to the next turn
+            # and must be consumed by _receive_next_response_create instead.
+            active_downstream_task.cancel()
+            await asyncio.gather(active_downstream_task, return_exceptions=True)
+            if result.ok or result.closed_after_accept:
+                # A terminal Responses frame can contain complete output without a
+                # preceding delta. Buffered metadata also includes response.created,
+                # which commits dispatch without being classified as visible output.
+                if pending_visible:
+                    result.closed_after_accept = True
+                    _apply_ws_snapshot(result, timing, terminal=False)
+                await finalize_accepted_request()
+                if pending_visible:
+                    for item in pending_visible:
+                        try:
+                            await _send_downstream(
+                                websocket,
+                                _identity_expose_frame(item, _identity_map),
+                            )
+                        except WebSocketDisconnect:
+                            # The upstream terminal is already durable; a failed
+                            # downstream send must not become a new channel failure.
+                            return result
+                if result.outcome == "request_invalid":
+                    if result.http_status == 413:
+                        await _send_request_invalid_error_frame(
+                            websocket, result.error_detail, code="message_too_big", status=413,
+                        )
+                    else:
+                        await _send_context_length_error_frame(
+                            websocket, result.error_detail,
+                        )
+                # Per-request typed errors can usually leave the persistent upstream
+                # socket reusable. A committed context/size failure is closed here so
+                # both peers receive an unambiguous turn termination; transport and
+                # blacklist failures also destroy the session.
+                must_close_connection = bool(
+                    result.outcome in {
+                        "connection_lifecycle", "upstream_closed", "blacklist_hit",
+                        "transport_error", "transport_timeout", "first_byte_timeout",
+                        "connection_timeout", "idle_timeout", "total_timeout",
+                    }
+                    or result.outcome == "request_invalid"
+                )
+                if close_downstream_on_terminal or must_close_connection:
+                    if result.ok:
+                        await _close_downstream(websocket, 1000, "")
+                    else:
+                        close_code = _ws_close_code_for_http(
+                            _http_status_from_ws_outcome(result)
+                        )
+                        if result.outcome == "connection_lifecycle":
+                            close_code = 1011
+                        await _close_downstream(
+                            websocket,
+                            close_code,
+                            _trim_reason(result.error_detail or result.outcome),
+                        )
+                return await finalize_accepted_request()
+            return sync_tracker_result()
+
+        _apply_ws_snapshot(result, timing, terminal=False)
+        result.closed_after_accept = True
+        for item in pending_visible:
+            await _send_downstream(websocket, _identity_expose_frame(item, _identity_map))
+
+        async def upstream_to_downstream() -> None:
+            nonlocal result
+            while True:
+                step = await read_next_responses_ws_step(
+                    upstream_ws,
+                    tracker,
+                    channel_key=ch.key,
+                    deadline_ts=deadline_ts,
+                    idle_timeout=idle_timeout,
+                    proxy_bytes=proxy_bytes,
+                    frame_transform=lambda frame: _identity_expose_frame(frame, _identity_map),
+                    skip_event_types=(),
+                    blacklist_before_error=True,
+                    on_text_frame=lambda frame: _capture_codex_response_event(
+                        ch, translator_ctx, frame
+                    ),
+                    timing=timing,
+                    round_timeouts=round_timeouts,
+                )
+                if step.outcome in (
+                    "connection_timeout", "first_byte_timeout", "idle_timeout",
+                    "total_timeout", "transport_timeout",
+                ):
+                    result.outcome = step.outcome
+                    result.error_detail = step.error_detail
+                    await finalize_accepted_request()
+                    await _close_downstream(websocket, 4504, result.error_detail)
+                    return
+                if step.outcome in ("upstream_closed", "connection_lifecycle"):
+                    result.outcome = step.outcome
+                    result.error_detail = step.error_detail
+                    await finalize_accepted_request()
+                    # 1006 is reserved and cannot be sent in a close frame.
+                    downstream_close_code = (
+                        step.close_code if step.close_code in (1000, 1001) else 1011
+                    )
+                    await _close_downstream(
+                        websocket, downstream_close_code, step.close_reason,
+                    )
+                    return
+                if step.outcome == "blacklist_hit":
+                    result.outcome = "blacklist_hit"
+                    result.error_detail = step.error_detail
+                    await finalize_accepted_request()
+                    await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
+                    return
+                if step.outcome == "request_invalid":
+                    result.outcome = "request_invalid"
+                    result.http_status = int(step.http_status or 400)
+                    result.error_code = step.error_code
+                    result.error_detail = step.error_detail or protocol_errors.responses_max_output_context_error_message()
+                    await finalize_accepted_request()
+                    if result.http_status == 413:
+                        await _send_request_invalid_error_frame(
+                            websocket, result.error_detail, code="message_too_big", status=413,
+                        )
+                    else:
+                        await _send_context_length_error_frame(websocket, result.error_detail)
+                    if close_downstream_on_terminal or (
+                        step.data is None and result.http_status == 413
+                    ):
+                        await _close_downstream(
+                            websocket,
+                            _ws_close_code_for_http(result.http_status),
+                            _trim_reason(result.error_detail),
+                        )
+                    return
+                terminal_error = step.outcome in {
+                    "stream_upstream_error", "request_rejected", "response_incomplete",
+                }
+                if terminal_error:
+                    result.outcome = step.outcome
+                    result.error_code = step.error_code
+                    result.http_status = step.http_status
+                    result.error_detail = step.error_detail
+                    await finalize_accepted_request()
+                elif step.outcome == "success":
+                    result.ok = True
+                    result.outcome = "success"
+                    await finalize_accepted_request()
+                if step.data is not None and not step.skip_downstream:
+                    await _send_downstream(websocket, step.data)
+                if terminal_error:
+                    close_code = 1011 if step.data is not None else step.close_code
+                    close_reason = _trim_reason(result.error_detail) if step.data is not None else step.close_reason
+                    if close_downstream_on_terminal:
+                        await _close_downstream(websocket, close_code, close_reason)
+                    return
+                if step.outcome == "success":
+                    close_code = 1000 if step.data is not None else step.close_code
+                    close_reason = "" if step.data is not None else step.close_reason
+                    if close_downstream_on_terminal:
+                        await _close_downstream(websocket, close_code, close_reason)
+                    return
+                if step.skip_downstream:
+                    continue
+
+        t_down = active_downstream_task
+        t_up = asyncio.create_task(upstream_to_downstream())
+        owned_tasks.add(t_up)
+        tasks = {t_down, t_up}
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if (
+            t_down in done
+            and result.outcome == "connected"
+            and not tracker.response_completed
+            and not tracker.response_failed
+        ):
+            result.outcome = "client_disconnected"
+            result.error_detail = "client disconnected"
+        for task in done:
+            exc = task.exception()
+            if exc is None or result.request_finalized:
+                continue
+            if isinstance(exc, WebSocketDisconnect):
+                if tracker.response_completed:
+                    result.ok = True
+                    result.outcome = "success"
+                elif tracker.response_failed:
+                    result.outcome = "stream_upstream_error"
+                    result.error_detail = tracker.stream_error_message or "upstream stream error"
+                else:
+                    result.outcome = "client_disconnected"
+                    result.error_detail = "client disconnected"
+                continue
+            if isinstance(exc, BusinessTimeoutError):
+                result.outcome = exc.outcome
+                result.error_detail = exc.outcome
+                continue
+            result.outcome = "transport_error"
+            result.error_detail = f"websocket relay error: {exc}"
+
+        return await finalize_accepted_request()
+
+    finally:
+        for task in owned_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*owned_tasks, return_exceptions=True)
 
 
 async def _run_search_ws_session(
@@ -4056,6 +4166,21 @@ async def _run_search_ws_session(
             except apikey_limiter.ApiKeyLimitError as exc:
                 await _send_request_invalid_error_frame(websocket, exc.message, status=429)
                 return True
+        if body.get("generate") is False:
+            # A later warmup cannot stay on the HTTP search runner. Return
+            # ownership to native WS routing, which can also reject HTTP-only
+            # candidates without dispatching a billable generation.
+            try:
+                return await _run_ws_failover(
+                    websocket, first_obj={"type": "response.create", **{
+                        key: value for key, value in body.items() if not key.startswith("_")}},
+                    schedule_result=schedule_result, body=body, request_id=request_id,
+                    api_key_name=api_key_name, client_ip=client_ip, start_time=start_time,
+                    start_monotonic=start_monotonic, fp_query=None,
+                    allowed_models=allowed_models, api_key_lease=lease,
+                )
+            finally:
+                await lease.release()
         async def invoke(round_body):
             nonlocal schedule_result
             response = await runtime.run_failover(

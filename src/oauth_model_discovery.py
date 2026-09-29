@@ -359,20 +359,31 @@ def discover_xai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str
     payload = _json_object(network.get_sync(base + "/language-models", headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai", proxy_channel=proxy_channel))
     records = payload.get("data", payload.get("models"))
     if not isinstance(records, list): raise ValueError("xAI model catalog has invalid schema")
-    records = [item for item in records if isinstance(item, dict)]
-    models = _unique([item.get("id") or item.get("name") for item in records])
+    def model_id(item):
+        if isinstance(item, dict):
+            for field in ("id", "name"):
+                value = item.get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    # A non-empty list is not a verified catalog: never stringify None, bools,
+    # objects or numbers into fake IDs, and keep catalog records aligned to IDs.
+    records = [item for item in records if model_id(item)]
+    models = _unique([model_id(item) for item in records])
     if not models: raise ValueError("xAI model catalog has no verified language models")
     enrichment: dict[str, dict] = {}
     try:
         extra = _json_object(network.get_sync(base + "/models", headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai", proxy_channel=proxy_channel))
         values = extra.get("data", extra.get("models"))
-        if isinstance(values, list): enrichment = {str(i.get("id") or i.get("name") or ""): i for i in values if isinstance(i, dict)}
+        if isinstance(values, list):
+            enrichment = {model_id(item): item for item in values if model_id(item)}
     except Exception: pass
     normalized = []
     for item in records:
-        model_id = str(item.get("id") or item.get("name") or "").strip(); merged = dict(item); supplement = enrichment.get(model_id) or {}
+        name = model_id(item); merged = dict(item); supplement = enrichment.get(name) or {}
         if merged.get("context_length") is None and supplement.get("context_length") is not None: merged["context_length"] = supplement["context_length"]
-        normalized.append(_record(model_id, merged, {
+        normalized.append(_record(name, merged, {
             "name": ("display_name", "name"), "description": ("description", "tagline"),
             "contextWindow": ("context_length", "context_window", "contextWindow"),
             "inputModalities": ("input_modalities", "inputModalities", "modalities"), "outputModalities": ("output_modalities", "outputModalities"),

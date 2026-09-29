@@ -126,7 +126,9 @@ def test_matrix_keeps_native_x_search_history_on_xai_only():
                 "responses", "openai-responses", features=features,
                 capabilities=ordinary_capabilities,
             )
-        with pytest.raises(ProtocolGuardError, match="x_search_call"):
+        # Both hosted capability and native history require xAI. The earlier
+        # hosted guard may reject x_search before the x_search_call guard.
+        with pytest.raises(ProtocolGuardError, match="x_search"):
             DEFAULT_MATRIX.plan(
                 "responses", "anthropic", features=features,
                 capabilities=ChannelCapabilities(protocol="anthropic"),

@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import local_web_tools as web, upstream
 from .protocols.sse import split_sse_events
 from .transports.chat_aggregate import ChatAggregateBuilder
+from .search_tool_policy import is_response_tool_call
 
 
 def _take_chat_tools(delta, tools):
@@ -155,7 +156,8 @@ class Projection:
         return index, ident
 
     def owned(self, item):
-        return (str(item.get("namespace") or ""), str(item.get("name") or "")) in self.plan
+        return (item.get("type") in ("function_call", "tool_use") and
+                (str(item.get("namespace") or ""), str(item.get("name") or "")) in self.plan)
 
     async def consume(self, response, branch_index=None):
         """Read one real stream; closing/cancelling always closes its owner."""
@@ -321,14 +323,15 @@ class Round:
         self.response_sent = set()
         self.response_text = {}
         self.response_args = {}
+        self.response_custom_inputs = {}
 
     @staticmethod
     def _item_start(item):
         start = copy.deepcopy(item)
         if start.get("type") == "message":
             start["content"] = []
-        elif start.get("type") == "function_call":
-            start["arguments"] = ""
+        elif is_response_tool_call(start):
+            start["input" if start.get("type") == "custom_tool_call" else "arguments"] = ""
         return start
 
     async def _fill_part(self, index, content_index, part):
@@ -359,15 +362,17 @@ class Round:
             await self._emit_response(f"response.{part['type']}.done", {**ids, field: part.get(field, "")})
         await self._emit_response("response.content_part.done", {**ids, "part": part})
 
-    async def _fill_arguments(self, index, arguments):
+    async def _fill_arguments(self, index, arguments, *, custom=False):
         arguments = str(arguments or "")
-        prior = self.response_args.get(index, "")
+        buffers = self.response_custom_inputs if custom else self.response_args
+        event = "response.custom_tool_call_input" if custom else "response.function_call_arguments"
+        prior = buffers.get(index, "")
         if not arguments.startswith(prior):
             if prior.startswith(arguments):
                 return
             raise ValueError("managed search tool snapshot conflicts with emitted arguments")
         if suffix := arguments[len(prior):]:
-            await self._emit_response("response.function_call_arguments.delta", {
+            await self._emit_response(event + ".delta", {
                 "output_index": index, "item_id": self.mapping[index][1], "delta": suffix,
             })
 
@@ -377,12 +382,15 @@ class Round:
                 if isinstance(part, dict):
                     method = self._close_part if close else self._fill_part
                     await method(index, content_index, part)
-        elif item.get("type") == "function_call":
-            await self._fill_arguments(index, item.get("arguments"))
+        elif is_response_tool_call(item):
+            custom = item.get("type") == "custom_tool_call"
+            field = "input" if custom else "arguments"
+            event = "response.custom_tool_call_input" if custom else "response.function_call_arguments"
+            await self._fill_arguments(index, item.get(field), custom=custom)
             if close:
-                await self._emit_response("response.function_call_arguments.done", {
+                await self._emit_response(event + ".done", {
                     "output_index": index, "item_id": self.mapping[index][1],
-                    "arguments": item.get("arguments", ""),
+                    field: item.get(field, ""),
                 })
 
     async def _emit_response(self, event, data):
@@ -411,8 +419,9 @@ class Round:
             typ = event.split(".")[1]
             field = "text" if typ == "output_text" else "refusal"
             await self._fill_part(index, data.get("content_index", 0), {"type": typ, field: data.get(field, "")})
-        elif event == "response.function_call_arguments.done":
-            await self._fill_arguments(index, data.get("arguments"))
+        elif event in ("response.function_call_arguments.done", "response.custom_tool_call_input.done"):
+            custom = event == "response.custom_tool_call_input.done"
+            await self._fill_arguments(index, data.get("input" if custom else "arguments"), custom=custom)
 
         p = self.owner
         mapped, ident = self.mapping[index]
@@ -439,8 +448,9 @@ class Round:
         if event in ("response.output_text.delta", "response.refusal.delta"):
             part_key = (index, data.get("content_index", 0), event.split(".")[1])
             self.response_text[part_key] = self.response_text.get(part_key, "") + (data.get("delta") or "")
-        elif event == "response.function_call_arguments.delta":
-            self.response_args[index] = self.response_args.get(index, "") + (data.get("delta") or "")
+        elif event in ("response.function_call_arguments.delta", "response.custom_tool_call_input.delta"):
+            buffers = self.response_custom_inputs if event == "response.custom_tool_call_input.delta" else self.response_args
+            buffers[index] = buffers.get(index, "") + (data.get("delta") or "")
         elif event == "response.output_item.added" and isinstance(item, dict):
             await self._fill_item(index, item)
         elif event == "response.content_part.added":
@@ -465,6 +475,10 @@ class Round:
                 await p.start(data.get("response") or {})
                 return
             if event == "response.completed":
+                # Validate the unmerged terminal batch too: a terminal-only
+                # upstream can repeat a call ID with conflicting arguments.
+                from .search_tool_policy import _unique_calls
+                _unique_calls(data.get("response") or {}, "responses")
                 self.terminal = True
                 return
             if "output_index" not in data:
@@ -479,7 +493,7 @@ class Round:
                 item = self.builder.get_output_item(index) or item
                 data = {**data, "item": item}
             if isinstance(item, dict):
-                if item.get("type") == "function_call" and not item.get("name"):
+                if is_response_tool_call(item) and not item.get("name"):
                     self.uncertain.add(index)
                     self.pending.setdefault(index, []).append((event, data))
                     return
@@ -491,11 +505,11 @@ class Round:
                             old_data = {**old_data, "item": {**old_data["item"], "name": item.get("name"),
                                 "namespace": item.get("namespace", "")}}
                         await self.feed(old_event, old_data, build=False)
-                if item.get("type") == "function_call" and (p.owned(item) or self.duplicate_call(index, item)):
+                if is_response_tool_call(item) and (p.owned(item) or self.duplicate_call(index, item)):
                     self.hidden.add(index)
                     self.pending.pop(index, None)
                     return
-                if item.get("type") == "function_call":
+                if is_response_tool_call(item):
                     self.deferred_indices.add(index)
                 if index not in self.mapping:
                     await p.start({"object": "response", "model": p.body.get("model")})
@@ -601,6 +615,10 @@ class Round:
                     "finish_reason": builder._finish_reason, "logprobs": builder.logprobs or None})
             return {**self.metadata, "object": "chat.completion", "choices": choices, "usage": self.usage}
         if self.protocol == "responses":
+            # Identity coalescing is useful for snapshot repair but must not
+            # erase conflicting calls before the existing pre-execution check.
+            from .search_tool_policy import _unique_calls
+            _unique_calls({"output": self.builder.get_stream_output_items()}, "responses")
             obj = self.builder.to_full_json(fallback_model=p.body.get("model", ""))
             await p.start(obj)
             items = obj.get("output") or []

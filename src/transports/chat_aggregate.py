@@ -14,6 +14,7 @@ class ChatAggregateBuilder(ChatSSEAssistantBuilder):
         self.metadata = {}
         self.raw_usage = None
         self.logprobs = {}
+        self._choice_logprobs = {0: self.logprobs}
 
     @property
     def done_received(self):
@@ -29,9 +30,10 @@ class ChatAggregateBuilder(ChatSSEAssistantBuilder):
         for choice in event.get("choices") or []:
             values = choice.get("logprobs")
             if isinstance(values, dict):
+                target = self._choice_logprobs.setdefault(int(choice.get("index") or 0), {})
                 for key in ("content", "refusal"):
                     if isinstance(values.get(key), list):
-                        self.logprobs.setdefault(key, []).extend(copy.deepcopy(values[key]))
+                        target.setdefault(key, []).extend(copy.deepcopy(values[key]))
 
     def to_full_json(self, *, fallback_model=""):
         obj = super().to_full_json(
@@ -39,8 +41,10 @@ class ChatAggregateBuilder(ChatSSEAssistantBuilder):
             model=self.metadata.get("model") or fallback_model,
             created=self.metadata.get("created") or int(time.time()),
             system_fingerprint=self.metadata.get("system_fingerprint"), usage=self.raw_usage)
-        if self.logprobs:
-            obj["choices"][0]["logprobs"] = copy.deepcopy(self.logprobs)
+        for choice in obj["choices"]:
+            values = self._choice_logprobs.get(choice["index"])
+            if values:
+                choice["logprobs"] = copy.deepcopy(values)
         if "service_tier" in self.metadata:
             obj["service_tier"] = self.metadata["service_tier"]
         return obj

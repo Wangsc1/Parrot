@@ -80,9 +80,7 @@ def _instructions_to_messages(instructions: Any) -> list[dict[str, Any]]:
                 param="instructions",
             )
         role = item.get("role") or "system"
-        if role == "developer":
-            role = "system"
-        if role not in ("system", "user", "assistant"):
+        if role not in ("system", "developer", "user", "assistant"):
             _fail(
                 f"Responses instructions role {role!r} cannot be safely converted to Chat instructions",
                 param="instructions",
@@ -117,7 +115,14 @@ def translate_request_from_input_items(body: dict, input_items: list) -> dict:
     用于需要同时检查完整历史语义的桥接路径，避免 `previous_response_id`
     被重复查 Store 后让转换和语义补丁看到不同的历史快照。
     """
-    messages = _input_items_to_messages(resolve_item_references(input_items), native_search=bool(body.get("_parrot_preserve_native_search")))
+    input_items = bridge_history_items(resolve_item_references(input_items))
+    if body.get("previous_response_id") and not body.get("_parrot_preserve_native_search"):
+        from ...protocols.matrix import DEFAULT_MATRIX, extract_request_features, ProtocolGuardError
+        try:
+            DEFAULT_MATRIX.plan("responses", "openai-chat", extract_request_features("responses", {"model": body.get("model"), "input": input_items}))
+        except ProtocolGuardError as exc:
+            raise guard.GuardError(400, "invalid_request_error", str(exc), param="input", scope="candidate") from exc
+    messages = _input_items_to_messages(input_items, native_search=bool(body.get("_parrot_preserve_native_search")))
 
     # instructions → 前置消息（在任何历史之前）
     messages = _instructions_to_messages(body.get("instructions")) + messages
@@ -243,6 +248,24 @@ def _resolve_input(body: dict, *, api_key_name: str = "") -> list:
     return resolve_item_references(list(history) + cur_items)
 
 
+def bridge_history_items(items: list) -> list:
+    out = []
+    for item in items:
+        typ = item.get("type") if isinstance(item, dict) else None
+        if (typ == "code_interpreter_call" and item.get("status") == "completed"
+                and isinstance(item.get("outputs"), list)
+                and all(isinstance(p, dict) and p.get("type") == "logs" for p in item["outputs"])):
+            out.append({"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "[Completed code interpreter result; historical record, not a live container]\n"
+                 + json.dumps(item, ensure_ascii=False)}]})
+        elif typ in ("message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "reasoning", "web_search_call", None):
+            out.append(item)
+        else:
+            raise guard.GuardError(400, "invalid_request_error",
+                f"Responses history item {typ!r} requires a native-capable candidate", param="input", scope="candidate")
+    return out
+
+
 def resolve_input_items(body: dict, *, api_key_name: str = "") -> list:
     """返回完整 input items，包含 previous_response_id 展开的历史。"""
     return _resolve_input(body, api_key_name=api_key_name)
@@ -346,8 +369,6 @@ def _input_items_to_messages(items: list, *, native_search=False) -> list:
         if t == "message":
             _flush()
             role = item.get("role") or "user"
-            if role == "developer":
-                role = "system"   # chat 只认 system/user/assistant/tool
             content_parts = item.get("content") or []
             if role == "assistant":
                 # Responses 的 assistant message 的 content 只可能是 output_text / refusal；
@@ -488,8 +509,8 @@ def _input_items_to_messages(items: list, *, native_search=False) -> list:
             "mcp_approval_response", "local_shell_call", "local_shell_call_output",
             "item_reference",
         ):
-            # guard 已拦；防御性 skip
-            pass
+            raise guard.GuardError(400, "invalid_request_error",
+                f"Responses history item {t!r} requires a native-capable candidate", param="input", scope="candidate")
 
     _flush()
     return messages
@@ -636,6 +657,8 @@ def translate_response(chat: dict, *, model: str,
     当 `current_input_items` 非 None 且 `api_key_name` 非空时，把本次响应
     存入 openai.store（供下次 previous_response_id 续接使用）。
     """
+    from ._legacy_chat import normalize_response
+    chat = normalize_response(chat)
     choices = chat.get("choices") or [{}]
     choice0 = choices[0] if choices else {}
     msg = choice0.get("message") or {}
@@ -800,6 +823,8 @@ def _chat_choice_logprobs_part(choice: dict[str, Any], key: str) -> list[dict[st
 
 def _finish_reason_to_status(finish_reason: Optional[str],
                              has_tool_calls: bool) -> tuple[str, Optional[dict]]:
+    if finish_reason == "pause_turn":
+        return ("incomplete", {"reason": "pause_turn"})
     if finish_reason in (None, "stop"):
         return ("completed", None)
     if finish_reason == "tool_calls" or finish_reason == "function_call":

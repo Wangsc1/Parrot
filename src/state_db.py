@@ -103,7 +103,7 @@ def init() -> None:
         store = StateStore(runtime, durable, manifest_path=manifest_path)
         store.start()
         try:
-            from .state_migration import LegacyUnavailable, inspect_with_recovery, source_fingerprint
+            from .state_migration import LegacyUnavailable, inspect_with_recovery, source_fingerprint, content_revision
             manifest = _read_manifest(manifest_path)
             verified = _verified_snapshot_generations(runtime, durable)
             try:
@@ -119,7 +119,7 @@ def init() -> None:
                 kind in verified and isinstance(generation, int) and verified[kind] >= generation
                 for kind, generation in recorded.items()))
             unchanged = bool(manifest and snapshots_cover_manifest and
-                             manifest.get("source", {}).get("revision") == current.get("revision"))
+                             content_revision(manifest.get("source", {})) == content_revision(current))
             if unchanged:
                 _migration_report = {"status": "unchanged", "source": current,
                                      "manifest": manifest_path}
@@ -238,8 +238,8 @@ def _rename_rows(domain:str,old:str,new:str,*,replace_conflicts:bool=False)->Non
         for k,r in moving:
             nr=dict(r);nr["channel_key"]=new
             nk=_key(new,nr["model"]) if domain in ("performance_stats","channel_errors") else k
-            if replace_conflicts or nk not in d:d[nk]=nr
-            d.pop(k,None)
+            if nk == k or replace_conflicts or nk not in d:d[nk]=nr
+            if nk != k:d.pop(k,None)
     _mut(domain,op)
 def perf_rename_channel(old_key:str,new_key:str)->None:
     if old_key!=new_key:_rename_rows("performance_stats",old_key,new_key,replace_conflicts=True)
@@ -512,7 +512,8 @@ def rename_runtime_channel_state(old_channel_key:str,new_channel_key:str,*,old_a
                     if row.get("channel_key")!=old_channel_key:continue
                     moved=dict(row);moved["channel_key"]=new_channel_key
                     target=_key(new_channel_key,moved["model"]) if domain in ("performance_stats","channel_errors") else key
-                    bucket[target]=moved;bucket.pop(key,None)
+                    bucket[target]=moved
+                    if target != key:bucket.pop(key,None)
         if old_account_key and new_account_key and old_account_key!=new_account_key:
             bucket=data["oauth_quota_cache"];row=bucket.pop(old_account_key,None)
             if row:

@@ -446,11 +446,12 @@ def _row_to_response(row: sqlite3.Row, response_id: str, api_key_name: str) -> S
     if row["expires_at"] is not None and float(row["expires_at"]) < time.time():
         raise ResponseExpired(response_id)
     try:
-        input_items = json.loads(row["input_items"]) if row["input_items"] else []
-        output_items = json.loads(row["output_items"]) if row["output_items"] else []
-    except (TypeError, ValueError, json.JSONDecodeError):
-        input_items = []
-        output_items = []
+        input_items = json.loads(row["input_items"])
+        output_items = json.loads(row["output_items"])
+    except (TypeError, ValueError) as exc:
+        raise ResponseHistoryError(f"corrupt response history at {response_id}") from exc
+    if not isinstance(input_items, list) or not isinstance(output_items, list):
+        raise ResponseHistoryError(f"corrupt response history at {response_id}: expected item arrays")
     return StoredResponse(
         response_id=row["response_id"],
         parent_id=row["parent_id"] or None,
@@ -459,8 +460,8 @@ def _row_to_response(row: sqlite3.Row, response_id: str, api_key_name: str) -> S
         channel_key=row["channel_key"] or None,
         created_at=float(row["created_at"]),
         expires_at=float(row["expires_at"]),
-        input_items=input_items if isinstance(input_items, list) else [],
-        output_items=output_items if isinstance(output_items, list) else [],
+        input_items=input_items,
+        output_items=output_items,
     )
 
 

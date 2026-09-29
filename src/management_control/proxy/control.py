@@ -702,28 +702,31 @@ class ProxyControl(DomainControl):
         if self._operation_store is None:
             raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY)
         fingerprint = stable_revision({"kind": kind, "target": target})
-        replay = self._idempotent_replay(
-            context,
-            action=kind,
-            fingerprint=fingerprint,
-            operation_store=self._operation_store,
-        )
-        if replay is not None:
-            return replay
-        snapshot = self._network_snapshot()
-        container = snapshot["groups"] if group else snapshot["proxies"]
-        if target not in container:
-            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        group_members = (
-            tuple(str(member) for member in container[target]) if group else None
-        )
-        operation = self._operation_store.create(context, kind=kind, cancellable=False)
-        self._remember_idempotency(
-            context,
-            action=kind,
-            fingerprint=fingerprint,
-            operation_id=operation.id,
-        )
+        # Claim a first request atomically; simultaneous retries must see its
+        # operation (or a payload conflict), not launch a second probe.
+        with self._idempotency_lock:
+            replay = self._idempotent_replay(
+                context,
+                action=kind,
+                fingerprint=fingerprint,
+                operation_store=self._operation_store,
+            )
+            if replay is not None:
+                return replay
+            snapshot = self._network_snapshot()
+            container = snapshot["groups"] if group else snapshot["proxies"]
+            if target not in container:
+                raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+            group_members = (
+                tuple(str(member) for member in container[target]) if group else None
+            )
+            operation = self._operation_store.create(context, kind=kind, cancellable=False)
+            self._remember_idempotency(
+                context,
+                action=kind,
+                fingerprint=fingerprint,
+                operation_id=operation.id,
+            )
 
         def worker() -> None:
             try:

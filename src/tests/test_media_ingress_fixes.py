@@ -12,7 +12,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from src import config, media_cache, media_db, model_metadata
+from src import config, media_cache, media_db, model_metadata, token_counter
 from src.antigravity import images as ag_images
 from src.management_control import ManagementError, ManagementErrorCode
 from src.management_control.auxiliary.media import AntigravityMediaControl, XaiMediaControl
@@ -217,7 +217,9 @@ async def test_messages_small_candidate_does_not_preempt_large_wire_dispatch(mon
         for ch, size in zip(channels, [300000, large_context])
     }}
     monkeypatch.setattr(server.auth, "validate", lambda _: ("ws-key", [], None))
-    monkeypatch.setattr(server.token_counter, "count_request_tokens", lambda *a, **k: 310000)
+    # Inject the estimator at its owner, not via server's removed preflight import.
+    # A large original estimate must not prevent final-wire dispatch.
+    monkeypatch.setattr(token_counter, "count_request_tokens", lambda *a, **k: 310000)
     body = {"model": "test-model", "max_tokens": 10000, "messages": [{"role": "user", "content": "controlled 310k prompt"}]}
     route = server.scheduler.schedule(body, "ws-key", "127.0.0.1")
     assert [ch.key for ch, _ in route.candidates] == ["api:small", "api:large"]

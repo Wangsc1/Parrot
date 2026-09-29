@@ -103,8 +103,6 @@ def decode_mcp_args(raw_map: Any) -> dict[str, Any]:
             decoded[key] = MessageToDict(message)
         except Exception:
             decoded[key] = bytes(value).decode("utf-8", errors="replace")
-    if decoded.get("filePath") and not decoded.get("path"):
-        decoded["path"] = decoded.pop("filePath")
     return decoded
 
 

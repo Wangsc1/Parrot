@@ -181,6 +181,15 @@ class OAuthMutationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class OAuthQuotaResetResult:
+    account_id: str
+    revision: str
+    status: str
+    upstream_outcome: str | None = None
+    local_action: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class OAuthLoginFlow:
     flow_id: str
     flow_secret: str = field(repr=False)

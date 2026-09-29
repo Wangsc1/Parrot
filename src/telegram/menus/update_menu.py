@@ -393,8 +393,9 @@ def _confirm_restart(chat_id: int, message_id: int, cb_id: str) -> None:
 def _cancel_staged(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "正在取消…")
     ok, detail = _CONTROL.cancel_direct(_ctx(chat_id))
+    title = "↩️ <b>已取消更新</b>" if ok else "❌ <b>取消更新失败</b>"
     ui.edit(chat_id, message_id,
-            ui.truncate(f"↩️ <b>已取消更新</b>\n\n{ui.escape_html(detail)}"),
+            ui.truncate(f"{title}\n\n{ui.escape_html(detail)}"),
             reply_markup=ui.inline_kb([[ui.btn("◀ 返回", "menu:update")]]))
 
 

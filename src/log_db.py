@@ -104,10 +104,18 @@ class RetentionPlanError(RuntimeError):
 # Compatibility lookup for call sites migrated incrementally.  The authoritative
 # value is still the immutable handle returned by insert_pending; S5/S6 thread it
 # explicitly through active request paths.
-_request_handles: dict[str, RequestLogHandle] = {}
+# The request lease (or explicit caller) owns the handle, not this index.
+# Abandoned callers must not pin old months forever.
+_request_handles: weakref.WeakValueDictionary[str, RequestLogHandle] = weakref.WeakValueDictionary()
 # Weak references protect in-flight independent calls without retaining abandoned
 # callers forever. Access is serialized by _write_lock, like _request_handles.
 _active_call_handles: weakref.WeakValueDictionary[tuple[str, str, int], RowLogHandle] = weakref.WeakValueDictionary()
+
+
+def _release_request_handle(request_id: str) -> None:
+    _request_handles.pop(request_id, None)
+    from . import drain
+    drain.release_log_handle(request_id)
 
 
 def _track_call_handle(handle: RowLogHandle) -> RowLogHandle:
@@ -528,6 +536,8 @@ def retain_request_handle(
     handle = RequestLogHandle(request_id=root_request_id, db=row_handle.db)
     with _write_lock:
         _request_handles[root_request_id] = handle
+        from . import drain
+        drain.retain_log_handle(handle)
     return handle
 
 
@@ -1603,6 +1613,10 @@ def _trim_retention_month(
             "SELECT request_id FROM request_log WHERE created_at < ?",
             (float(item["cutoff"]),),
         )
+        conn.executemany(
+            "DELETE FROM _parrot_retention_ids WHERE request_id=?",
+            [(h.request_id,) for h in list(_request_handles.values()) if h.db.path == path],
+        )
         target_count = int(conn.execute("SELECT COUNT(*) FROM _parrot_retention_ids").fetchone()[0] or 0)
         if "upstream_attempt_usage" in tables:
             conn.execute(
@@ -1956,6 +1970,8 @@ def insert_pending(
         )
         conn.commit()
         _request_handles[request_id] = handle
+        from . import drain
+        drain.retain_log_handle(handle)
     return handle
 
 
@@ -2844,13 +2860,13 @@ def finish_search_call(
         cost_source, cost_ticks = "actual", int(normalized.actual_cost_ticks)
     elif observed and model:
         priority = model_pricing.priority_from_service_tier(normalized.service_tier)
-        estimate = model_pricing.estimate_cost(
+        estimate = (model_pricing.estimate_cost(
             str(model),
             input_tokens=tokens[0], output_tokens=tokens[1],
             cache_creation_tokens=tokens[2], cache_read_tokens=tokens[3],
-            priority=bool(priority),
-        )
-        if estimate is None and cache_split is not None and tokens[2] > 0:
+            priority=priority,
+        ) if priority is not None else None)
+        if priority is not None and estimate is None and cache_split is not None and tokens[2] > 0:
             # Use the same exact 5m/1h settlement as ordinary upstream calls.
             # The persisted account/source supplies the binding scope; never
             # manufacture a provider or pick a TTL from the aggregate count.
@@ -3490,7 +3506,7 @@ def finish_success(
         )
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
-            _request_handles.pop(handle.request_id, None)
+            _release_request_handle(handle.request_id)
 
     if actual_model or model_signal_conflict:
         _notify_upstream_observation(
@@ -3591,7 +3607,7 @@ def finish_error(
         )
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
-            _request_handles.pop(handle.request_id, None)
+            _release_request_handle(handle.request_id)
 
     if actual_model or model_signal_conflict:
         _notify_upstream_observation(
@@ -6225,9 +6241,11 @@ def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
                         (cutoff,),
                     ).fetchall()
                 ]
+                active_ids = {h.request_id for h in list(_request_handles.values()) if h.db.path == path}
+                stale_ids = [rid for rid in stale_ids if rid not in active_ids]
                 if not stale_ids:
                     continue
-                cur = conn.execute(
+                cur = conn.executemany(
                     f"""UPDATE request_log
                        SET status=CASE WHEN ({disconnected}) THEN 'cancelled' ELSE 'error' END,
                            error_message=CASE WHEN ({disconnected})
@@ -6235,8 +6253,8 @@ def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
                                ELSE 'process crashed (stale pending)' END,
                            http_status=CASE WHEN ({disconnected}) THEN 499 ELSE http_status END,
                            finished_at=?
-                       WHERE status='pending' AND created_at < ?""",
-                    (finished_at, cutoff),
+                       WHERE status='pending' AND request_id=?""",
+                    [(finished_at, rid) for rid in stale_ids],
                 )
                 conn.commit()
                 cleaned += max(0, int(cur.rowcount or 0))
@@ -9537,5 +9555,5 @@ def record_upstream_model_observation(
         changed = bool(cur.rowcount)
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
-            _request_handles.pop(handle.request_id, None)
+            _release_request_handle(handle.request_id)
         return changed

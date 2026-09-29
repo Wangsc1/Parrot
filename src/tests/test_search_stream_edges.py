@@ -110,6 +110,43 @@ async def test_duplicate_external_calls_are_not_emitted_twice(protocol, conflict
         assert len([t for f in frames for c in f.get("choices", []) for t in c.get("delta", {}).get("tool_calls", [])]) == 1
 
 
+@pytest.mark.parametrize("wire_shape", ["sparse_terminal", "deltas_only", "terminal_only"])
+@pytest.mark.parametrize("managed", [False, True])
+async def test_responses_conflicts_checked_before_coalescing_or_execution(wire_shape, managed, monkeypatch):
+    body = request("responses", mixed=True)
+    name = next(iter(policy.compile_request(body, "responses")[1].values())).name if managed else None
+    obj = reply("responses", name, mixed=not managed)
+    obj["output"].append({**obj["output"][0], "arguments": '{"query":"conflicting"}'})
+    executed, invocations = [], []
+
+    async def execute(calls, **kwargs):
+        executed.extend(calls)
+        return []
+
+    monkeypatch.setattr(web, "execute_local_tool_calls", execute)
+
+    async def invoke(current):
+        invocations.append(current)
+        async def source():
+            for event, data in events(obj, "responses"):
+                if wire_shape == "terminal_only" and event != "response.completed":
+                    continue
+                if wire_shape == "deltas_only" and event in {
+                    "response.output_item.done", "response.function_call_arguments.done",
+                }:
+                    continue
+                if wire_shape != "terminal_only" and event == "response.completed":
+                    data["response"]["output"] = []
+                yield encode(event, data)
+        return StreamingResponse(source())
+
+    raw, frames = await collect(policy.stream(body, "responses", invoke))
+    assert b"tool_call_id_conflict" in raw
+    assert frames[-1]["type"] == "response.failed"
+    assert not any(frame["type"] in {"response.completed", "response.output_item.added"} for frame in frames)
+    assert len(invocations) == 1 and executed == []
+
+
 async def test_responses_late_tool_name_hidden_with_byte_fragmentation():
     body = request(hosted=True)
     name = next(iter(policy.compile_request(body, "responses")[1].values())).name

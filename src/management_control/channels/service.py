@@ -584,8 +584,11 @@ class ChannelControl(ChannelOperationWorkers):
             })
         if not patch:
             raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        if command.name is not None and not command.name.strip():
-            raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
+        if command.name is not None and (not command.name.strip() or len(command.name.strip()) > 64):
+            raise ManagementError(
+                ManagementErrorCode.VALIDATION_FAILED,
+                fields=(ErrorField("name", "invalid_length", "Channel name must contain 1 to 64 characters"),),
+            )
         if command.base_url is not None:
             validate_base_url(command.base_url)
         if command.api_key is not None and len(command.api_key.strip()) < 5:

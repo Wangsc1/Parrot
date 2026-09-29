@@ -2688,6 +2688,9 @@ def handle_edit_text(chat_id: int, action: str, text: str) -> bool:
         if not new_name:
             ui.send(chat_id, "❌ 名称不能为空，请重新输入：")
             return True
+        if len(new_name) > 64:
+            ui.send(chat_id, "❌ 名称过长（上限 64 字符），请重新输入：")
+            return True
         ok, result = _do_edit(chat_id, short, "name", new_name)
         if not ok:
             ui.send(chat_id, f"❌ {ui.escape_html(result)}")

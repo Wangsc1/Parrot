@@ -50,6 +50,7 @@ from ..schemas.oauth import (
     OAuthMutationData,
     OAuthOperationEnvelope,
     OAuthQuotaResetPlanData,
+    OAuthQuotaResetData,
     OAuthQuotaResetPlanRequest,
     OAuthRevisionData,
     PreviewOAuthImportRequest,
@@ -534,7 +535,7 @@ def plan_oauth_quota_reset(
 @router.post(
     "/oauth/accounts/{accountId}/actions/reset-quota",
     operation_id="resetOAuthQuota",
-    response_model=DataEnvelope[OAuthMutationData],
+    response_model=DataEnvelope[OAuthQuotaResetData],
     responses=responses(200, {"accountId": "openai:example", "revision": "revision-example", "status": "reset"}, ManagementErrorCode.INVALID_OPERATION_STATE, ManagementErrorCode.REVISION_CONFLICT),
 )
 def reset_oauth_quota(
@@ -543,12 +544,15 @@ def reset_oauth_quota(
     request: Request,
     context: DestructiveContext,
     control: Control,
-) -> DataEnvelope[OAuthMutationData]:
+) -> DataEnvelope[OAuthQuotaResetData]:
     result = control.reset_quota(
         context, accountId, body.planToken.get_secret_value(),
     )
     return DataEnvelope(
-        data=OAuthMutationData(accountId=result.account_id, revision=result.revision, status=result.status),
+        data=OAuthQuotaResetData(
+            accountId=result.account_id, revision=result.revision, status=result.status,
+            upstreamOutcome=result.upstream_outcome, localAction=result.local_action,
+        ),
         meta=meta(request),
     )
 

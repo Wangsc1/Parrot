@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -77,6 +78,46 @@ class ConversationState:
     blob_store: dict[str, bytes] = field(default_factory=dict)
     live: CursorSession | None = None
     answered_tool_ids: set[str] = field(default_factory=set)
+    constraints: str | None = None
+    busy: bool = False
+    cancelled: bool = False
+    idle_since: float = field(default_factory=time.monotonic)
+
+
+class _TurnIterator:
+    """Own even an unstarted generator; close() must release its live stream."""
+    def __init__(self, iterator, state, release):
+        self.iterator, self.state, self.release = iterator, state, release
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self.iterator)
+        except StopIteration:
+            self._finish(False)
+            raise
+        except BaseException:
+            self._finish(True)
+            raise
+
+    def _finish(self, cancel):
+        if not self.closed:
+            self.closed = True
+            live = self.state.live
+            if cancel and live is not None:
+                getattr(live, "cancel", live.close)()
+                if self.state.live is live:
+                    self.state.live = None
+            self.release()
+
+    def close(self):
+        try:
+            self.iterator.close()
+        finally:
+            self._finish(True)
 
 
 class CursorClient:
@@ -136,22 +177,48 @@ class CursorClient:
     def discard_conversation(self, session_id: str, *, cancel: bool = False) -> None:
         with self._conversation_lock:
             state = self._conversations.pop(str(session_id or ""), None)
-        if state is None or state.live is None:
-            return
-        if cancel:
-            state.live.cancel()
-        else:
-            state.live.close()
-        state.live = None
+            if state is None:
+                return
+            state.cancelled = True
+            live, state.live = state.live, None
+        if live is not None:
+            if cancel:
+                live.cancel()
+            else:
+                live.close()
+
+    def reap_conversations(self, *, now: float | None = None, protected=()) -> list[str]:
+        """Bound paused checkpoints/blobs as well as their transport lifetime."""
+        now = time.monotonic() if now is None else now
+        removed = []
+        with self._conversation_lock:
+            idle = sorted(((key, state) for key, state in self._conversations.items()
+                           if not state.busy and key not in protected), key=lambda item: item[1].idle_since)
+            sizes = {key: len(state.checkpoint or b"") + sum(len(v) for v in tuple(state.blob_store.values()))
+                     for key, state in idle}
+            total = sum(sizes.values())
+            count = len(idle)
+            for key, state in idle:
+                if (state.live is not None and not state.live.alive
+                        or now - state.idle_since >= 600
+                        or count > 128 or total > 64 * 1024 * 1024):
+                    self._conversations.pop(key, None)
+                    removed.append((key, state))
+                    count -= 1
+                    total -= sizes[key]
+        for _, state in removed:
+            self._close_live(state)
+            state.blob_store.clear()
+            state.checkpoint = None
+        return [key for key, _ in removed]
 
     def close(self) -> None:
         with self._conversation_lock:
             states = list(self._conversations.values())
             self._conversations.clear()
         for state in states:
-            if state.live is not None:
-                state.live.close()
-                state.live = None
+            state.cancelled = True
+            self._close_live(state)
 
     def list_models(self) -> list[CursorModel]:
         return list_cursor_models(
@@ -186,70 +253,80 @@ class CursorClient:
         selected = select_tools_for_choice(tools or [], tool_choice)
         mcp_tools = build_mcp_tools(selected)
         enabled = enabled_tool_names(mcp_tools)
+        constraints = json.dumps([model_id, bool(long_ctx or self.max_mode),
+            parsed.system_prompt, selected, tool_choice or "auto"], sort_keys=True, ensure_ascii=False)
         with self._conversation_lock:
             state = self._conversations.setdefault(key, ConversationState())
+            if state.busy and state.live is not None and not state.live.alive:
+                # The old iterator still owns its state object, even after IO
+                # dies. Never let its later close cancel the replacement.
+                state = self._conversations[key] = ConversationState()
+            if state.busy:
+                # A concurrent independent turn is a branch, never an implicit
+                # cancellation of the owner. Runtime gives these branches IDs.
+                if parsed.tool_results:
+                    raise CursorError("Tool response is already being consumed", code="conversation_busy", status=409)
+                key = key + ":branch:" + uuid.uuid4().hex
+                state = self._conversations[key] = ConversationState()
+            state.busy = True
 
-        pending_ids = {item.tool_call_id for item in state.live.pending_execs} if state.live is not None else set()
-        result_ids = {item.tool_call_id for item in parsed.tool_results}
-        resumed = bool(
-            state.live is not None and state.live.alive
-            and result_ids & pending_ids
-            and result_ids <= pending_ids | state.answered_tool_ids
-        )
-        if resumed:
-            assert state.live is not None
-            state.live.send_tool_results(
-                [
-                    {"tool_call_id": item.tool_call_id, "content": item.content, "is_error": False}
-                    for item in parsed.tool_results if item.tool_call_id in pending_ids
-                ]
-            )
-            state.answered_tool_ids.update(result_ids & pending_ids)
-            session = state.live
-        else:
-            # A dead/mismatched tool stream cannot accept Exec replies through
-            # a new UserMessageAction. Rebuild the ordered transcript instead of
-            # attaching tool text to an opaque checkpoint with pending calls.
-            if parsed.tool_results or pending_ids:
-                self._reset_conversation(state)
-            session = self._open_session(
-                state,
-                model_id=model_id,
-                parsed=parsed,
-                mcp_tools=mcp_tools,
-                enabled=enabled,
-                long_ctx=long_ctx,
-            )
+        def release():
+            with self._conversation_lock:
+                state.busy = False
+                state.idle_since = time.monotonic()
 
-        if stream:
-            return self._stream(
-                session,
-                state,
-                model,
-                resumed=resumed,
-                open_session=lambda: self._open_session(
+        try:
+            live = state.live
+            pending_ids = {item.tool_call_id for item in live.pending_execs} if live is not None else set()
+            result_ids = {item.tool_call_id for item in parsed.tool_results}
+            resumed = bool(
+                live is not None and live.alive
+                and state.constraints == constraints
+                and result_ids & pending_ids
+                and result_ids <= pending_ids | state.answered_tool_ids
+            )
+            if resumed:
+                assert live is not None
+                live.send_tool_results(
+                    [
+                        {"tool_call_id": item.tool_call_id, "content": item.content, "is_error": False}
+                        for item in parsed.tool_results if item.tool_call_id in pending_ids
+                    ]
+                )
+                state.answered_tool_ids.update(result_ids & pending_ids)
+                session = live
+            else:
+                # A dead/mismatched tool stream cannot accept Exec replies through
+                # a new UserMessageAction. Rebuild the ordered transcript instead of
+                # attaching tool text to an opaque checkpoint with pending calls.
+                if (parsed.tool_results or pending_ids
+                        or state.constraints is not None and state.constraints != constraints):
+                    self._reset_conversation(state)
+                state.constraints = constraints
+                session = self._open_session(
                     state,
                     model_id=model_id,
                     parsed=parsed,
                     mcp_tools=mcp_tools,
                     enabled=enabled,
                     long_ctx=long_ctx,
-                ),
+                )
+
+            reopen = lambda: self._open_session(
+                state, model_id=model_id, parsed=parsed, mcp_tools=mcp_tools,
+                enabled=enabled, long_ctx=long_ctx,
             )
-        return self._collect(
-            session,
-            state,
-            model,
-            resumed=resumed,
-            open_session=lambda: self._open_session(
-                state,
-                model_id=model_id,
-                parsed=parsed,
-                mcp_tools=mcp_tools,
-                enabled=enabled,
-                long_ctx=long_ctx,
-            ),
-        )
+            if stream:
+                return _TurnIterator(self._stream(session, state, model,
+                    resumed=resumed, open_session=reopen), state, release)
+            try:
+                return self._collect(session, state, model, resumed=resumed, open_session=reopen)
+            finally:
+                release()
+        except BaseException:
+            self._close_live(state)
+            release()
+            raise
 
     def _open_session(
         self,
@@ -261,9 +338,9 @@ class CursorClient:
         enabled: set[str],
         long_ctx: bool,
     ) -> CursorSession:
-        if state.live is not None:
-            state.live.close()
-            state.live = None
+        if state.cancelled:
+            raise CursorError("Request cancelled", code="request_cancelled", status=499)
+        self._close_live(state)
         has_checkpoint = decode_checkpoint(state.checkpoint) is not None
         cloud_rule = parsed.system_prompt if has_checkpoint else parsed.reconstruction_prompt
         request_bytes = build_run_request_bytes(
@@ -294,13 +371,17 @@ class CursorClient:
             channel_key=self.channel_key,
             model=model_id,
         )
-        state.live = session
+        with self._conversation_lock:
+            cancelled = state.cancelled
+            if not cancelled:
+                state.live = session
+        if cancelled:
+            getattr(session, "cancel", session.close)()
+            raise CursorError("Request cancelled", code="request_cancelled", status=499)
         return session
 
     def _reset_conversation(self, state: ConversationState) -> None:
-        if state.live is not None:
-            state.live.close()
-            state.live = None
+        self._close_live(state)
         state.conversation_id = new_conversation_id()
         state.checkpoint = None
         state.blob_store.clear()
@@ -341,9 +422,10 @@ class CursorClient:
         return True, attempt + 1, auth_retried
 
     def _close_live(self, state: ConversationState) -> None:
-        if state.live is not None:
-            state.live.close()
-            state.live = None
+        with self._conversation_lock:
+            live, state.live = state.live, None
+        if live is not None:
+            live.close()
 
     def _next_event(self, session: CursorSession, deadline: float) -> SessionEvent:
         remaining = deadline - time.monotonic()

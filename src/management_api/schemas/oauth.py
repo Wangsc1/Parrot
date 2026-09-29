@@ -162,6 +162,12 @@ class OAuthMutationData(StrictSchema):
     status: str
 
 
+class OAuthQuotaResetData(OAuthMutationData):
+    """Reset receipt; upstream consumption and local recovery are separate facts."""
+    upstreamOutcome: str | None = None
+    localAction: str | None = None
+
+
 class OAuthReplaceConflictData(StrictSchema):
     accountId: str
     replacePlanToken: str

@@ -313,7 +313,11 @@ def inject_user_system_to_messages(messages, user_system):
             messages.insert(0, {"role": "user", "content": [{"type": "text", "text": "..."}]})
         return messages
     messages = list(messages)
-    messages.insert(0, {"role": "user", "content": [{"type": "text", "text": system_text}]})
+    blocks = [{"type": "text", "text": system_text}]
+    if isinstance(user_system, list) and any(isinstance(b, dict) and b.get("cache_control") for b in user_system):
+        blocks = [dict(b) if isinstance(b, dict) else {"type": "text", "text": b}
+                  for b in user_system if isinstance(b, str) or isinstance(b, dict) and b.get("type") == "text"]
+    messages.insert(0, {"role": "user", "content": blocks})
     messages.insert(1, {"role": "assistant", "content": [{"type": "text", "text": "Understood."}]})
     return messages
 
@@ -650,9 +654,9 @@ def _build_dynamic_tool_map(tool_names, threshold=5):
 
 
 def _sanitize_tool_name(name, dynamic_map=None):
-    # 先尝试动态映射
-    if dynamic_map and name in dynamic_map:
-        return dynamic_map[name]
+    # A request map is authoritative, including identity entries.
+    if dynamic_map is not None:
+        return dynamic_map.get(name, name)
     # 兜底：静态前缀映射
     for prefix, replacement in TOOL_NAME_REWRITES.items():
         if name.startswith(prefix):
@@ -664,10 +668,12 @@ def _restore_tool_name_value(name, dynamic_map=None):
     """只还原协议里的工具名值，避免全 chunk 替换误伤正文文本。"""
     if not isinstance(name, str):
         return name
-    if dynamic_map:
+    if dynamic_map is not None:
         for original, fake in dynamic_map.items():
             if name == fake:
                 return original
+        if not getattr(dynamic_map, "_allow_static_fallback", False):
+            return name
     for prefix, replacement in TOOL_NAME_REWRITES.items():
         if name.startswith(replacement):
             return prefix + name[len(replacement):]
@@ -753,6 +759,10 @@ class ToolNameRestoreMap(dict):
 
     def __init__(self, mapping=None):
         super().__init__(mapping or {})
+        # No mapping retains the legacy public static-prefix restoration.
+        # An explicitly supplied request map (even {}) is authoritative: never
+        # reinterpret an original cc_ses_*/cc_sess_* name as another tool.
+        self._allow_static_fallback = mapping is None
         self._pending = b""
 
     def feed(self, chunk):
@@ -862,7 +872,8 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key", s
     if prompt_id is None and not side_query:
         prompt_id = str(uuid.uuid4())
 
-    messages = inject_user_system_to_messages(original_messages, body.get("system"))
+    import copy
+    messages = copy.deepcopy(inject_user_system_to_messages(original_messages, body.get("system")))
     messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
     if not explicit_cache_control:
@@ -874,13 +885,35 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key", s
         prompt_id=prompt_id,
     )
 
-    dynamic_tool_map = None
-    if body.get("tools"):
-        raw_tools = body["tools"]
-        tool_names = [t.get("name") for t in raw_tools if isinstance(t, dict) and t.get("name") and not _is_anthropic_server_tool(t)]
-        dynamic_tool_map = _build_dynamic_tool_map(tool_names)
-        if dynamic_tool_map:
-            print(f"  [tool] dynamic mapping {len(dynamic_tool_map)} tools")
+    tool_names = [t.get("name") for t in body.get("tools") or []
+                  if isinstance(t, dict) and t.get("name") and not _is_anthropic_server_tool(t)]
+    def protocol_blocks(blocks):
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict):
+                continue
+            yield block
+            if block.get("type") == "tool_result":
+                yield from protocol_blocks(block.get("content"))
+    for message in messages:
+        for block in protocol_blocks(message.get("content")):
+            field = "name" if block.get("type") == "tool_use" else "tool_name" if block.get("type") == "tool_reference" else None
+            if field and block.get(field) and block[field] not in tool_names:
+                tool_names.append(block[field])
+    proposed = _build_dynamic_tool_map(tool_names) or {name: _sanitize_tool_name(name) for name in tool_names}
+    # Reserve original names first so an alias never impersonates a distinct tool.
+    reserved = set(tool_names)
+    dynamic_tool_map = {}
+    for name in tool_names:
+        fake = proposed[name]
+        while fake != name and fake in reserved:
+            fake += "_"
+        reserved.add(fake)
+        dynamic_tool_map[name] = fake
+    for message in messages:
+        for block in protocol_blocks(message.get("content")):
+            field = "name" if block.get("type") == "tool_use" else "tool_name" if block.get("type") == "tool_reference" else None
+            if field and block.get(field):
+                block[field] = _sanitize_tool_name(block[field], dynamic_tool_map)
 
     # v280 insertion order is the wire order.  Optional compatibility fields are
     # inserted adjacent to their native section and all private fields are consumed.

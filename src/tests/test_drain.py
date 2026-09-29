@@ -4,7 +4,7 @@ import signal
 import pytest
 import uvicorn
 
-from src import drain
+from src import drain, updater, update_checker
 import server as parrot_server
 
 
@@ -15,6 +15,8 @@ def isolated_drain_state():
         yield
     finally:
         drain.reset_for_tests()
+        updater.start()
+        update_checker.start()
 
 
 def test_drain_waits_for_active_lease_then_finishes():

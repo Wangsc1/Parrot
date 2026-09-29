@@ -161,6 +161,9 @@ class CursorH2Stream:
             proxy_channel=self.channel_key,
             proxy_model=self.model,
         )
+        if self._closed.is_set():
+            raw.close()
+            return
         try:
             sock = raw.start_tls(context, server_hostname=self.host)
         except BaseException:
@@ -177,12 +180,18 @@ class CursorH2Stream:
             conn.initiate_connection()
             stream_id = conn.get_next_available_stream_id()
             conn.send_headers(stream_id, headers, end_stream=end_stream and not initial_body)
-            sock.sendall(conn.data_to_send())
-            self._sock = sock
-            self._conn = conn
-            self._stream_id = stream_id
-            self._reader = threading.Thread(target=self._read_loop, name="cursor-h2-reader", daemon=True)
-            self._reader.start()
+            # Publish only while holding the same lock as close(). A late
+            # connect/TLS result must never resurrect an intentionally closed IO.
+            with self._lock:
+                if self._closed.is_set():
+                    sock.close()
+                    return
+                sock.sendall(conn.data_to_send())
+                self._sock = sock
+                self._conn = conn
+                self._stream_id = stream_id
+                self._reader = threading.Thread(target=self._read_loop, name="cursor-h2-reader", daemon=True)
+                self._reader.start()
             if initial_body:
                 self.write(initial_body, end_stream=end_stream)
             elif end_stream:
@@ -217,11 +226,12 @@ class CursorH2Stream:
             return None
 
     def close(self) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        sock = self._sock
-        conn = self._conn
+        with self._lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            sock = self._sock
+            conn = self._conn
         if sock is not None and conn is not None:
             try:
                 with self._lock:

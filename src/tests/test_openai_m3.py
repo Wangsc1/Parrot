@@ -549,7 +549,7 @@ def test_r2c_translate_request_preserves_text_instruction_items(m):
     out = r2c.translate_request(body)
 
     assert out["messages"] == [
-        {"role": "system", "content": "follow policy"},
+        {"role": "developer", "content": "follow policy"},
         {"role": "user", "content": "background"},
         {"role": "assistant", "content": "noted"},
         {"role": "user", "content": "ping"},

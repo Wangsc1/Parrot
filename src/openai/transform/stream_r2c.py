@@ -156,6 +156,8 @@ class StreamTranslator:
         )
         self._buf = b""
         self._text_order = TextOutputOrder()
+        self._reasoning_parts: dict[tuple[int, int], str] = {}
+        self._reasoning_indices: dict[str, int] = {}
 
     # --- 公开接口 ---
 
@@ -250,6 +252,9 @@ class StreamTranslator:
         elif event_name in ("response.reasoning_summary_text.delta",
                              "response.reasoning_text.delta"):
             yield from self._on_reasoning_delta(data or {})
+        elif event_name in ("response.reasoning_summary_text.done", "response.reasoning_text.done", "response.reasoning_summary_part.done"):
+            value = data.get("text") if event_name.endswith("text.done") else (data.get("part") or {}).get("text")
+            yield from self._on_reasoning_snapshot(data, value)
         elif event_name == "response.function_call_arguments.delta":
             yield from self._on_fc_args_delta(data or {})
         elif event_name == "response.function_call_arguments.done":
@@ -279,6 +284,8 @@ class StreamTranslator:
     def _on_output_item_added(self, data: dict) -> Iterator[bytes]:
         item = data.get("item") or {}
         item_type = item.get("type")
+        if item_type == "reasoning" and item.get("id") and isinstance(data.get("output_index"), int):
+            self._reasoning_indices[item["id"]] = data["output_index"]
         # 02-bug-findings #33: 上游连续 emit 多个 message item 时，
         # 下游 chat 流应每个 message 一个 role chunk 来分段；
         # 否则所有 text 会被合并到同一个 message 里、丢段落。
@@ -360,6 +367,12 @@ class StreamTranslator:
             yield from self._ensure_custom_tool_call_started(data, item)
             yield from self._emit_terminal_custom_input_tail(data, item.get("input"))
             return
+        if item_type == "reasoning":
+            index = self._reasoning_indices.get(str(item.get("id") or ""), int(data.get("output_index") or 0))
+            for summary_index, part in enumerate(item.get("summary") or []):
+                if isinstance(part, dict):
+                    yield from self._on_reasoning_snapshot({"output_index": index, "summary_index": summary_index}, part.get("text"))
+            return
         if item_type != "message":
             return
         if isinstance(item.get("id"), str) and isinstance(data.get("output_index"), int):
@@ -409,8 +422,7 @@ class StreamTranslator:
             tail = full_text[len(emitted):]
             self.state.chat_text_by_part[key] = full_text
         else:
-            # A contradictory terminal snapshot cannot be safely merged without
-            # risking duplicated or reordered client-visible text.
+            yield from self._on_error("error", {"message": "Conflicting final text after publication", "code": "invalid_response_snapshot"})
             return
         if not tail:
             return
@@ -489,9 +501,22 @@ class StreamTranslator:
         text = data.get("delta")
         if not isinstance(text, str) or not text:
             return
+        key = (int(data.get("output_index") or 0), int(data.get("summary_index") or 0))
+        if data.get("item_id"):
+            self._reasoning_indices[data["item_id"]] = key[0]
+        self._reasoning_parts[key] = self._reasoning_parts.get(key, "") + text
         yield from self._ensure_role_sent()
-        # 非官方字段：兼容客户端会忽略；DeepSeek 系列客户端能拾取
         yield _mk_chunk(self.state, delta={"reasoning_content": text})
+
+    def _on_reasoning_snapshot(self, data: dict, text: Any) -> Iterator[bytes]:
+        if not isinstance(text, str):
+            return
+        key = (int(data.get("output_index") or 0), int(data.get("summary_index") or 0))
+        previous = self._reasoning_parts.get(key, "")
+        if text.startswith(previous):
+            yield from self._on_reasoning_delta({**data, "delta": text[len(previous):]})
+        else:
+            yield from self._on_error("error", {"message": "Conflicting final reasoning after publication", "code": "invalid_response_snapshot"})
 
     def _on_fc_args_delta(self, data: dict) -> Iterator[bytes]:
         output_index = int(data.get("output_index", 0))
@@ -521,8 +546,12 @@ class StreamTranslator:
             return
         emitted = self.state.fc_args_by_tc_index.get(tc_index, "")
         if not full_args.startswith(emitted):
-            # A contradictory final snapshot cannot be appended without
-            # corrupting the JSON argument stream sent to the client.
+            try:
+                if json.loads(full_args) == json.loads(emitted):
+                    return
+            except (ValueError, TypeError):
+                pass
+            yield from self._on_error("error", {"message": "Conflicting final tool arguments after publication", "code": "invalid_tool_arguments"})
             return
         tail = full_args[len(emitted):]
         self.state.fc_args_by_tc_index[tc_index] = full_args
@@ -562,6 +591,7 @@ class StreamTranslator:
             return
         emitted = self.state.custom_input_by_tc_index.get(tc_index, "")
         if not full_input.startswith(emitted):
+            yield from self._on_error("error", {"message": "Conflicting final custom tool input after publication", "code": "invalid_tool_arguments"})
             return
         tail = full_input[len(emitted):]
         self.state.custom_input_by_tc_index[tc_index] = full_input
@@ -585,16 +615,18 @@ class StreamTranslator:
         return
         yield  # noqa: keep generator
 
-    def _on_completed(self, data: dict) -> Iterator[bytes]:
+    def _restore_terminal_output(self, data: dict) -> Iterator[bytes]:
         resp = data.get("response") or {}
         # The terminal response snapshot may be the only carrier of function
         # arguments or custom tool input. Repair either kind before locking
         # terminal state.
         for snapshot_index, item in enumerate(resp.get("output") or []):
+            if self.state.terminal_emitted:
+                return
             if not isinstance(item, dict):
                 continue
             item_type = item.get("type")
-            if item_type == "message":
+            if item_type in ("message", "reasoning"):
                 output_index = self.state.message_output_index_by_id.get(str(item.get("id") or ""), snapshot_index)
                 yield from self._on_output_item_done({"output_index": output_index, "item": item})
                 continue
@@ -620,6 +652,12 @@ class StreamTranslator:
             else:
                 yield from self._ensure_custom_tool_call_started(item_data, item)
                 yield from self._emit_terminal_custom_input_tail(item_data, item.get("input"))
+
+    def _on_completed(self, data: dict) -> Iterator[bytes]:
+        resp = data.get("response") or {}
+        yield from self._restore_terminal_output(data)
+        if self.state.terminal_emitted:
+            return
         self.state.terminal_status = "completed"
         self.state.usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else None
         fallback = ("tool_calls" if (self.state.fc_output_index_to_tc_index
@@ -633,6 +671,9 @@ class StreamTranslator:
 
     def _on_incomplete(self, data: dict) -> Iterator[bytes]:
         resp = data.get("response") or {}
+        yield from self._restore_terminal_output(data)
+        if self.state.terminal_emitted:
+            return
         self.state.terminal_status = "incomplete"
         self.state.usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else None
         incomplete = resp.get("incomplete_details") or {}
@@ -662,6 +703,8 @@ class StreamTranslator:
         msg: dict = {"role": "assistant"}
         content = "".join(self.state.chat_text_parts)
         msg["content"] = content if content else None
+        if self._reasoning_parts:
+            msg["reasoning_content"] = "".join(self._reasoning_parts.values())
         if self.state.chat_refusal_parts:
             msg["refusal"] = "".join(self.state.chat_refusal_parts)
         if self.state.annotations:

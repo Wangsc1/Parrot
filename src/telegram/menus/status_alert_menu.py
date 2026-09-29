@@ -67,7 +67,8 @@ def _format_active_block() -> str:
             icon = _CONTROL.impact_icon(_ctx(), impact)
             sicon = _CONTROL.status_icon(_ctx(), status)
             short = i.get("shortlink") or ""
-            lines.append(f"  {icon} {ui.escape_html(name)} · {sicon} <code>{status}</code>")
+            pending = "（本轮缺席，状态待确认）" if i.get("_status_unconfirmed") else ""
+            lines.append(f"  {icon} {ui.escape_html(name)} · {sicon} <code>{status}</code>{pending}")
             if short:
                 lines.append(f"  <code>{ui.escape_html(short)}</code>")
     if total == 0:
@@ -79,7 +80,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
     cfg = _cfg()
     enabled = bool(cfg.get("enabled", True))
     interval = int(cfg.get("intervalSeconds", 60) or 60)
-    targets = set(cfg.get("targets") or _PROVIDERS_ORDER)
+    targets = set(cfg.get("targets", _PROVIDERS_ORDER))
     min_impact = (cfg.get("minImpact") or "minor").lower()
     notif_evt = bool(cfg.get("notificationEnabled", True))
     muted_total = len(_CONTROL.list_muted_raw(_ctx()))
@@ -236,7 +237,7 @@ def _refresh(chat_id: int, message_id: int, cb_id: str) -> None:
 def _history(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "拉取中…")
     lines = ["📜 <b>最近事件（各 provider 最多 5 条）</b>"]
-    for p in _cfg().get("targets") or list(_PROVIDERS_ORDER):
+    for p in _cfg().get("targets", _PROVIDERS_ORDER):
         if p not in STATUS_PROVIDERS:
             continue
         try:

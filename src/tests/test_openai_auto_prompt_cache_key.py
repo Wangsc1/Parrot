@@ -409,7 +409,7 @@ def test_responses_stable_fallback_includes_input_system(m):
     assert key2.startswith("parrot:auto:v1:stable:")
 
 
-def test_openai_prompt_total_legacy_input_includes_cached(m):
+def test_openai_prompt_total_does_not_guess_legacy_semantics(m):
     from src import cache_display
 
     row = {
@@ -418,8 +418,10 @@ def test_openai_prompt_total_legacy_input_includes_cached(m):
         "cache_creation_tokens": 0,
         "cache_read_tokens": 26112,
     }
-    assert cache_display.prompt_total_from_row(row) == 28010
-    assert "93.2%" in cache_display.cache_read_phrase_from_row(row)
+    # No version/provenance proves this row uses the obsolete inclusive-input
+    # shape. Protocol and relative counter sizes must not change its meaning.
+    assert cache_display.prompt_total_from_row(row) == 54122
+    assert "48.2%" in cache_display.cache_read_phrase_from_row(row)
 
 
 def test_get_client_ip_prefers_cdn_headers(m):

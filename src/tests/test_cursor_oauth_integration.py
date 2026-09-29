@@ -1194,8 +1194,7 @@ def test_cursor_context_markers_and_openai_ingress_normalization():
         assert disabled[cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY] is False
 
 
-def test_cursor_max_context_metadata_and_preflight_use_one_million(monkeypatch):
-    import server
+def test_cursor_max_context_metadata_and_request_budget_use_one_million():
 
     account = _install_account()
     scope = "oauth:cursor:cursor-user-1"
@@ -1220,48 +1219,40 @@ def test_cursor_max_context_metadata_and_preflight_use_one_million(monkeypatch):
     ) == 1_000_000
 
     channel = CursorOAuthChannel(account)
-    route = SimpleNamespace(
-        candidates=[(channel, "claude-fable-5")], saturated=[],
-    )
-    monkeypatch.setattr(
-        server.token_counter, "count_request_tokens", lambda *_args, **_kwargs: 310_000,
-    )
     base = {
         "model": "claude-fable-5",
         "_client_visible_model": "claude-fable-5",
         "messages": [{"role": "user", "content": "large prompt"}],
     }
-    assert server._anthropic_to_openai_context_preflight(
-        {**base, cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY: False}, route,
-    ) is not None
-    assert server._anthropic_to_openai_context_preflight(
-        {**base, cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY: True}, route,
-    ) is None
+    # Ordinary request budgets have no compaction reserve; safe_prompt_limit
+    # above is the separate planning value with its 20k buffer.
+    for wants_max, expected in ((False, 300_000), (True, 1_000_000)):
+        body = {**base, cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY: wants_max}
+        budget = model_metadata.effective_request_budget(
+            "claude-fable-5", scope_key=scope, outbound_model="claude-fable-5",
+            request_shape=body, use_max_context=channel.uses_max_context(body, "claude-fable-5"),
+        )
+        assert budget.effective_input_budget == expected
 
 
-def test_cursor_preflight_ignores_clampable_output_limit(monkeypatch):
-    """A max_tokens above the native output cap is clamped per candidate later;
-    the single-route context preflight must not turn it into a bogus
-    'Prompt is too long: N > M' error with N < M."""
-    import server
+def test_cursor_output_is_clamped_without_estimated_input_rejection(monkeypatch):
+    """Output caps remain enforced independently of advisory input estimates."""
+    from src import failover, token_counter
 
     account = _install_account()
     channel = CursorOAuthChannel(account)
-    route = SimpleNamespace(candidates=[(channel, "claude-fable-5")], saturated=[])
-    monkeypatch.setattr(
-        server.token_counter, "count_request_tokens", lambda *_args, **_kwargs: 30_000,
-    )
     body = {
         "model": "claude-fable-5",
         "_client_visible_model": "claude-fable-5",
         "max_tokens": 128_000,
         "messages": [{"role": "user", "content": "small prompt"}],
     }
-    assert server._anthropic_to_openai_context_preflight(body, route) is None
-    monkeypatch.setattr(
-        server.token_counter, "count_request_tokens", lambda *_args, **_kwargs: 1_000_001,
-    )
-    assert server._anthropic_to_openai_context_preflight(body, route) is not None
+    monkeypatch.setattr(token_counter, "count_request_tokens", lambda *_a, **_kw: 1_000_001)
+    clamped = failover._candidate_budget_body(channel, "claude-fable-5", body)
+    assert clamped["max_tokens"] == 64_000
+    assert body["max_tokens"] == 128_000
+    budget = failover._validate_wire_payload_budget(channel, "claude-fable-5", body, clamped, None)
+    assert budget is not None and budget.output_within_limit
 
 
 def test_cursor_compact_trigger_override_may_target_max_context_tier():

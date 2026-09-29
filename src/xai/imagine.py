@@ -38,6 +38,7 @@ from .. import (
     media_db,
     model_validation,
     network,
+    oauth_manager,
     scorer,
     state_db,
 )
@@ -176,6 +177,56 @@ def _safe_response_headers(headers: httpx.Headers) -> dict[str, str]:
         for name, value in headers.items()
         if name.lower() not in _HOP_BY_HOP_RESPONSE_HEADERS
     }
+
+
+def _media_private_values(channel: XAIOAuthChannel, headers: dict | None = None) -> tuple[str, ...]:
+    """Freeze known private values before I/O, including the token actually sent."""
+    account = oauth_manager.get_account(channel.account_key) or {}
+    values = [account.get(field) for field in (
+        "access_token", "refresh_token", "id_token", "email", "subject", "sub",
+        "workspace_id", "chatgpt_account_id", "project_id", "projectId",
+    )]
+    values.extend((getattr(channel, "email", None), getattr(channel, "subject", None)))
+    for name, value in (headers or {}).items():
+        if name.lower() in ("authorization", "x-api-key", "cookie"):
+            values.append(value)
+            if name.lower() == "authorization":
+                values.append(value.partition(" ")[2])
+    return tuple(value for value in values if isinstance(value, str) and value)
+
+
+def _sanitize_video_response(response: httpx.Response, private: tuple[str, ...]) -> httpx.Response:
+    """Redact known credentials from errors before either logs or clients see them.
+
+    Successful video payloads (URLs, progress, IDs and usage) stay byte-for-byte.
+    Some asynchronous failures use HTTP 200, so HTTP status alone is insufficient.
+    """
+    values = sorted(set(private), key=len, reverse=True)
+    def redact(value):
+        if isinstance(value, str):
+            for secret in values:
+                value = value.replace(secret, "[private]")
+            return value
+        if isinstance(value, dict):
+            return {redact(k): redact(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [redact(v) for v in value]
+        return value
+
+    obj = _response_object(response)
+    failed = (response.status_code >= 400 or bool(obj.get("error"))
+              or _video_log_status(obj.get("status")) in ("failed", "expired", "cancelled"))
+    headers = {name: redact(value) for name, value in _safe_response_headers(response.headers).items()
+               if name.lower() != "authorization"}
+    content = response.content
+    if failed:
+        try:
+            content = json.dumps(redact(response.json()), ensure_ascii=False).encode("utf-8")
+            headers["content-type"] = "application/json"
+        except ValueError:
+            content = redact(response.text).encode("utf-8")
+            headers["content-type"] = headers.get("content-type", "text/plain").split(";", 1)[0] + "; charset=utf-8"
+    return httpx.Response(response.status_code, content=content, headers=headers)
 
 
 def _downstream_response(response: httpx.Response) -> Response:
@@ -356,55 +407,66 @@ async def _cache_xai_results(
     max_bytes = _media_cache_file_limit(cfg)
     paths: list[str] = []
     total_bytes = 0
-    for index, item in enumerate(items):
-        try:
-            source_url = str(item.get("url") or "")
-            b64_value = item.get("b64_json")
-            if isinstance(b64_value, str) and b64_value:
-                if len(b64_value) * 3 // 4 > max_bytes:
-                    raise ValueError("generated media exceeds cache file limit")
-                raw = media_cache.decode_base64(b64_value, max_bytes=max_bytes)
-                mime = str(item.get("mime_type") or "")
-            elif source_url:
-                raw, downloaded_mime = await _download_xai_media(
-                    source_url,
-                    channel=channel,
-                    model=model,
-                    max_bytes=max_bytes,
+    write_task = None
+    try:
+        for index, item in enumerate(items):
+            try:
+                source_url = str(item.get("url") or "")
+                b64_value = item.get("b64_json")
+                if isinstance(b64_value, str) and b64_value:
+                    if len(b64_value) * 3 // 4 > max_bytes:
+                        raise ValueError("generated media exceeds cache file limit")
+                    raw = media_cache.decode_base64(b64_value, max_bytes=max_bytes)
+                    mime = str(item.get("mime_type") or "")
+                elif source_url:
+                    # Downloads remain cancellable; only disk transitions are owned.
+                    raw, downloaded_mime = await _download_xai_media(
+                        source_url, channel=channel, model=model, max_bytes=max_bytes,
+                    )
+                    mime = str(item.get("mime_type") or downloaded_mime)
+                else:
+                    continue
+                if not raw or len(raw) > max_bytes:
+                    raise ValueError("generated media is empty or exceeds cache file limit")
+                extension = _cached_media_extension(
+                    media_type=media_type, mime=mime, source_url=source_url,
                 )
-                mime = str(item.get("mime_type") or downloaded_mime)
-            else:
-                continue
-            if not raw or len(raw) > max_bytes:
-                raise ValueError("generated media is empty or exceeds cache file limit")
-            extension = _cached_media_extension(
-                media_type=media_type,
-                mime=mime,
-                source_url=source_url,
-            )
-            path = await asyncio.to_thread(
-                _write_cached_media,
-                raw,
-                cfg=cfg,
-                media_type=media_type,
-                action=action,
-                extension=extension,
-                index=index,
-            )
-            paths.append(path)
-            total_bytes += len(raw)
-        except Exception as exc:
-            print(
-                f"[xai-imagine] {media_type} cache failed "
-                f"index={index} type={type(exc).__name__}"
-            )
+                write_task = asyncio.create_task(asyncio.to_thread(
+                    _write_cached_media, raw, cfg=cfg, media_type=media_type,
+                    action=action, extension=extension, index=index,
+                ))
+                path = await await_owned(write_task)
+                write_task = None
+                paths.append(path)
+                total_bytes += len(raw)
+            except Exception as exc:
+                print(
+                    f"[xai-imagine] {media_type} cache failed "
+                    f"index={index} type={type(exc).__name__}"
+                )
 
-    if paths:
-        try:
-            root = media_cache.cache_root(cfg)
-            await asyncio.to_thread(media_cache.cleanup, root, cfg)
-        except Exception as exc:
-            print(f"[xai-imagine] media cache cleanup failed type={type(exc).__name__}")
+        if paths:
+            try:
+                root = media_cache.cache_root(cfg)
+                await await_owned(asyncio.to_thread(media_cache.cleanup, root, cfg))
+            except Exception as exc:
+                print(f"[xai-imagine] media cache cleanup failed type={type(exc).__name__}")
+    except asyncio.CancelledError:
+        # await_owned has drained the worker. These new files have not been
+        # published or handed to a log owner, so roll back only this cache batch.
+        if write_task is not None and write_task.done() and not write_task.cancelled():
+            try:
+                paths.append(write_task.result())
+            except Exception:
+                pass
+        def discard_unpublished():
+            for path in paths:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+        await await_owned(asyncio.to_thread(discard_unpublished))
+        raise
     return paths, total_bytes
 
 
@@ -439,7 +501,8 @@ async def _finish_media_log(log_id: int | None, **fields: Any) -> None:
 
 async def _update_video_log(request_id: str, **fields: Any) -> None:
     try:
-        await asyncio.to_thread(media_db.update_job, request_id, **fields)
+        # A completed cache batch transfers its receipt to this durable owner.
+        await await_owned(asyncio.to_thread(media_db.update_job, request_id, **fields))
     except Exception as exc:
         print(f"[xai-imagine] video log update failed type={type(exc).__name__}")
 
@@ -511,9 +574,9 @@ async def _request_upstream(
 
 def _record_upstream_status(channel: XAIOAuthChannel, model: str, status: int) -> None:
     if 200 <= status < 300:
-        cooldown.clear_on_success(channel.key, model)
+        cooldown.clear_on_success(channel_state.effect_key(channel), model)
     elif status in _EXPLICIT_SAFE_FAILOVER_STATUSES or status >= 500:
-        cooldown.record_error(channel.key, model, f"xAI Imagine HTTP {status}")
+        cooldown.record_error(channel_state.effect_key(channel), model, f"xAI Imagine HTTP {status}")
 
 
 async def _post_with_safe_failover(
@@ -542,14 +605,17 @@ async def _post_with_safe_failover(
             continue
         acquired_any = True
         try:
+            private = _media_private_values(channel) if kind == "video" else ()
             try:
                 headers = await channel.build_media_headers()
+                if kind == "video":
+                    private += _media_private_values(channel, headers)
             except Exception as exc:
                 print(
                     f"[xai-imagine] OAuth headers failed channel={channel.key} "
                     f"type={type(exc).__name__}"
                 )
-                cooldown.record_error(channel.key, model, "xAI Imagine OAuth headers failed")
+                cooldown.record_error(effect_key, model, "xAI Imagine OAuth headers failed")
                 continue
 
             try:
@@ -581,6 +647,8 @@ async def _post_with_safe_failover(
                 )
 
             _record_upstream_status(channel, model, response.status_code)
+            if kind == "video":
+                response = _sanitize_video_response(response, private)
             result = _PostResult(response=response, channel=channel)
             if response.status_code in _EXPLICIT_SAFE_FAILOVER_STATUSES:
                 last_rejection = result
@@ -1055,7 +1123,9 @@ async def handle_video_result(request: Request, request_id: str) -> Response:
 
     try:
         try:
+            private = _media_private_values(channel)
             headers = await channel.build_media_headers()
+            private += _media_private_values(channel, headers)
             response = await _request_upstream(
                 channel,
                 method="GET",
@@ -1098,6 +1168,7 @@ async def handle_video_result(request: Request, request_id: str) -> Response:
             )
 
         _record_upstream_status(channel, model, response.status_code)
+        response = _sanitize_video_response(response, private)
         response_body = _response_object(response)
         upstream_status = str(response_body.get("status") or "").strip()
         if 200 <= response.status_code < 300:

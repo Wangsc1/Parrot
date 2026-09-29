@@ -104,12 +104,16 @@ async def test_reconnect_restores_replay_before_scheduling(monkeypatch):
     good = scheduler.schedule(restored, api_key_name='ws-key', client_ip='1.2.3.4', ingress_protocol='responses')
     assert good
     invoked = []
-    async def unexpected(*a, **kw):
+    async def restored_session(websocket, **kw):
         invoked.append(kw['body'])
+        # A real completed session emits a terminal before returning. Without
+        # it the connection correctly remains open awaiting further frames.
+        await websocket.send_text(json.dumps({'type':'response.completed', 'response': {
+            'id':'replayed-response', 'status':'completed', 'output':[]}}))
         return True
-    monkeypatch.setattr(responses_ws, '_run_search_ws_session', unexpected)
+    monkeypatch.setattr(responses_ws, '_run_search_ws_session', restored_session)
     ws = w.FakeWebSocket({'type':'response.create', **body})
-    await responses_ws.handle_responses_ws(ws)
+    await asyncio.wait_for(responses_ws.handle_responses_ws(ws), 2)
     print('RECONNECT_CLOSE', ws.close_calls, 'RESTORED_ROUTES', len(good.candidates))
     assert len(invoked) == 1 and not ws.close_calls
     assert 'previous_response_id' not in invoked[0]
@@ -263,27 +267,30 @@ async def test_search_ws_control_cancels_real_http_round_and_releases_capacity(m
             yield b''
         async def aclose(self):
             closed.set()
-    class WS(w.FakeWebSocket):
-        async def receive(self):
-            if self._first_text is not None:
-                return await super().receive()
-            await waiting.wait()
-            if control == 'disconnect':
-                return {'type':'websocket.disconnect','code':1000}
-            return {'type':'websocket.receive','text':json.dumps({'type':'response.cancel'})}
-    ws = WS({'type':'response.create','model':'test-model','input':'hi','tools':[{'type':'web_search'}]})
+    from src.tests.test_protocol_audit_ws_regressions import Client
+    ws = Client()
+    ws.send({'type':'response.create','model':'test-model','input':'hi','tools':[{'type':'web_search'}]})
     monkeypatch.setattr(upstream, '_client_pool', upstream.SharedClientPool(upstream._new_client))
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, headers={'openai-model':'cancel-model'}, stream=SlowStream()))) as client:
         upstream.set_client(client)
-        await asyncio.wait_for(responses_ws.handle_responses_ws(ws), 3)
+        task = asyncio.create_task(responses_ws.handle_responses_ws(ws))
+        try:
+            await asyncio.wait_for(waiting.wait(), 2)
+            if control == 'cancel':
+                ws.send({'type':'response.cancel'})
+                await ws.until(lambda event: event.get('error', {}).get('code') == 'response_cancelled')
+                # Cancelling one response does not close the client connection.
+                assert not ws.close_calls and closed.is_set()
+        finally:
+            ws.disconnect()
+            await asyncio.wait_for(task, 3)
     assert closed.is_set()
     assert m['apikey_limiter'].key_snapshot('ws-key')['in_flight'] == 0
     channels = {r['channel_key']:r for r in m['concurrency'].snapshot()}
     assert channels[ch.key]['in_flight'] == 0
     assert w._last_request_log(m)['status'] == 'cancelled'
     assert w._last_request_log(m)['upstream_actual_model'] == 'cancel-model'
-    if control == 'cancel':
-        assert ws.close_calls == [(1000,'response cancelled')]
+    assert not ws.close_calls
 
 
 async def test_search_ws_sequential_terminal_handoff(monkeypatch):

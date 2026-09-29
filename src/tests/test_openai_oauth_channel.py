@@ -1038,7 +1038,10 @@ def test_channel_chat_ingress_translator(m):
         "messages": [{"role": "user", "content": "hi"}],
         "stream": True,
         "stream_options": {"include_usage": True},
-        "response_format": {"type": "json_schema"},
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "reply", "strict": True,
+            "schema": {"type": "object", "properties": {}, "additionalProperties": False},
+        }},
         "_api_key_name": "internal",
     }
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1",
@@ -1053,6 +1056,7 @@ def test_channel_chat_ingress_translator(m):
     payload = json.loads(req.body)
     # chat→responses translator 应该已把 messages 翻译成 input
     assert isinstance(payload.get("input"), list) and payload["input"]
+    assert payload["text"]["format"] == {**body["response_format"]["json_schema"], "type": "json_schema"}
     assert "response_format" not in payload
     assert "_api_key_name" not in payload
     # codex transform 强制 flag

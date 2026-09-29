@@ -159,7 +159,7 @@ class OpenAIApiChannel(Channel):
                 "invalid_request_error",
                 "DeepSeek thinking mode does not support forced/required tool_choice; use tool_choice=auto or explicitly disable thinking",
                 param="tool_choice",
-                scope="request",
+                scope="candidate",
             )
 
         # DeepSeek thinking is enabled by default.  Only an explicit Anthropic
@@ -207,7 +207,7 @@ class OpenAIApiChannel(Channel):
                 "invalid_request_error",
                 "DeepSeek thinking mode does not support forced/required tool_choice; use tool_choice=auto or explicitly disable thinking",
                 param="tool_choice",
-                scope="request",
+                scope="candidate",
             )
         if not thinking_enabled:
             payload["reasoning"] = {"effort": "none"}
@@ -461,6 +461,7 @@ class OpenAIApiChannel(Channel):
                 "upstream_protocol": "openai-responses",
                 # failover 按此字段选非流式响应反向函数 + 流式 translator
                 "response_translator": "chat_to_responses",
+                "request_body": body,
                 "model_for_response": resolved_model,
                 "include_usage": include_usage,
             },

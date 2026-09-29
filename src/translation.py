@@ -407,13 +407,14 @@ def _mem_prune_locked(now: Optional[float] = None, *, max_bytes: Optional[int] =
     if max_bytes is None or ttl_s is None:
         max_bytes, ttl_s = _mem_limits()
 
-    if ttl_s > 0:
-        expired = [
-            key for key, item in _mem_cache.items()
-            if now - float(item.get("cached_at") or 0) > ttl_s
-        ]
-        for key in expired:
-            _mem_remove_locked(key)
+    durable_cutoff = now - _as_int(_get_cfg().get("cacheTtlDays"), 3, lo=1) * 86400
+    expired = [
+        key for key, item in _mem_cache.items()
+        if (ttl_s > 0 and now - float(item.get("cached_at") or 0) > ttl_s)
+        or float(item.get("created_at", item.get("cached_at")) or 0) <= durable_cutoff
+    ]
+    for key in expired:
+        _mem_remove_locked(key)
 
     if max_bytes <= 0:
         _mem_cache.clear()
@@ -425,7 +426,8 @@ def _mem_prune_locked(now: Optional[float] = None, *, max_bytes: Optional[int] =
         _mem_remove_locked(oldest_key)
 
 
-def _mem_put(key: str, translated: str, *, cfg: Optional[dict] = None) -> None:
+def _mem_put(key: str, translated: str, *, cfg: Optional[dict] = None,
+             created_at: Optional[float] = None) -> None:
     global _mem_cache_bytes
     cfg = cfg or _get_cfg()
     max_bytes, ttl_s = _mem_limits(cfg)
@@ -440,7 +442,8 @@ def _mem_put(key: str, translated: str, *, cfg: Optional[dict] = None) -> None:
     now = time.time()
     with _mem_lock:
         _mem_remove_locked(key)
-        _mem_cache[key] = {"translated": translated, "cached_at": now, "size": size}
+        _mem_cache[key] = {"translated": translated, "cached_at": now, "size": size,
+                           "created_at": now if created_at is None else created_at}
         _mem_cache.move_to_end(key)
         _mem_cache_bytes += size
         _mem_prune_locked(now, max_bytes=max_bytes, ttl_s=ttl_s)
@@ -450,15 +453,16 @@ def _preload(count: int) -> None:
     """从 sqlite 加载最近 count 条到内存热层。"""
     if _db is None or count <= 0:
         return
+    cfg = _get_cfg()
+    cutoff = time.time() - _as_int(cfg.get("cacheTtlDays"), 3, lo=1) * 86400
     with _db_lock:
         rows = _db.execute(
-            "SELECT cache_key, translated FROM translation_cache "
-            "ORDER BY created_at DESC LIMIT ?",
-            (count,),
+            "SELECT cache_key, translated, created_at FROM translation_cache "
+            "WHERE created_at > ? ORDER BY created_at DESC LIMIT ?",
+            (cutoff, count),
         ).fetchall()
-    cfg = _get_cfg()
-    for key, translated in reversed(rows):  # 最新的放后面（OrderedDict 末尾）
-        _mem_put(key, translated, cfg=cfg)
+    for key, translated, created_at in reversed(rows):  # 最新的放后面
+        _mem_put(key, translated, cfg=cfg, created_at=created_at)
 
 
 def _make_cache_key(
@@ -475,7 +479,8 @@ def _make_cache_key(
     if system_prompt is None:
         system_prompt = DEFAULT_TRANSLATION_PROMPT.replace("{target_language}", target_language)
     payload = {
-        "v": 2,
+        # Older SSE cache entries did not prove successful completion.
+        "v": 3,
         "target_language": target_language,
         "prompt_sha256": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
         "model_signature": model_signature,
@@ -500,11 +505,14 @@ def _cache_get(key: str) -> Optional[str]:
     max_bytes, ttl_s = _mem_limits(cfg)
     now = time.time()
 
+    # Promotion/preload must not renew the original durable lifetime.
+    cutoff = now - _as_int(cfg.get("cacheTtlDays"), 3, lo=1) * 86400
     # 1. 内存热层：受独立内存 TTL 和容量上限约束。
     with _mem_lock:
         item = _mem_cache.get(key)
         if item is not None:
-            if ttl_s <= 0 or now - float(item.get("cached_at") or 0) <= ttl_s:
+            if ((ttl_s <= 0 or now - float(item.get("cached_at") or 0) <= ttl_s)
+                    and float(item.get("created_at", item.get("cached_at")) or 0) > cutoff):
                 _mem_cache.move_to_end(key)
                 _cache_stats["hits"] += 1
                 return str(item.get("translated") or "")
@@ -518,7 +526,7 @@ def _cache_get(key: str) -> Optional[str]:
     cutoff = now - ttl_days * 86400
     with _db_lock:
         row = _db.execute(
-            "SELECT translated FROM translation_cache "
+            "SELECT translated, created_at FROM translation_cache "
             "WHERE cache_key = ? AND created_at > ?",
             (key, cutoff),
         ).fetchone()
@@ -527,7 +535,7 @@ def _cache_get(key: str) -> Optional[str]:
         return None
 
     translated = str(row[0])
-    _mem_put(key, translated, cfg=cfg)
+    _mem_put(key, translated, cfg=cfg, created_at=float(row[1]))
     _cache_stats["hits"] += 1
     return translated
 
@@ -783,7 +791,10 @@ def _extract_text_from_response(data: dict, protocol: str) -> Optional[str]:
 
 def _iter_sse_event_objects(raw: bytes) -> list[tuple[Optional[str], Optional[dict]]]:
     """解析完整 SSE 字节串，返回 [(event_name, data_obj)]。"""
-    text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    except UnicodeDecodeError:
+        return [("error", {"type": "error"})]
     out: list[tuple[Optional[str], Optional[dict]]] = []
     text = text.replace("\r\n", "\n")
     for block in text.split("\n\n"):
@@ -802,12 +813,13 @@ def _iter_sse_event_objects(raw: bytes) -> list[tuple[Optional[str], Optional[di
             continue
         data_str = "\n".join(data_lines).strip()
         if not data_str or data_str == "[DONE]":
-            out.append((event_name, None))
+            out.append(("[DONE]" if data_str == "[DONE]" else event_name, None))
             continue
         try:
             out.append((event_name, json.loads(data_str)))
         except Exception:
-            out.append((event_name, None))
+            # Malformed content after a text delta is not successful translation.
+            out.append(("error", {"type": "error"}))
     return out
 
 
@@ -824,11 +836,24 @@ def _extract_text_from_sse(raw: bytes, protocol: str, resolved_model: str) -> Op
     events = _iter_sse_event_objects(raw)
     if not events:
         return None
+    # An error may follow usable text, and Responses errors live in response.
+    for event_name, data in events:
+        data = data if isinstance(data, dict) else {}
+        typ = str(data.get("type") or event_name or "")
+        nested = data.get("response") if isinstance(data.get("response"), dict) else {}
+        if (typ in ("error", "response.failed", "response.incomplete")
+                or data.get("error") or nested.get("error")
+                or nested.get("status") in ("failed", "incomplete", "cancelled")
+                or _completion_incomplete_reason(nested, "openai-responses")):
+            return None
 
     if protocol == "openai-chat":
         parts: list[str] = []
         final_obj: Optional[dict] = None
+        completed = False
         for _event, data in events:
+            if _event == "[DONE]":
+                completed = True  # Accepted by compatible Chat services.
             if not isinstance(data, dict):
                 continue
             if isinstance(data.get("error"), dict):
@@ -837,12 +862,18 @@ def _extract_text_from_sse(raw: bytes, protocol: str, resolved_model: str) -> Op
             if isinstance(data.get("choices"), list):
                 choices = data.get("choices") or []
                 if choices:
+                    reason = (choices[0] or {}).get("finish_reason")
+                    if reason and reason != "stop":
+                        return None  # length/filter/tool calls are not a translation.
+                    completed |= reason == "stop"
                     msg = (choices[0] or {}).get("message") or {}
                     if isinstance(msg.get("content"), str):
                         final_obj = data
                     delta = (choices[0] or {}).get("delta") or {}
                     if isinstance(delta.get("content"), str):
                         parts.append(delta["content"])
+        if not completed:
+            return None
         if final_obj is not None:
             return _extract_text_from_response(final_obj, "openai-chat")
         return "".join(parts) if parts else None
@@ -851,6 +882,7 @@ def _extract_text_from_sse(raw: bytes, protocol: str, resolved_model: str) -> Op
         deltas: list[str] = []
         done_texts: list[str] = []
         completed_text: Optional[str] = None
+        completed = False
         for event_name, data in events:
             if not isinstance(data, dict):
                 continue
@@ -864,10 +896,13 @@ def _extract_text_from_sse(raw: bytes, protocol: str, resolved_model: str) -> Op
             elif typ == "response.output_text.done" and isinstance(data.get("text"), str):
                 done_texts.append(data["text"])
             elif typ == "response.completed":
+                completed = True
                 resp = data.get("response") if isinstance(data.get("response"), dict) else data
                 text = _extract_text_from_response(resp, "openai-responses")
                 if text:
                     completed_text = text
+        if not completed:
+            return None
         if completed_text:
             return completed_text
         if done_texts:
@@ -877,16 +912,24 @@ def _extract_text_from_sse(raw: bytes, protocol: str, resolved_model: str) -> Op
     # Anthropic SSE 兜底（正常翻译请求不会主动启用）。
     if protocol == "anthropic":
         parts: list[str] = []
+        completed = False
         for event_name, data in events:
             if not isinstance(data, dict):
                 continue
             if data.get("type") == "error" or isinstance(data.get("error"), dict):
                 return None
-            if data.get("type") == "content_block_delta":
+            typ = data.get("type") or event_name
+            if typ == "message_stop":
+                completed = True
+            elif typ == "message_delta":
+                reason = (data.get("delta") or {}).get("stop_reason")
+                if reason and reason not in ("end_turn", "stop_sequence"):
+                    return None
+            if typ == "content_block_delta":
                 delta = data.get("delta") or {}
                 if isinstance(delta, dict) and isinstance(delta.get("text"), str):
                     parts.append(delta["text"])
-        return "".join(parts) if parts else None
+        return "".join(parts) if completed and parts else None
 
     return None
 

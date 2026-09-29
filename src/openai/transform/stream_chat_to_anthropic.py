@@ -16,6 +16,8 @@ from typing import Any, Iterator, Optional
 
 from ...protocols.usage import legacy_usage_from_openai_chat_json
 from ...protocols.sse import split_sse_events
+from ._stream_chat_tools import ChatToolDeltaBuffer
+from .tool_arguments import parse_tool_arguments, ToolArgumentsError
 
 
 def _gen_id(prefix: str) -> str:
@@ -111,6 +113,7 @@ class StreamTranslator:
             created_ts=int(created_ts or time.time()),
         )
         self._buf = b""
+        self._tool_deltas = ChatToolDeltaBuffer()
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         if not chunk:
@@ -123,7 +126,13 @@ class StreamTranslator:
             evt = _parse_chat_block(block)
             if evt is None:
                 continue
-            yield from self._handle_event(evt)
+            if evt.get("_done"):
+                for ready in self._tool_deltas.flush(self.state.finish_reason):
+                    yield from self._handle_event(ready)
+                yield from self._handle_event(evt)
+            else:
+                for ready in self._tool_deltas.feed(evt):
+                    yield from self._handle_event(ready)
 
     def close(self) -> Iterator[bytes]:
         if self.state.terminal_emitted:
@@ -148,6 +157,10 @@ class StreamTranslator:
     # ─── event handling ──────────────────────────────────────────
 
     def _handle_event(self, evt: dict) -> Iterator[bytes]:
+        if self.state.terminal_emitted:
+            return
+        if evt.get("_parrot_tool_finish_reason"):
+            self.state.finish_reason = evt["_parrot_tool_finish_reason"]
         if evt.get("_done"):
             self.state.done_seen = True
             return
@@ -291,8 +304,20 @@ class StreamTranslator:
             args = fn.get("arguments")
             if isinstance(args, str) and args:
                 st.args += args
-        yield from self._start_tool_if_ready(st)
+        # The Chat suffix buffer has completed this call's identity/arguments.
+        if self.state.finish_reason != "length":
+            try:
+                st.args = json.dumps(parse_tool_arguments(st.args or "{}", tool_name=st.name), ensure_ascii=False, separators=(",", ":"))
+            except ToolArgumentsError as exc:
+                self.state.terminal_emitted = True
+                yield _emit("error", {"type": "error", "error": {"type": "api_error", "code": "invalid_tool_arguments", "message": str(exc)}})
+                return
+        yield from self._start_tool_if_ready(st, final=True)
+        if self.state.terminal_emitted:
+            return
         yield from self._flush_tool_args(st)
+        st.stopped = True
+        yield _emit("content_block_stop", {"type": "content_block_stop", "index": st.block_index})
 
     def _flush_tool_args(self, st: _ToolState) -> Iterator[bytes]:
         if st.started and len(st.args) > st.args_emitted:

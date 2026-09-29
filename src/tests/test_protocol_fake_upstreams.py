@@ -4266,7 +4266,7 @@ async def test_responses_client_text_instruction_items_to_openai_chat_fake_upstr
     assert resp.status_code == 200
     assert json.loads(resp.body)["output_text"] == "responses instructions chat pong"
     assert captured["payload"]["messages"] == [
-        {"role": "system", "content": "follow policy"},
+        {"role": "developer", "content": "follow policy"},
         {"role": "user", "content": "background"},
         {"role": "assistant", "content": "noted"},
         {"role": "user", "content": "ping"},

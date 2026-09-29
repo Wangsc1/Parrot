@@ -366,6 +366,53 @@ def account_key_to_email(account_key: str) -> str:
 
 _refresh_locks: dict[str, threading.Lock] = {}
 _refresh_lock_for_dict = threading.Lock()
+# Uncommitted rotations belong to an incarnation, not a reusable account name.
+# Keep the candidate until it is saved or superseded; even an expired AT may
+# carry the only usable RT. Never log these values or replay the pre-rotation RT.
+_pending_refreshes: dict[str, tuple[str, dict]] = {}
+
+
+def _refresh_credential_fingerprint(account: dict) -> str:
+    # Identity/metadata-only renames must not invalidate an in-flight rotation.
+    raw = json.dumps([provider_of(account), account.get("access_token"), account.get("refresh_token")])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _has_pending_refresh(state_key: str) -> bool:
+    with _refresh_lock_for_dict:
+        return state_key in _pending_refreshes
+
+
+def _commit_refresh_candidate(state_key: str, fingerprint: str, fields: dict) -> str:
+    """Save under credential CAS, retaining failed writes for save-only retry."""
+    from . import channel_state
+
+    with account_generation_guard(state_key) as live:
+        if not live:
+            with _refresh_lock_for_dict:
+                _pending_refreshes.pop(state_key, None)
+            raise ValueError("OAuth account generation was deleted")
+        key = channel_state.resolve(state_key).removeprefix("oauth:")
+        current = get_account(key)
+        if _refresh_credential_fingerprint(current) != fingerprint:
+            with _refresh_lock_for_dict:
+                _pending_refreshes.pop(state_key, None)
+            if _token_is_fresh(current):
+                return current["access_token"]
+            raise oauth_errors.OAuthRefreshStateError("credentials_changed")
+        with _refresh_lock_for_dict:
+            _pending_refreshes[state_key] = (fingerprint, fields)
+        try:
+            saved = _save_token_fields(key, fields, expected_state_key=state_key)
+        except Exception as exc:
+            raise oauth_errors.OAuthRefreshStateError("save_failed_retry_save") from exc
+        if not saved:
+            with _refresh_lock_for_dict:
+                _pending_refreshes.pop(state_key, None)
+            raise ValueError("OAuth account generation was deleted")
+        with _refresh_lock_for_dict:
+            _pending_refreshes.pop(state_key, None)
+        return fields["access_token"]
 
 
 def _get_refresh_lock(account_key: str) -> threading.Lock:
@@ -834,9 +881,14 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
         raise RuntimeError(
             "refresh disabled in dual-instance rebuild mode (PARROT_NO_REFRESH=1)"
         )
-    account_key = _resolve_existing_account_key_or_raise(account_key)
+    with account_generation_guard(expected_state_key) as current:
+        if not current:
+            raise ValueError("OAuth account generation was deleted")
+        account_key = _resolve_existing_account_key_or_raise(account_key)
+        expected_state_key = account_state_key(get_account(account_key))
     email = account_key_to_email(account_key)
-    lock = _get_refresh_lock(account_key)
+    # The stable generation also serializes old/new names during a rename.
+    lock = _get_refresh_lock(expected_state_key)
     with lock:
         with account_generation_guard(expected_state_key) as current:
             if not current:
@@ -853,44 +905,76 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
         if provider_of(acc) == "workbuddy":
             return workbuddy_runtime.refresh_locked(copy.deepcopy(acc), account_key, force)
 
+        with _refresh_lock_for_dict:
+            pending = _pending_refreshes.get(expected_state_key)
+        if pending is not None:
+            if pending[0] == _refresh_credential_fingerprint(acc):
+                _commit_refresh_candidate(expected_state_key, *pending)
+                with account_generation_guard(expected_state_key) as current:
+                    if not current:
+                        raise ValueError("OAuth account generation was deleted")
+                    acc = copy.deepcopy(get_account(account_key))
+                if _token_is_fresh(acc):
+                    return acc["access_token"]
+                # The candidate's AT can expire while disk writes fail. Save its
+                # RT first, then renew using that RT, never the pre-rotation one.
+            else:
+                # A new login supersedes an unsaved old rotation in this generation.
+                with _refresh_lock_for_dict:
+                    _pending_refreshes.pop(expected_state_key, None)
+
         # 双重检查：force 路径不做（强制刷）
         if not force:
             if _token_is_fresh(acc):
                 return acc["access_token"]
 
         provider = provider_of(acc)
-        if provider == "openai":
-            data = openai_provider.refresh_sync(
-                acc["refresh_token"], email=email, account_key=account_key,
-                workspace_id=acc.get("workspace_id") or acc.get("chatgpt_account_id") or None,
-                org_id=acc.get("organization_id") or None,
-            )
-        elif provider == "xai":
-            data = xai_provider.refresh_sync(
-                acc["refresh_token"],
-                token_endpoint=acc.get("token_endpoint") or None,
-                email=email,
-                subject=_xai_subject(acc) or None,
-                account_key=account_key,
-            )
-        elif provider == "cursor":
-            data = cursor_provider.refresh_sync(
-                acc["refresh_token"], account_key=account_key,
-            )
-        elif provider == "antigravity":
-            data = antigravity_provider.refresh_sync(
-                acc["refresh_token"],
-                token_endpoint=acc.get("token_endpoint") or None,
-                email=email,
-                project_id=_antigravity_project_id(acc) or None,
-                account_key=account_key,
-            )
-        elif mock_mode_enabled():
-            data = _do_refresh_mock(acc["refresh_token"])
-        else:
-            data = _do_refresh_http(
-                acc["refresh_token"], acc.get("scopes", ""), account_key=account_key,
-            )
+        try:
+            if provider == "openai":
+                data = openai_provider.refresh_sync(
+                    acc["refresh_token"], email=email, account_key=account_key,
+                    workspace_id=acc.get("workspace_id") or acc.get("chatgpt_account_id") or None,
+                    org_id=acc.get("organization_id") or None,
+                )
+            elif provider == "xai":
+                data = xai_provider.refresh_sync(
+                    acc["refresh_token"],
+                    token_endpoint=acc.get("token_endpoint") or None,
+                    email=email,
+                    subject=_xai_subject(acc) or None,
+                    account_key=account_key,
+                )
+            elif provider == "cursor":
+                data = cursor_provider.refresh_sync(
+                    acc["refresh_token"], account_key=account_key,
+                )
+            elif provider == "antigravity":
+                data = antigravity_provider.refresh_sync(
+                    acc["refresh_token"],
+                    token_endpoint=acc.get("token_endpoint") or None,
+                    email=email,
+                    project_id=_antigravity_project_id(acc) or None,
+                    account_key=account_key,
+                )
+            elif mock_mode_enabled():
+                data = _do_refresh_mock(acc["refresh_token"])
+            else:
+                data = _do_refresh_http(
+                    acc["refresh_token"], acc.get("scopes", ""), account_key=account_key,
+                )
+        except Exception:
+            # A late failure of old credentials must not disable a fresh login.
+            # Otherwise retain the original exception and provider classification.
+            from . import channel_state
+            with account_generation_guard(expected_state_key) as current:
+                if not current:
+                    raise ValueError("OAuth account generation was deleted") from None
+                current_account = get_account(channel_state.resolve(expected_state_key).removeprefix("oauth:"))
+                if _refresh_credential_fingerprint(current_account) != _refresh_credential_fingerprint(acc):
+                    if _token_is_fresh(current_account):
+                        return current_account["access_token"]
+                    raise oauth_errors.OAuthRefreshStateError("credentials_changed") from None
+            raise
 
         new_expired = datetime.now(timezone.utc) + timedelta(
             seconds=int(data.get("expires_in", 28800))
@@ -1014,12 +1098,9 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
             except Exception as exc:
                 print(f"[oauth] claude refresh: profile fetch failed for {email}: {exc}")
 
-        if not _save_token_fields(account_key, new_fields, expected_state_key=expected_state_key):
-            print(
-                f"[oauth] discarded refresh result for retired generation: "
-                f"{account_key}"
-            )
-        return new_fields["access_token"]
+        return _commit_refresh_candidate(
+            expected_state_key, _refresh_credential_fingerprint(acc), new_fields,
+        )
 
 
 async def ensure_channel_token(channel) -> str:
@@ -1054,7 +1135,7 @@ async def ensure_valid_token(account_key: str, *, expected_state_key: str | None
         return acc["model_key"]
     if provider_of(acc) in {"workbuddy", "zhipu"}:
         return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
-    if _token_is_fresh(acc):
+    if _token_is_fresh(acc) and not _has_pending_refresh(expected_state_key):
         return acc["access_token"]
 
     return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
@@ -2765,24 +2846,40 @@ def _evaluate_antigravity_credits(
     base = {"utils": utils, "any_over": any_over, "hit_windows": hits,
             "disabled_until": acc.get("disabled_until")}
 
-    if any_over:
-        if reason == "quota":
-            return {**base, "action": "still_over_quota"}
+    previous = acc.get(_QUOTA_OBSERVATION_FIELD) or {}
+    if not isinstance(previous, dict):
+        previous = {}
+    blocked = set(previous.get("blocked") or []) if previous.get("source") == "antigravity_quota" else set()
+    blocked &= {"Credits", "5h", "7d"}
+    if fresh:
+        if credits_known and credits_available:
+            blocked.discard("Credits")
+        for label, util in zip(("5h", "7d"), utils[:2]):
+            if util is not None and util < threshold:
+                blocked.discard(label)
+    blocked.update(hits)
+    observation = {"source": "antigravity_quota", "blocked": sorted(blocked)}
+    # Persist independent gates even when already disabled. A later partial
+    # snapshot must not lose a known refusal just because an unrelated gate is low.
+    changed = previous != observation
+    if any_over or (reason == "quota" and previous.get("source") == "antigravity_quota" and changed):
         latest_reset = None if "Credits" in hits else reset_iso_for_hit_windows(usage, threshold)
         try:
-            disable_result = set_disabled_by_quota(account_key, latest_reset)
+            disable_result = set_disabled_by_quota(account_key, latest_reset, observation=observation)
         except Exception as exc:
             print(f"[oauth] evaluate antigravity disable failed for {account_key}: {exc}")
             return {**base, "action": "disable_failed", "disabled_until": latest_reset}
         disable_state = (disable_result or {}).get("state")
-        if disable_state != "disabled":
-            return {**base,
-                    "action": ("still_over_quota" if disable_state == "already_quota_disabled"
-                               else disable_state or "disable_failed"),
+        if disable_state not in {"disabled", "already_quota_disabled"}:
+            return {**base, "action": disable_state or "disable_failed",
                     "disabled_until": (disable_result or {}).get("disabled_until"),
                     "disabled_reason": (disable_result or {}).get("disabled_reason"),
                     "error_code": "account_state_conflict"}
-        return {**base, "action": "disabled", "disabled_until": latest_reset}
+        expected_quota_generation = disable_result["quota_observation_generation"]
+        if any_over:
+            return {**base,
+                    "action": "disabled" if disable_state == "disabled" else "still_over_quota",
+                    "disabled_until": disable_result.get("disabled_until")}
 
     if reason != "quota":
         return {**base, "action": "kept_enabled"}
@@ -2796,6 +2893,8 @@ def _evaluate_antigravity_credits(
         return {**base, "action": "quota_unknown_keep_disabled"}
     if not fresh:
         return {**base, "action": "quota_stale_keep_disabled"}
+    if blocked:
+        return {**base, "action": "quota_unknown_keep_disabled", "missing_gates": sorted(blocked)}
     if expected_quota_generation is None:
         return {**base, "action": "resume_failed",
                 "error_code": "quota_observation_generation_invalid"}
@@ -4274,6 +4373,8 @@ def delete_invalid_accounts_batch_if_unchanged(
 
         for channel_key, generation_keys in retirement_plan.items():
             for generation_key in generation_keys:
+                with _refresh_lock_for_dict:
+                    _pending_refreshes.pop(generation_key, None)
                 concurrency.retire_channel(
                     generation_key,
                     frozen_max=frozen_limits[generation_key],
@@ -4417,6 +4518,8 @@ def _delete_account_serialized(account_key: str) -> None:
             raise
         for channel_key, generation_keys in retirement_plan.items():
             for generation_key in generation_keys:
+                with _refresh_lock_for_dict:
+                    _pending_refreshes.pop(generation_key, None)
                 concurrency.retire_channel(
                     generation_key,
                     frozen_max=frozen_limits[generation_key],
@@ -6381,7 +6484,8 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
                 print(f"[oauth] openai metadata refresh failed for {ak}: {exc}")
 
         expired = _token_expiry(acc)
-        if expired is None and provider != "workbuddy" and not _openai_last_refresh_stale(acc):
+        pending_save = _has_pending_refresh(account_state_key(acc))
+        if expired is None and provider != "workbuddy" and not _openai_last_refresh_stale(acc) and not pending_save:
             out[email] = "skipped:no_expired"
             continue
 
@@ -6389,7 +6493,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
         if provider == "workbuddy" and not workbuddy_runtime.refresh_due(acc, ak, refresh_threshold_seconds):
             out[email] = "skipped:backoff_or_healthy"
             continue
-        if remaining >= refresh_threshold_seconds:
+        if remaining >= refresh_threshold_seconds and not pending_save:
             out[email] = "skipped:healthy"
             continue
 

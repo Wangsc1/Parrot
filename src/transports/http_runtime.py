@@ -594,7 +594,7 @@ async def aggregate_stream_as_non_stream_response(
         await close_response_context(ctx)
         return StreamAsNonStreamResult(error=with_partial_billing(err))
 
-    while not (chat_upstream and builder.done_received):
+    while not ((chat_upstream and builder.done_received) or (not chat_upstream and tracker.saw_stream_end)):
         eof = False
         try:
             chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
@@ -775,6 +775,7 @@ async def _read_until_first_downstream_chunk(
         tracker.feed(restored)
         builder.feed(restored)
         result = commit_gate.feed(restored)
+        upstream.observe_downstream_error(tracker, result.downstream_chunks)
         return result.downstream_chunks, result.error_event
 
     restored_first = await restore(first_chunk)
@@ -1136,6 +1137,7 @@ async def read_next_stream_step(
             downstream_chunks = list(stream_translator.feed(restored))
         else:
             downstream_chunks = [restored]
+        upstream.observe_downstream_error(tracker, downstream_chunks)
 
         if (
             getattr(tracker, "saw_stream_error", False)

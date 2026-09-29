@@ -20,7 +20,7 @@ import httpx
 from . import network
 from .upstream_client import SharedClientPool
 from .protocols import errors as protocol_errors
-from .protocols.sse import split_sse_events as _split_sse_events_bytes
+from .protocols.sse import split_sse_events as _split_sse_events_bytes, TerminalEventFilter
 from .protocols.usage import (
     UsageAccumulator,
     legacy_usage_from_anthropic_json,
@@ -200,6 +200,8 @@ class SSEUsageTracker:
         self.usage = self._usage_acc.legacy_dict()
         self._chunks: list[bytes] = []
         self._buf = b""
+        self._relay_filter = TerminalEventFilter({"message_stop", "error"})
+        self._record_filter = TerminalEventFilter({"message_stop", "error"})
         # 是否已见到上游流的"收尾事件"。Anthropic: message_stop。见后判定
         # 即使 client 之后断开，服务端视角也已拿到完整响应，日志应归 success。
         self.saw_stream_end = False
@@ -207,7 +209,11 @@ class SSEUsageTracker:
         self.stream_error_message: Optional[str] = None
         self.stream_error_code: Optional[str] = None
 
+    def filter_relay_chunk(self, chunk_bytes: bytes) -> bytes:
+        return self._relay_filter.feed(chunk_bytes)
+
     def feed(self, chunk_bytes: bytes) -> None:
+        chunk_bytes = self._record_filter.feed(chunk_bytes)
         if not chunk_bytes:
             return
         self._chunks.append(chunk_bytes)
@@ -257,11 +263,13 @@ class SSEAssistantBuilder:
         self._partial_jsons: dict[int, str] = {}  # index -> partial_json string
         self._role = "assistant"
         self._stop_reason: Optional[str] = None
+        self._record_filter = TerminalEventFilter({"message_stop", "error"})
         self._got_any = False
 
     def feed(self, chunk: bytes) -> None:
         if not chunk:
             return
+        chunk = self._record_filter.feed(chunk)
         self._buf += chunk
         self._buf, data_events = _iter_sse_data_lines(self._buf)
         for data in data_events:
@@ -414,6 +422,17 @@ def is_stream_error_event(event_name: Optional[str], data: Optional[dict], *, pr
     if isinstance(resp, dict) and isinstance(resp.get("error"), dict):
         return True
     return False
+
+
+def observe_downstream_error(tracker, chunks) -> None:
+    """A translator failure is a failed attempt even if upstream completed."""
+    _, blocks = _split_sse_events_bytes(b"".join(chunks))
+    for block in blocks:
+        name, data = parse_sse_event_bytes(block)
+        if is_stream_error_event(name, data):
+            tracker.saw_stream_error = True
+            tracker.stream_error_code, tracker.stream_error_message = _format_stream_error_info(data)
+            return
 
 
 def is_downstream_visible_event(event_name: Optional[str], data: Optional[dict], protocol: str) -> bool:
@@ -575,6 +594,9 @@ class ChatSSEAssistantBuilder:
         self._refusal_parts: list[str] = []
         # tool_calls 按 index 聚合，保留首次的 id/name，arguments 拼接
         self._tool_calls: dict[int, dict] = {}
+        self._legacy_function: dict | None = None
+        self._choice_builders: dict[int, ChatSSEAssistantBuilder] = {}
+        self._choice_seen = False
         self._finish_reason: Optional[str] = None
         self._got_any = False
         self._done_received = False
@@ -602,7 +624,18 @@ class ChatSSEAssistantBuilder:
         if not choices:
             return
         self._got_any = True
-        ch0 = choices[0]
+        own = []
+        for choice in choices:
+            index = int(choice.get("index") or 0)
+            if index == 0:
+                own.append(choice)
+            else:
+                builder = self._choice_builders.setdefault(index, ChatSSEAssistantBuilder())
+                builder._apply({"choices": [{**choice, "index": 0}]})
+        if not own:
+            return
+        self._choice_seen = True
+        ch0 = own[0]
         delta = ch0.get("delta") or {}
         if delta.get("role"):
             self._role = delta["role"]
@@ -615,22 +648,28 @@ class ChatSSEAssistantBuilder:
         refusal = delta.get("refusal")
         if isinstance(refusal, str) and refusal:
             self._refusal_parts.append(refusal)
+        from .openai.transform._stream_chat_tools import merge_identifier_delta
         for tc in delta.get("tool_calls") or []:
             idx = int(tc.get("index", 0))
-            slot = self._tool_calls.setdefault(idx, {
-                "id": None, "type": "function",
-                "function": {"name": None, "arguments": ""},
-            })
-            if tc.get("id") and not slot["id"]:
-                slot["id"] = tc["id"]
-            if tc.get("type"):
-                slot["type"] = tc["type"]
-            fn = tc.get("function") or {}
-            if fn.get("name") and not slot["function"]["name"]:
-                slot["function"]["name"] = fn["name"]
-            args_piece = fn.get("arguments")
+            kind = tc.get("type") or (self._tool_calls.get(idx) or {}).get("type") or "function"
+            field = "input" if kind == "custom" else "arguments"
+            slot = self._tool_calls.setdefault(idx, {"id": None, "type": kind, kind: {"name": None, field: ""}})
+            if tc.get("id"):
+                slot["id"] = merge_identifier_delta(slot["id"] or "", tc["id"])
+            fn = tc.get(kind) or {}
+            if fn.get("name"):
+                slot[kind]["name"] = merge_identifier_delta(slot[kind]["name"] or "", fn["name"])
+            args_piece = fn.get(field)
             if isinstance(args_piece, str) and args_piece:
-                slot["function"]["arguments"] += args_piece
+                slot[kind][field] += args_piece
+        if isinstance(delta.get("function_call"), dict) and not delta.get("tool_calls"):
+            fn = delta["function_call"]
+            if self._legacy_function is None:
+                self._legacy_function = {"name": "", "arguments": ""}
+            if fn.get("name"):
+                self._legacy_function["name"] = merge_identifier_delta(self._legacy_function["name"], fn["name"])
+            if isinstance(fn.get("arguments"), str):
+                self._legacy_function["arguments"] += fn["arguments"]
         if ch0.get("finish_reason"):
             self._finish_reason = ch0["finish_reason"]
 
@@ -643,6 +682,8 @@ class ChatSSEAssistantBuilder:
             msg["refusal"] = "".join(self._refusal_parts)
         if self._tool_calls:
             msg["tool_calls"] = [self._tool_calls[i] for i in sorted(self._tool_calls.keys())]
+        elif self._legacy_function is not None:
+            msg["function_call"] = dict(self._legacy_function)
         return msg
 
     @property
@@ -653,7 +694,7 @@ class ChatSSEAssistantBuilder:
     def finish_reason(self) -> Optional[str]:
         fr = self._finish_reason
         # Guard: upstream claims tool_calls but none were actually returned.
-        if fr in ("tool_calls", "function_call") and not self._tool_calls:
+        if fr in ("tool_calls", "function_call") and not self._tool_calls and self._legacy_function is None:
             return "stop"
         return fr
 
@@ -673,6 +714,10 @@ class ChatSSEAssistantBuilder:
                 "logprobs": None,
             }],
         }
+        out["choices"] = ([out["choices"][0]] if self._choice_seen else []) + [
+            {"index": index, "message": builder.get_assistant(), "finish_reason": builder.finish_reason or "stop", "logprobs": None}
+            for index, builder in sorted(self._choice_builders.items())
+        ]
         if system_fingerprint:
             out["system_fingerprint"] = system_fingerprint
         if usage:
@@ -734,6 +779,8 @@ class ResponsesSSEUsageTracker:
         self.usage = self._usage_acc.legacy_dict()
         self._chunks: list[bytes] = []
         self._buf = b""
+        self._relay_filter = TerminalEventFilter({"response.completed", "response.failed", "response.incomplete", "error"})
+        self._record_filter = TerminalEventFilter({"response.completed", "response.failed", "response.incomplete", "error"})
         # Responses 流的收尾事件：completed / failed / incomplete 之一。
         # 收到即视为上游已完成本次生成，client 后续断开不影响日志归 success。
         self.saw_stream_end = False
@@ -741,7 +788,11 @@ class ResponsesSSEUsageTracker:
         self.stream_error_message: Optional[str] = None
         self.stream_error_code: Optional[str] = None
 
+    def filter_relay_chunk(self, chunk_bytes: bytes) -> bytes:
+        return self._relay_filter.feed(chunk_bytes)
+
     def feed(self, chunk_bytes: bytes) -> None:
+        chunk_bytes = self._record_filter.feed(chunk_bytes)
         if not chunk_bytes:
             return
         self._chunks.append(chunk_bytes)
@@ -794,8 +845,11 @@ class ResponsesSSEAssistantBuilder:
 
     def __init__(self):
         self._buf = b""
+        self._record_filter = TerminalEventFilter({"response.completed", "response.failed", "response.incomplete", "error"})
         self._items: dict[int, dict] = {}
         self._fc_args: dict[int, str] = {}
+        self._custom_input: dict[int, str] = {}
+        self._reasoning_text: dict[tuple[int, int], str] = {}
         self._msg_text: dict[tuple[int, int], str] = {}
         self._msg_refusal: dict[tuple[int, int], str] = {}
         self._got_any = False
@@ -841,12 +895,20 @@ class ResponsesSSEAssistantBuilder:
             return
         key = (self._index(data.get("output_index")), self._index(data.get("content_index")))
         store[key] = store.get(key, "") + delta
+        if key[0] not in self._items:
+            self._items[key[0]] = {"type": "message", "role": "assistant", "content": []}
+            if data.get("item_id"):
+                self._items[key[0]]["id"] = data["item_id"]
 
     def _set_part_snapshot(self, store: dict[tuple[int, int], str], data: dict, value: Any) -> None:
         if not isinstance(value, str):
             return
         key = (self._index(data.get("output_index")), self._index(data.get("content_index")))
         store[key] = self._merge_text_snapshot(store.get(key, ""), value)
+        if key[0] not in self._items:
+            self._items[key[0]] = {"type": "message", "role": "assistant", "content": []}
+            if data.get("item_id"):
+                self._items[key[0]]["id"] = data["item_id"]
 
     def _capture_item_snapshot(self, output_index: int, item: dict) -> None:
         """Record content/arguments embedded in item snapshots as terminal data."""
@@ -917,6 +979,7 @@ class ResponsesSSEAssistantBuilder:
     def feed(self, chunk: bytes) -> None:
         if not chunk:
             return
+        chunk = self._record_filter.feed(chunk)
         self._buf += chunk
         self._buf, events = _iter_sse_events(self._buf)
         for block in events:
@@ -954,6 +1017,19 @@ class ResponsesSSEAssistantBuilder:
                         self._set_part_snapshot(self._msg_text, data, part.get("text"))
                     elif part.get("type") == "refusal":
                         self._set_part_snapshot(self._msg_refusal, data, part.get("refusal"))
+            elif event_name in ("response.custom_tool_call_input.delta", "response.custom_tool_call_input.done"):
+                index = self._index(data.get("output_index"))
+                if event_name.endswith(".delta") and isinstance(data.get("delta"), str):
+                    self._custom_input[index] = self._custom_input.get(index, "") + data["delta"]
+                else:
+                    self._custom_input[index] = self._merge_text_snapshot(self._custom_input.get(index, ""), data.get("input"))
+            elif event_name in ("response.reasoning_summary_text.delta", "response.reasoning_summary_text.done", "response.reasoning_summary_part.done"):
+                key = (self._index(data.get("output_index")), self._index(data.get("summary_index")))
+                if event_name.endswith(".delta") and isinstance(data.get("delta"), str):
+                    self._reasoning_text[key] = self._reasoning_text.get(key, "") + data["delta"]
+                else:
+                    value = data.get("text") if event_name.endswith("text.done") else (data.get("part") or {}).get("text")
+                    self._reasoning_text[key] = self._merge_text_snapshot(self._reasoning_text.get(key, ""), value)
             elif event_name == "response.function_call_arguments.delta":
                 output_index = self._index(data.get("output_index"))
                 delta = data.get("delta")
@@ -1049,16 +1125,36 @@ class ResponsesSSEAssistantBuilder:
         item_type = item.get("type")
         if item_type == "message":
             self._apply_message_buffers(output_index, item, prefer_buffer=prefer_buffer)
-        elif item_type == "function_call":
-            buffered = self._fc_args.get(output_index, "")
-            item["arguments"] = (self._merge_preferred_text(buffered, item.get("arguments"))
-                                 if prefer_buffer else self._merge_preferred_text(item.get("arguments"), buffered))
+        elif item_type in ("function_call", "custom_tool_call"):
+            field = "arguments" if item_type == "function_call" else "input"
+            buffers = self._fc_args if item_type == "function_call" else self._custom_input
+            buffered = buffers.get(output_index, "")
+            item[field] = (self._merge_preferred_text(buffered, item.get(field))
+                           if prefer_buffer else self._merge_preferred_text(item.get(field), buffered))
+        elif item_type == "reasoning":
+            summary = copy.deepcopy(item.get("summary") or [])
+            for (index, part_index), text in sorted(self._reasoning_text.items()):
+                if index != output_index:
+                    continue
+                while len(summary) <= part_index:
+                    summary.append({"type": "summary_text", "text": ""})
+                summary[part_index]["text"] = self._merge_preferred_text(summary[part_index].get("text"), text)
+            item["summary"] = summary
         return item
 
     def get_output_item(self, output_index: int) -> dict | None:
         """Resolve one item identically to the final snapshot, preserving its index."""
         source = self._base_items_by_index().get(output_index)
         return self._resolved_output_item(output_index, source) if source is not None else None
+
+    def get_stream_output_items(self) -> list[dict]:
+        """Resolve original stream slots before cross-index identity coalescing.
+
+        Batch validators need these occurrences to detect conflicting call IDs;
+        the merged final output alone has already lost that evidence.
+        """
+        return [self._resolved_output_item(index, item, prefer_buffer=True)
+                for index, item in sorted(self._items.items())]
 
     def get_output_items(self) -> list[dict]:
         """Return final output items ordered by Responses ``output_index``."""

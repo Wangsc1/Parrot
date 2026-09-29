@@ -17,6 +17,7 @@ from typing import Any, Iterator, Optional
 from ...protocols import errors as protocol_errors
 from ...protocols.sse import split_sse_events
 from . import common
+from .tool_arguments import parse_tool_arguments, ToolArgumentsError
 from ._stream_response_text_order import TextOutputOrder
 from ...protocols.usage import legacy_usage_from_openai_responses_json
 
@@ -185,6 +186,9 @@ class StreamTranslator:
             )
         self.allow_reasoning_bridge = bool(allow_reasoning_bridge)
         self._buf = b""
+        self._tool_names = [t.get("name") for t in (request_body or {}).get("tools", []) if isinstance(t, dict) and t.get("name")]
+        self._pending_tool: tuple[str, int | None] | None = None
+        self._deferred_tools: list[tuple[str, dict]] = []
         self._hosted_seen: set[str] = set()
         self._hosted_blocks: list[tuple[int, dict]] = []
         self._pending_hosted: tuple[str, int | None] | None = None
@@ -213,12 +217,14 @@ class StreamTranslator:
     def close(self) -> Iterator[bytes]:
         if self.state.terminal_emitted:
             return
-        self.state.terminal_emitted = True
         if not self.state.message_started:
             yield from self._emit_message_start()
         yield from self._stop_text_if_needed()
         yield from self._stop_all_reasoning()
         yield from self._stop_all_tools()
+        if self.state.terminal_emitted:
+            return
+        self.state.terminal_emitted = True
         yield _emit("message_delta", {
             "type": "message_delta",
             "delta": {
@@ -235,6 +241,44 @@ class StreamTranslator:
     # ─── event handling ──────────────────────────────────────────
 
     def _handle_event(self, event_name: str, data: dict) -> Iterator[bytes]:
+        if self.state.terminal_emitted:
+            return
+        if self._pending_tool is not None:
+            key, index = self._pending_tool
+            item = data.get("item") if isinstance(data.get("item"), dict) else {}
+            same = (data.get("output_index") == index if index is not None else False) or self.state.item_id_to_key.get(str(item.get("id") or data.get("item_id") or "")) == key
+            terminal = event_name in ("response.completed", "response.incomplete")
+            if event_name in ("error", "response.failed") or data.get("type") == "error":
+                self._pending_tool = None
+                self._deferred_tools.clear()
+            elif terminal:
+                response = _response_from_event(data)
+                self._capture_response_metadata(response)
+                st = self.state.tools[key]
+                snapshot = next((it for it in response.get("output") or [] if isinstance(it, dict) and (it.get("call_id") == st.id or self.state.item_id_to_key.get(str(it.get("id") or "")) == key)), None)
+                self._pending_tool = None
+                if snapshot is not None:
+                    yield from self._on_output_item_done({"output_index": index, "item": snapshot}, snapshot)
+                else:
+                    yield from self._finish_tool(st)
+                deferred, self._deferred_tools = self._deferred_tools, []
+                for name, value in deferred:
+                    yield from self._handle_event(name, value)
+                if self.state.terminal_emitted:
+                    return
+                if self._pending_tool is not None:
+                    yield from self._handle_event(event_name, data)
+                    return
+            elif same and event_name == "response.output_item.done":
+                self._pending_tool = None
+                yield from self._on_output_item_done(data, item)
+                deferred, self._deferred_tools = self._deferred_tools, []
+                for name, value in deferred:
+                    yield from self._handle_event(name, value)
+                return
+            elif not same and event_name != "keepalive":
+                self._deferred_tools.append((event_name, data))
+                return
         # The final reasoning summary determines thinking vs redacted_thinking.
         # Do not commit later text/tool blocks until that earlier item is done.
         if self._pending_reasoning is not None:
@@ -385,6 +429,23 @@ class StreamTranslator:
                     yield from self._emit_tool_args_delta(st, delta)
             return
 
+        if event_name == "response.function_call_arguments.done":
+            st = self._tool_for_delta_event(data)
+            if isinstance(data.get("name"), str) and not st.name:
+                st.name = data["name"]
+            if isinstance(data.get("arguments"), str):
+                if st.stopped and data["arguments"] != st.args:
+                    try:
+                        same = parse_tool_arguments(data["arguments"], tool_name=st.name) == parse_tool_arguments(st.args, tool_name=st.name)
+                    except ToolArgumentsError:
+                        same = False
+                    if not same:
+                        yield from self._tool_error("Conflicting final tool arguments after publication")
+                        return
+                else:
+                    st.args = data["arguments"]
+            return
+
         if event_name in ("response.completed", "response.incomplete", "response.failed"):
             resp = _response_from_event(data)
             self._capture_response_metadata(resp)
@@ -440,7 +501,9 @@ class StreamTranslator:
         key = self._key_from_item_event(data, item)
         st = self._tool_state(key)
         self._update_tool_metadata(st, data, item, key)
-        yield from self._start_tool_if_needed(st)
+        self._pending_tool = (key, data.get("output_index"))
+        if st.id and st.name:
+            yield from self._start_tool_if_needed(st)
 
     def _on_output_item_done(self, data: dict, item: dict) -> Iterator[bytes]:
         item_type = item.get("type")
@@ -476,30 +539,23 @@ class StreamTranslator:
             yield from self._emit_redacted_reasoning(signature)
         key = self._key_from_item_event(data, item)
         st = self._tool_state(key)
-        if st.stopped:
-            return  # done + terminal is one completion, not a second JSON value.
-        self._update_tool_metadata(st, data, item, key)
         done_args = item.get("arguments")
-        if self._should_buffer_tool_args(st) and isinstance(done_args, str):
+        if st.stopped:
+            if isinstance(done_args, str) and done_args and done_args != st.args:
+                try:
+                    same = parse_tool_arguments(done_args, tool_name=st.name) == parse_tool_arguments(st.args, tool_name=st.name)
+                except ToolArgumentsError:
+                    same = False
+                if not same:
+                    yield from self._tool_error("Conflicting final tool arguments after publication")
+            return
+        if st.started and ((item.get("call_id") and item["call_id"] != st.id) or (item.get("name") and item["name"] != st.name)):
+            yield from self._tool_error("Conflicting final tool identity after publication")
+            return
+        self._update_tool_metadata(st, data, item, key)
+        if isinstance(done_args, str):
             st.args = done_args
-        elif isinstance(done_args, str) and done_args != st.args:
-            # Responses usually emits argument deltas before output_item.done,
-            # but some providers only include the final arguments on the done
-            # item.  Emit only the missing suffix when the final value extends
-            # the streamed buffer; otherwise avoid duplicating/mangling JSON.
-            if done_args.startswith(st.args):
-                missing = done_args[len(st.args):]
-                if missing:
-                    yield from self._emit_tool_args_delta(st, missing)
-            elif not st.args:
-                yield from self._emit_tool_args_delta(st, done_args)
-        if self._should_buffer_tool_args(st):
-            yield from self._flush_buffered_tool_args_if_needed(st)
-        else:
-            yield from self._start_tool_if_needed(st)
-        if not st.stopped:
-            st.stopped = True
-            yield _emit("content_block_stop", {"type": "content_block_stop", "index": st.block_index})
+        yield from self._finish_tool(st, incomplete=item.get("status") == "incomplete")
 
     def _emit_hosted_search(self, item: dict) -> Iterator[bytes]:
         from ... import search_hosted_codec
@@ -516,7 +572,7 @@ class StreamTranslator:
             yield _emit("content_block_stop", {"type": "content_block_stop", "index": index})
 
     def _update_tool_metadata(self, st: _ToolState, data: dict, item: dict, key: str) -> None:
-        call_id = item.get("call_id") or item.get("id")
+        call_id = item.get("call_id")
         if isinstance(call_id, str) and call_id:
             st.id = call_id
         name = item.get("name")
@@ -583,7 +639,9 @@ class StreamTranslator:
             return
         key = self._text_key(data)
         existing = self._text_emitted_by_part.get(key, "")
-        if value.startswith(existing) and len(value) > len(existing):
+        if not value.startswith(existing):
+            yield from self._tool_error("Conflicting final text after publication")
+        elif len(value) > len(existing):
             yield from self._emit_text_for_item(data, value[len(existing):])
 
     def _emit_text_delta(self, text: str) -> Iterator[bytes]:
@@ -731,15 +789,10 @@ class StreamTranslator:
         })
 
     def _should_buffer_tool_args(self, st: _ToolState) -> bool:
-        return bool(self.optional_empty_string_fields_by_tool.get(st.name or ""))
+        return True  # Anthropic requires a recoverable JSON object, not arbitrary text.
 
     def _sanitized_tool_args_json(self, st: _ToolState) -> str:
-        try:
-            parsed = json.loads(st.args) if st.args else {}
-        except Exception:
-            return st.args
-        if not isinstance(parsed, dict):
-            return st.args
+        parsed = parse_tool_arguments(st.args or "{}", tool_name=st.name)
         normalized = common.normalize_tool_input_optional_empty_strings(
             st.name,
             parsed,
@@ -773,17 +826,43 @@ class StreamTranslator:
                 "delta": {"type": "input_json_delta", "partial_json": args_json},
             })
 
+    def _tool_error(self, message: str) -> Iterator[bytes]:
+        self.state.terminal_emitted = True
+        yield _emit("error", {"type": "error", "error": {"type": "api_error", "code": "invalid_tool_arguments", "message": message}})
+
+    def _finish_tool(self, st: _ToolState, *, incomplete: bool = False) -> Iterator[bytes]:
+        if st.stopped or self.state.terminal_emitted:
+            return
+        if not st.name and len(self._tool_names) == 1:
+            st.name = self._tool_names[0]
+        if not st.name:
+            yield from self._tool_error("Upstream tool call ended without a tool name")
+            return
+        if not st.id:
+            yield from self._tool_error("Upstream tool call ended without a call_id")
+            return
+        try:
+            args = self._sanitized_tool_args_json(st)
+        except ToolArgumentsError as exc:
+            if incomplete or self.state.status == "incomplete":
+                args = st.args
+            else:
+                yield from self._tool_error(str(exc))
+                return
+        st.args = args
+        yield from self._start_tool_if_needed(st)
+        if args and not st.args_emitted:
+            st.args_emitted = True
+            yield _emit("content_block_delta", {"type": "content_block_delta", "index": st.block_index,
+                        "delta": {"type": "input_json_delta", "partial_json": args}})
+        st.stopped = True
+        yield _emit("content_block_stop", {"type": "content_block_stop", "index": st.block_index})
+
     def _stop_all_tools(self) -> Iterator[bytes]:
-        for key in sorted(self.state.tools.keys(), key=lambda k: self.state.tools[k].block_index):
-            st = self.state.tools[key]
-            if not st.started:
-                if self._should_buffer_tool_args(st):
-                    yield from self._flush_buffered_tool_args_if_needed(st)
-                else:
-                    yield from self._start_tool_if_needed(st)
-            if st.started and not st.stopped:
-                st.stopped = True
-                yield _emit("content_block_stop", {"type": "content_block_stop", "index": st.block_index})
+        for st in sorted(self.state.tools.values(), key=lambda value: value.block_index):
+            yield from self._finish_tool(st)
+            if self.state.terminal_emitted:
+                return
 
     # ─── tool key helpers ────────────────────────────────────────
 
@@ -821,7 +900,7 @@ class StreamTranslator:
         item_id = data.get("item_id")
         if isinstance(item_id, str) and item_id in self.state.item_id_to_key:
             return self._tool_state(self.state.item_id_to_key[item_id])
-        if self.state.last_tool_key:
+        if self.state.last_tool_key and oi is None and not item_id:
             return self._tool_state(self.state.last_tool_key)
         key = f"oi:{oi}" if isinstance(oi, int) else f"fallback:{len(self.state.tools)}"
         if isinstance(oi, int):

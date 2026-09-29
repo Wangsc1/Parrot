@@ -110,7 +110,7 @@ def _extract_system_messages(body: dict) -> str | None:
             continue
         typ = it.get("type")
         role = it.get("role")
-        if typ == "message" and role == "system":
+        if typ in (None, "message") and role == "system":
             txt = _content_to_plain_text(it.get("content", ""))
             if txt:
                 sys_texts.append(txt)
@@ -238,11 +238,16 @@ def _codex_tools_contain_type(raw_tools: Any, tool_type: str) -> bool:
     return False
 
 
-def _codex_tools_contain_function_name(raw_tools: Any, name: str) -> bool:
+def _codex_tools_contain_function_name(raw_tools: Any, name: str, namespace: str | None = None) -> bool:
     if not isinstance(raw_tools, list) or not name:
         return False
     for raw in raw_tools:
         if not isinstance(raw, dict):
+            continue
+        if namespace:
+            if raw.get("type") == "namespace" and raw.get("name") == namespace:
+                if _codex_tools_contain_function_name(raw.get("tools"), name):
+                    return True
             continue
         if str(raw.get("type") or "").strip() != "function":
             continue
@@ -343,7 +348,7 @@ def _normalize_codex_tool_choice(body: dict) -> bool:
         name = _first_non_empty_string(choice.get("name"))
         if not name and isinstance(fn, dict):
             name = _first_non_empty_string(fn.get("name"))
-        if not name or not _codex_tools_contain_function_name(body.get("tools"), name):
+        if not name or not _codex_tools_contain_function_name(body.get("tools"), name, choice.get("namespace")):
             body["tool_choice"] = "auto"
             return True
         modified = False

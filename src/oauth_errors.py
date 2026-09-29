@@ -16,6 +16,17 @@ from typing import Any
 import httpx
 
 
+class OAuthRefreshStateError(RuntimeError):
+    """Local refresh coordination failure, never proof of revoked credentials."""
+
+    auth_error = False
+    retryable = True
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        super().__init__("OAuth refresh " + kind)
+
+
 @dataclass(frozen=True)
 class OAuthDisplayError:
     """Structured, user-safe OAuth error description."""
@@ -139,6 +150,17 @@ def describe_oauth_error(
     status = _http_status(exc)
     body_code = _response_error_code(exc)
     technical = _technical_from_exception(exc)
+
+    if isinstance(exc, OAuthRefreshStateError):
+        pending = exc.kind == "save_failed_retry_save"
+        return OAuthDisplayError(
+            code=f"oauth_refresh_{exc.kind}",
+            title="Token 保存未完成" if pending else "账号凭据已更新",
+            reason="已取得的刷新结果尚未保存。" if pending else "旧刷新结果未覆盖当前凭据。",
+            action="稍后重试；优先保存已轮换的 Token，不重复刷新。" if pending else "使用当前账号凭据重试。",
+            retryable=True, auth_error=False, provider=prov, operation=op,
+            technical=technical,
+        )
 
     # WorkBuddy deliberately strips upstream bodies and transport text; use its
     # typed facts instead of guessing authentication failure from an error string.

@@ -250,6 +250,7 @@ services:
     image: ghcr.io/danger-dream/parrot:latest
     container_name: parrot
     restart: unless-stopped
+    stop_grace_period: 150s
     ports:
       - "${PORT:-22122}:22122"
     environment:
@@ -260,7 +261,7 @@ services:
       # 自更新：挂载 docker.sock，容器内才能通过 Engine API 起 sidecar 重建自己
       - /var/run/docker.sock:/var/run/docker.sock
 ${SOCK_GROUP_ADD}    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:22122/health"]
+      test: ["CMD", "curl", "--connect-timeout", "2", "--max-time", "4", "-fsS", "http://127.0.0.1:22122/health"]
       interval: 30s
       timeout: 5s
       retries: 3

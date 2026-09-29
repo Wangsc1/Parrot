@@ -371,16 +371,6 @@ async def test_anthropic_http_mapping_binds_final_logical_model(monkeypatch):
     monkeypatch.setattr(server.auth, "validate", lambda headers: ("test", [], None))
     monkeypatch.setattr(server.log_db, "insert_pending", lambda *args, **kwargs: None)
     monkeypatch.setattr(server.scheduler, "schedule", lambda *args, **kwargs: route)
-    original_effective_request_budget = server.model_metadata.effective_request_budget
-
-    def _capture_effective_request_budget(model, **kwargs):
-        captured["preflight_model"] = model
-        return original_effective_request_budget(model, **kwargs)
-
-    monkeypatch.setattr(
-        server.model_metadata, "effective_request_budget", _capture_effective_request_budget,
-    )
-
     async def _identity_translate(body, **kwargs):
         return body
 
@@ -402,7 +392,6 @@ async def test_anthropic_http_mapping_binds_final_logical_model(monkeypatch):
     assert response.status_code == 200
     assert captured["body"]["model"] == logical_model
     assert captured["body"]["_client_visible_model"] == logical_model
-    assert captured["preflight_model"] == logical_model
     binding = captured["binding"]
     assert binding.client_visible_model == logical_model
     assert binding.outbound_model_id == outbound_model
@@ -412,8 +401,7 @@ async def test_anthropic_http_mapping_binds_final_logical_model(monkeypatch):
     assert binding.tariff is not None
 
 
-def test_context_guard_uses_hard_fit_and_skips_compact_requests(monkeypatch):
-    import server
+def test_compact_trigger_remains_separate_from_input_budget():
 
     config.update(lambda c: c.update({
         "modelBindings": {
@@ -424,11 +412,6 @@ def test_context_guard_uses_hard_fit_and_skips_compact_requests(monkeypatch):
     }))
     trigger = model_metadata.compact_trigger_tokens("gpt-5.5")
     assert trigger is not None and trigger < model_metadata.context_window("gpt-5.5")
-    counted = {"tokens": trigger + 1}
-    monkeypatch.setattr(
-        server.token_counter, "count_request_tokens",
-        lambda body, model=None: counted["tokens"],
-    )
     compact_prompt = (
         "CRITICAL: Respond with text only. Create a detailed summary of the conversation so far. "
         "Your summary should include the following sections. After compaction continue."
@@ -443,17 +426,9 @@ def test_context_guard_uses_hard_fit_and_skips_compact_requests(monkeypatch):
     }
 
     assert compact_rescue.is_claude_code_compact_request(compact_body)
-    assert server._anthropic_to_openai_context_preflight(
-        compact_body, _DummyScheduleResult(),
-    ) is None
-    assert server._anthropic_to_openai_context_preflight(
-        normal_body, _DummyScheduleResult(),
-    ) is None
     hard_limit = model_metadata.effective_request_budget(
         "gpt-5.5", request_shape=normal_body,
     ).effective_input_budget
     assert hard_limit is not None and hard_limit > trigger
-    counted["tokens"] = hard_limit + 1
-    assert server._anthropic_to_openai_context_preflight(
-        normal_body, _DummyScheduleResult(),
-    ) is not None
+    # These remain planning metadata, not a tokenizer-independent HTTP reject.
+    # The actual ingress regression is covered in test_full_audit_fix_routing.

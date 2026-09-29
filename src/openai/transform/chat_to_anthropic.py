@@ -292,7 +292,22 @@ def _convert_messages(
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, str]]:
     out: list[dict[str, Any]] = []
     system: list[dict[str, str]] = []
-    id_map: dict[str, str] = {}
+    raw_ids = list(dict.fromkeys(
+        str(value) for msg in messages or [] if isinstance(msg, dict)
+        for value in ([msg.get("tool_call_id")] if msg.get("role") == "tool" else
+                      [tc.get("id") for tc in msg.get("tool_calls") or [] if isinstance(tc, dict)])
+        if value
+    ))
+    id_map = {value: value for value in raw_ids if _sanitize_tool_use_id(value) == value}
+    reserved = set(id_map.values())
+    for value in raw_ids:
+        if value in id_map:
+            continue
+        candidate = _sanitize_tool_use_id(value)
+        while candidate in reserved:
+            candidate += "_"
+        reserved.add(candidate)
+        id_map[value] = candidate
 
     def append_turn(role: str, content: list[dict[str, Any]]) -> None:
         if out and out[-1].get("role") == role:
@@ -339,6 +354,8 @@ def _convert_messages(
             allow_file_url_documents=allow_file_url_documents,
         )
         if role == "assistant":
+            if isinstance(msg.get("refusal"), str) and msg["refusal"]:
+                content.append({"type": "text", "text": msg["refusal"]})
             for tc in msg.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     _fail("tool_calls must contain objects on Chat→Anthropic bridge", param="messages")
@@ -522,6 +539,8 @@ def _convert_legacy_function_call(choice: Any, *, parallel_tool_calls: Any = Non
 
 
 def translate_request(body: dict, *, allow_file_url_documents: bool = False) -> dict:
+    from ._legacy_chat import normalize_request
+    body = normalize_request(body)
     guard_request(body, allow_file_url_documents=allow_file_url_documents)
     payload: dict[str, Any] = {"stream": bool(body.get("stream"))}
 
@@ -612,6 +631,8 @@ def translate_request(body: dict, *, allow_file_url_documents: bool = False) -> 
 
 
 def _stop_reason_to_finish_reason(stop_reason: str | None, *, has_tool_calls: bool = False) -> str:
+    if stop_reason == "pause_turn":
+        return "length"
     if stop_reason in ("max_tokens", "model_context_window_exceeded"):
         return "length"
     if stop_reason == "tool_use" or has_tool_calls:

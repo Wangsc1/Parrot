@@ -502,7 +502,9 @@ def _is_probably_base64_blob(value: Any) -> bool:
         return False
     # Base64 image/tool blobs are long and mostly ASCII alphabet/+//=.
     sample = text[:int(s["binarySampleChars"])]
-    allowed = sum(1 for ch in sample if ch.isalnum() or ch in "+/=_-\n\r")
+    # str.isalnum() includes Chinese and other Unicode letters. They are text,
+    # not base64 bytes, and must reach the summary model unchanged.
+    allowed = sum(1 for ch in sample if ch.isascii() and (ch.isalnum() or ch in "+/=_-\n\r"))
     return allowed / max(1, len(sample)) > float(s["binaryAsciiRatio"])
 
 

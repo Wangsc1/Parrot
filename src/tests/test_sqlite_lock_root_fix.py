@@ -1068,8 +1068,11 @@ def test_late_openai_refresh_after_delete_cannot_mutate_same_email_claude(monkey
         thread.join(5)
 
     assert not thread.is_alive()
-    assert errors == []
-    assert results == ["late-openai-access"]
+    # P-01: a retired credential result must neither mutate another account
+    # nor escape as a successful token for the already-deleted generation.
+    assert results == []
+    assert len(errors) == 1 and isinstance(errors[0], ValueError)
+    assert "generation was deleted" in str(errors[0])
     remaining = config.get().get("oauthAccounts", [])
     assert len(remaining) == 1
     assert remaining[0]["provider"] == "claude"

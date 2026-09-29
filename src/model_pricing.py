@@ -26,7 +26,9 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 
 from . import config
-from .protocols.usage import anthropic_cache_creation_split, openai_envelope_containers
+from .protocols.usage import (
+    UsageAccumulator, anthropic_cache_creation_split, openai_envelope_containers,
+)
 
 TICKS_PER_USD = 10_000_000_000
 _DEFAULT_SOURCE_URL = "https://models.dev/api.json"
@@ -145,6 +147,10 @@ class NormalizedBilling:
     cache_creation_1h_tokens: int | None = None
     service_tier: str | None = None
     actual_cost_ticks: int | None = None
+    # Presence is not completeness: WS consumers must update/clear their tracker
+    # on this flag, then use usage_observed to decide whether counters are known.
+    # Kept last to preserve the positional shape of existing constructors.
+    usage_present: bool = False
 
 
 _lock = threading.RLock()
@@ -1882,7 +1888,16 @@ def _billing_candidates(obj: Mapping[str, Any]):
 
 
 def normalize_response_billing(response_body: Any) -> NormalizedBilling:
+    """Normalize complete snapshots or Anthropic's cumulative start/delta pair.
+
+    Only Anthropic message events may supply input/output in separate objects.
+    All other usage candidates must prove both dimensions themselves; a partial
+    higher-priority envelope falls through, never fills from another envelope.
+    ``usage_present`` includes empty/malformed usage in all supported envelopes.
+    """
     observed = False
+    input_observed = output_observed = False
+    usage_present = False
     usage_invalid = False
     tier_invalid = False
     input_tokens = output_tokens = cache_creation = cache_read = 0
@@ -1892,6 +1907,8 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
     actual_ticks: int | None = None
 
     for obj in _strict_response_objects(response_body):
+        event_type = str(obj.get("type") or "").strip().lower()
+        incremental_anthropic = event_type in {"message_start", "message_delta"}
         usage_selected = False
         tier_selected = False
         for candidate, allow_actual_cost in _billing_candidates(obj):
@@ -1906,6 +1923,7 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                     tier_invalid = False
                 elif "service_tier" in candidate and tier is not None:
                     tier_invalid = True
+            usage_present = usage_present or "usage" in candidate
             usage = candidate.get("usage")
             if allow_actual_cost and isinstance(usage, Mapping) and "cost_in_usd_ticks" in usage:
                 value = _strict_nonnegative_int(usage.get("cost_in_usd_ticks"))
@@ -1927,19 +1945,45 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
             has_token_fields = any(field in usage for field in token_fields)
             if has_token_fields:
                 valid = True
-                next_input = input_tokens
-                next_output = output_tokens
-                next_cache_creation = cache_creation
-                next_cache_read = cache_read
-                next_cache_creation_5m = cache_creation_5m
-                next_cache_creation_1h = cache_creation_1h
+                # OpenAI/non-stream candidates are whole snapshots, not
+                # incremental patches to a prior event or another envelope.
+                next_input = input_tokens if incremental_anthropic else 0
+                next_output = output_tokens if incremental_anthropic else 0
+                next_cache_creation = cache_creation if incremental_anthropic else 0
+                next_cache_read = cache_read if incremental_anthropic else 0
+                next_cache_creation_5m = cache_creation_5m if incremental_anthropic else None
+                next_cache_creation_1h = cache_creation_1h if incremental_anthropic else None
                 is_anthropic_usage = bool(
-                    "cache_creation_input_tokens" in usage
+                    incremental_anthropic
+                    or "cache_creation_input_tokens" in usage
                     or "cache_read_input_tokens" in usage
                     or isinstance(usage.get("cache_creation"), Mapping)
                 )
 
                 has_prompt = "input_tokens" in usage or "prompt_tokens" in usage
+                has_output = "output_tokens" in usage or "completion_tokens" in usage
+                if not incremental_anthropic:
+                    if not has_prompt or not has_output:
+                        usage_invalid = True
+                        continue
+                    if not is_anthropic_usage:
+                        # Reuse runtime strict validation, retaining this
+                        # compatibility normalizer's existing field aliases and
+                        # precedence within ONE candidate (never across envelopes).
+                        canonical_usage = dict(usage)
+                        for canonical, alias in (
+                            ("input_tokens", "prompt_tokens"),
+                            ("output_tokens", "completion_tokens"),
+                            ("input_tokens_details", "prompt_tokens_details"),
+                            ("output_tokens_details", "completion_tokens_details"),
+                        ):
+                            if canonical not in canonical_usage and alias in usage:
+                                canonical_usage[canonical] = usage[alias]
+                        trial = UsageAccumulator()
+                        trial.set_from_openai_responses_usage(canonical_usage)
+                        if not trial.usage_observed:
+                            usage_invalid = True
+                            continue
                 details_obj = None
                 details_present = False
                 if "input_tokens_details" in usage:
@@ -1948,7 +1992,7 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                 elif "prompt_tokens_details" in usage:
                     details_present = True
                     details_obj = usage.get("prompt_tokens_details")
-                if details_present and not isinstance(details_obj, Mapping):
+                if details_present and details_obj is not None and not isinstance(details_obj, Mapping):
                     valid = False
 
                 cached_from_details = 0
@@ -1979,7 +2023,7 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                     else:
                         next_cache_read = (
                             max(cache_read, parsed_cache_read)
-                            if is_anthropic_usage else parsed_cache_read
+                            if incremental_anthropic else parsed_cache_read
                         )
 
                 if "cache_creation_input_tokens" in usage:
@@ -1991,18 +2035,18 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                         usage.get("cache_creation_tokens")
                     )
                 else:
-                    parsed_cache_creation = cache_creation
+                    parsed_cache_creation = next_cache_creation
                 if parsed_cache_creation is None:
                     valid = False
                 else:
                     next_cache_creation = (
                         max(cache_creation, parsed_cache_creation)
-                        if is_anthropic_usage else parsed_cache_creation
+                        if incremental_anthropic else parsed_cache_creation
                     )
                 ttl_split = anthropic_cache_creation_split(usage)
                 if ttl_split is not None:
-                    next_cache_creation_5m = max(cache_creation_5m or 0, ttl_split[0])
-                    next_cache_creation_1h = max(cache_creation_1h or 0, ttl_split[1])
+                    next_cache_creation_5m = max(next_cache_creation_5m or 0, ttl_split[0])
+                    next_cache_creation_1h = max(next_cache_creation_1h or 0, ttl_split[1])
 
                 if has_prompt:
                     prompt = _strict_nonnegative_int(
@@ -2021,7 +2065,7 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                         else:
                             if is_openai_shape:
                                 next_input = prompt - next_cache_read
-                            elif is_anthropic_usage:
+                            elif incremental_anthropic:
                                 next_input = max(input_tokens, prompt)
                             else:
                                 next_input = prompt
@@ -2033,7 +2077,10 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                     if parsed_output is None:
                         valid = False
                     else:
-                        next_output = parsed_output
+                        next_output = (
+                            max(output_tokens, parsed_output)
+                            if incremental_anthropic else parsed_output
+                        )
 
                 if valid:
                     input_tokens = next_input
@@ -2042,7 +2089,9 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                     cache_read = next_cache_read
                     cache_creation_5m = next_cache_creation_5m
                     cache_creation_1h = next_cache_creation_1h
-                    observed = True
+                    input_observed = has_prompt or (incremental_anthropic and input_observed)
+                    output_observed = has_output or (incremental_anthropic and output_observed)
+                    observed = input_observed and output_observed
                     usage_invalid = False
                     usage_selected = True
                 else:
@@ -2058,6 +2107,7 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
         cache_creation_1h_tokens=cache_creation_1h,
         service_tier=service_tier,
         actual_cost_ticks=actual_ticks,
+        usage_present=usage_present,
     )
 
 

@@ -235,7 +235,7 @@ class ApiChannel(Channel):
                     edits = [e for e in (cm.get("edits") or [])
                              if not (isinstance(e, dict) and str(e.get("type", "")).startswith("clear_thinking_"))]
                     if edits:
-                        cm["edits"] = edits
+                        payload["context_management"] = {**cm, "edits": edits}
                     else:
                         payload.pop("context_management", None)
             signed = cc_mimicry.sign_body(payload)

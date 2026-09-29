@@ -228,6 +228,9 @@ def test_cleanup_stale_pending_preserves_known_client_disconnect_semantics(isola
     )
     orphan = _insert("stale-orphan", created)
 
+    # Simulate a new process: these handles are historical row locators only,
+    # not live request leases. Age alone must not terminate a registered request.
+    log_db._request_handles.clear()
     assert log_db.cleanup_stale_pending(1800) == 3
 
     disconnected_row = _request(disconnected.db.path, disconnected.request_id)
@@ -262,6 +265,7 @@ def test_cleanup_stale_pending_scans_request_creation_month_after_rollover(
         error_detail="client disconnected",
     )
 
+    log_db._request_handles.clear()  # previous-process orphan, not an active root
     assert log_db.cleanup_stale_pending(1800) == 1
     row = _request(old.db.path, old.request_id)
     assert (row["status"], row["http_status"], row["error_message"]) == (

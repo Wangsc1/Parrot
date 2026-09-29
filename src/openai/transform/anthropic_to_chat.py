@@ -446,6 +446,8 @@ def _stop_reason(finish_reason: str | None) -> str:
 
 
 def translate_response(obj: dict, *, model: str = "") -> dict:
+    from ._legacy_chat import normalize_response
+    obj = normalize_response(obj)
     choices = obj.get("choices") or []
     choice = choices[0] if choices else {}
     msg = (choice or {}).get("message") or {}

@@ -60,7 +60,7 @@ def test_channel_url_rejected_before_write_or_operation(actual_management, bad_u
     assert config.get() == before
 
 
-def test_existing_channel_rename_keeps_original_long_name_semantics(actual_management, monkeypatch):
+def test_existing_channel_rename_uses_64_character_limit_and_repairs_legacy_name(actual_management, monkeypatch):
     client, _runtime = actual_management
     assert client.post(PREFIX + "/channels", json=_channel("short")).status_code == 201
     short = channel_menu.ui.register_code("short")
@@ -68,17 +68,45 @@ def test_existing_channel_rename_keeps_original_long_name_semantics(actual_manag
     sent: list[str] = []
     monkeypatch.setattr(channel_menu.ui, "send", lambda _chat, text, **_kwargs: sent.append(text))
     monkeypatch.setattr(channel_menu.ui, "send_result", lambda *_args, **_kwargs: None)
-    name = "N" * 65
-    assert channel_menu.handle_edit_text(42, "ch_edit_name", name) is True
-    assert any(row.get("name") == name for row in config.get()["channels"]), sent
-    path = PREFIX + "/channels/" + quote("api:" + name, safe="")
-    assert client.get(path).json()["data"]["name"] == name
-    renamed = client.patch(path, json={"name": "M" * 65})
-    assert renamed.status_code == 200, renamed.text
-    assert renamed.json()["data"]["name"] == "M" * 65
-    # The original new-channel limit is a different rule and stays intact.
-    denied_create = client.post(PREFIX + "/channels", json=_channel("C" * 65))
-    assert denied_create.status_code == 422
+    before = copy.deepcopy(config.get())
+    try:
+        # M-03 intentionally aligns create, TG rename and API rename at 64.
+        assert channel_menu.handle_edit_text(42, "ch_edit_name", "N" * 65) is True
+        assert sent == ["❌ 名称过长（上限 64 字符），请重新输入："]
+        assert config.get() == before
+        assert states.get_state(42)["action"] == "ch_edit_name"
+        assert client.get(PREFIX + "/channels/api:short").json()["data"]["name"] == "short"
+        name = "N" * 64
+        assert channel_menu.handle_edit_text(42, "ch_edit_name", name) is True
+        assert states.get_state(42) is None
+        path = PREFIX + "/channels/" + quote("api:" + name, safe="")
+        assert client.get(path).json()["data"]["name"] == name
+        before = copy.deepcopy(config.get())
+        denied_rename = client.patch(path, json={"name": "M" * 65})
+        assert denied_rename.status_code == 422, denied_rename.text
+        assert denied_rename.json()["error"]["code"] == "VALIDATION_FAILED"
+        assert config.get() == before
+        assert client.get(path).json()["data"]["name"] == name
+        renamed = client.patch(path, json={"name": "M" * 64})
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json()["data"]["name"] == "M" * 64
+        denied_create = client.post(PREFIX + "/channels", json=_channel("C" * 65))
+        assert denied_create.status_code == 422
+
+        # Existing over-limit names remain addressable and can be repaired;
+        # seed only this isolated fixture, never loosen new-name validation.
+        legacy_name = "legacy-" + "L" * 65
+        from src.channel import registry
+        registry.add_api_channel(_channel(legacy_name))
+        legacy_path = PREFIX + "/channels/" + quote("api:" + legacy_name, safe="")
+        legacy_read = client.get(legacy_path)
+        assert legacy_read.status_code == 200, legacy_read.text
+        assert legacy_read.json()["data"]["name"] == legacy_name
+        repaired = client.patch(legacy_path, json={"name": "repaired"})
+        assert repaired.status_code == 200, repaired.text
+        assert client.get(PREFIX + "/channels/api:repaired").json()["data"]["name"] == "repaired"
+    finally:
+        states.pop_state(42)
 
 
 @pytest.mark.parametrize("kind", ["request", "response"])
@@ -230,9 +258,48 @@ def test_status_api_reports_failure_and_preserves_tg_fallback(actual_management,
     assert history.json()["error"]["code"] == "UPSTREAM_ERROR"
 
     control = runtime.control_owner().auxiliary.status_alerts
-    assert control.refresh_direct(_telegram_context()) == len(targets)
+    # AO-02: failed refresh is not success and must not consume silent prime.
+    # TG still attempts later targets rather than aborting on the first failure.
+    tg_targets = list(reversed(targets))
+    config.update(lambda root: root["statusMonitor"].update({"targets": tg_targets}))
+    status_monitor._initialized_providers.clear()
+    with pytest.raises(RuntimeError, match="Status refresh failed"):
+        control.refresh_direct(_telegram_context())
+    assert "openai" not in status_monitor._initialized_providers
+    assert ("claude" in status_monitor._initialized_providers) is partial_success
+    assert status_monitor._active["openai"] == previous_active
     assert control.recent_direct(_telegram_context(), "openai") == []
-    assert "openai" in status_monitor._initialized_providers
+
+    # Exercise the real TG consumer: it acknowledges, reports failure, and leaves
+    # the previously rendered cached page and its navigation available. No fake
+    # refresh success, uncaught exception, or lost snapshot is acceptable.
+    from src.telegram.menus import status_alert_menu
+    calls = []
+    def telegram_api(method, data=None):
+        calls.append((method, copy.deepcopy(data)))
+        return {"ok": True, "result": {"message_id": 77}}
+    monkeypatch.setattr(status_alert_menu, "_CONTROL", control)
+    monkeypatch.setattr(status_alert_menu.ui, "api", telegram_api)
+    status_alert_menu.show(42, 77)
+    cached_page = calls[-1]
+    assert cached_page[0] == "editMessageText"
+    assert "Existing" in cached_page[1]["text"]
+    callbacks = {button["callback_data"] for row in cached_page[1]["reply_markup"]["inline_keyboard"] for button in row}
+    assert {"stat:refresh", "stat:history", "menu:settings", "menu:main"} <= callbacks
+    calls.clear()
+    status_monitor._initialized_providers.clear()
+    assert status_alert_menu.handle_callback(42, 77, "cb-refresh", "stat:refresh") is True
+    assert [method for method, _ in calls] == ["answerCallbackQuery", "sendMessage"]
+    assert calls[0][1]["callback_query_id"] == "cb-refresh"
+    assert calls[1][1]["text"] == "刷新失败: <code>Status refresh failed</code>"
+    assert "openai" not in status_monitor._initialized_providers
+    assert ("claude" in status_monitor._initialized_providers) is partial_success
+    assert status_monitor._active["openai"] == previous_active
+    assert status_alert_menu.handle_callback(42, 77, "cb-return", "menu:status_alert") is True
+    assert calls[-1] == cached_page
+    assert status_alert_menu.handle_callback(42, 77, "cb-history", "stat:history") is True
+    assert calls[-1][0] == "editMessageText" and "(空)" in calls[-1][1]["text"]
+    config.update(lambda root: root["statusMonitor"].update({"targets": targets}))
 
     def empty_feed(url, *, timeout, headers):
         return httpx.Response(200, json={"incidents": []}, request=httpx.Request("GET", url))

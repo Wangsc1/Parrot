@@ -353,8 +353,6 @@ class ApiKeyControl:
             path = sorted(unknown)[0] if unknown else "body"
             raise self._validation(path, "UNKNOWN_FIELD" if unknown else "EMPTY_UPDATE", "invalid update fields")
         allowed_models = changes.get("allowed_models")
-        if allowed_models is not None:
-            self._validate_allowed_models(allowed_models)
         if "mcp_tools" in changes:
             self._validate_mcp_tools(changes["mcp_tools"])
         limit_change = changes.get("limit_override", ...)
@@ -370,6 +368,10 @@ class ApiKeyControl:
                 raise self._not_found(key_id)
             entry = self._normalize_entry(raw)
             self._check_revision(key_id, entry, if_match)
+            if allowed_models is not None:
+                self._validate_allowed_models(
+                    allowed_models, retained=entry.get("allowedModels") or (),
+                )
             keys[key_id] = entry
             if "enabled" in changes:
                 entry["enabled"] = bool(changes["enabled"])
@@ -837,11 +839,12 @@ class ApiKeyControl:
             return result
         return {}
 
-    def _validate_allowed_models(self, values: Any) -> None:
+    def _validate_allowed_models(self, values: Any, *, retained=()) -> None:
         if not isinstance(values, (list, tuple)):
             raise self._validation("allowedModels", "INVALID_TYPE", "allowedModels must be an array")
         seen: set[str] = set()
-        available = set(self.available_permission_models_unchecked())
+        # Existing grants can survive inventory changes; new unknown grants cannot.
+        available = set(self.available_permission_models_unchecked()) | set(retained)
         for index, value in enumerate(values):
             model = str(value or "").strip()
             if not model:

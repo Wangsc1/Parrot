@@ -202,11 +202,19 @@ def constraints(tool: ManagedTool, args: dict) -> dict:
     return merged
 
 
+def is_response_tool_call(item: Any) -> bool:
+    """Client calls only: observed xAI X-search custom items remain hosted evidence."""
+    from .search_xai import is_x_search_call_item
+    return (isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call")
+            and not is_x_search_call_item(item))
+
+
 def _calls(obj: dict, protocol: str):
     if protocol == "responses":
         for item in obj.get("output") or []:
-            if isinstance(item, dict) and item.get("type") == "function_call":
-                yield item, str(item.get("call_id") or item.get("id") or ""), str(item.get("name") or ""), item.get("arguments"), str(item.get("namespace") or "")
+            if is_response_tool_call(item):
+                field = "input" if item.get("type") == "custom_tool_call" else "arguments"
+                yield item, str(item.get("call_id") or item.get("id") or ""), str(item.get("name") or ""), item.get(field), str(item.get("namespace") or "")
     elif protocol == "anthropic":
         for item in obj.get("content") or []:
             if isinstance(item, dict) and item.get("type") == "tool_use":
@@ -309,7 +317,7 @@ def _remember(body, protocol, api_key_name, references, *, visible_body=None):
 def _result_refs(item):
     if not isinstance(item, dict):
         return []
-    if item.get("type") == "function_call_output":
+    if item.get("type") in ("function_call_output", "custom_tool_call_output"):
         return [(str(item.get("call_id") or ""), False)]
     if item.get("role") == "tool":
         return [(str(item.get("tool_call_id") or ""), False)]
@@ -384,7 +392,7 @@ def restore_replay(body: dict, protocol: str, api_key_name: str | None) -> dict:
                 continue
             strength = len(visible)
         elif reference == previous:
-            if any(isinstance(i, dict) and (i.get("role") == "assistant" or i.get("type") == "function_call") for i in items):
+            if any(isinstance(i, dict) and (i.get("role") == "assistant" or is_response_tool_call(i)) for i in items):
                 continue
             tail, strength = items, 0
         else:
@@ -506,12 +514,15 @@ def _unique_calls(obj, protocol):
     """Validate the whole batch before any side effect; coalesce duplicates."""
     seen, duplicates = {}, set()
     for entry in _calls(obj, protocol):
-        _, call_id, name, args, namespace = entry
-        try:
-            args = json.loads(args) if isinstance(args, str) else args
-        except ValueError:
-            pass
-        identity = (namespace, name, _digest(args))
+        item, call_id, name, args, namespace = entry
+        custom = item.get("type") == "custom_tool_call"
+        # Freeform custom input is not JSON arguments: whitespace is semantic.
+        if not custom:
+            try:
+                args = json.loads(args) if isinstance(args, str) else args
+            except ValueError:
+                pass
+        identity = (custom, namespace, name, _digest(args))
         if call_id in seen:
             if seen[call_id] != identity:
                 raise ValueError("tool_call_id_conflict: one call ID has different names or arguments")
@@ -530,7 +541,7 @@ def _unique_calls(obj, protocol):
         emitted.add(ident)
         return True
     if protocol == "responses":
-        out["output"] = [i for i in out.get("output") or [] if i.get("type") != "function_call" or keep(i, "call_id")]
+        out["output"] = [i for i in out.get("output") or [] if not is_response_tool_call(i) or keep(i, "call_id")]
     elif protocol == "anthropic":
         out["content"] = [i for i in out.get("content") or [] if i.get("type") != "tool_use" or keep(i, "id")]
     else:
@@ -605,7 +616,8 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
             except ValueError as exc:
                 return _tool_error(str(exc), "tool_call_id_conflict"), None
             calls = list(_calls(obj, protocol))
-            owned = [(entry, plan[(entry[4], entry[2])]) for entry in calls if (entry[4], entry[2]) in plan]
+            owned = [(entry, plan[(entry[4], entry[2])]) for entry in calls
+                     if entry[0].get("type") != "custom_tool_call" and (entry[4], entry[2]) in plan]
             if not owned:
                 final = copy.deepcopy(request_body)
                 _append(final, obj, [], protocol)

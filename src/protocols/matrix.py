@@ -1414,6 +1414,11 @@ class ProtocolMatrix:
                     required_transforms=["chat_to_anthropic"],
                 )
             if ingress == "openai-responses" and upstream == "anthropic":
+                from ..local_web_tools import is_openai_web_search_tool_type
+                for label in f.hosted_tool_labels:
+                    kind = label.split(":")[-1]
+                    if kind not in ("namespace", "custom") and not is_openai_web_search_tool_type(kind):
+                        raise ProtocolGuardError("OpenAI Responses→Anthropic cannot execute required hosted tool" + _label_suffix(label))
                 if f.responses_instructions_unsupported_label:
                     raise ProtocolGuardError(
                         "OpenAI Responses→Anthropic instructions are not safely convertible"

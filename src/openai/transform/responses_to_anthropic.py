@@ -411,6 +411,13 @@ def guard_request(body: dict, *, store_enabled: bool = True) -> None:
         _fail("conversation resource is not supported on Responses→Anthropic bridge", param="conversation")
     if body.get("background") is True:
         _fail("background async response is not supported on Responses→Anthropic bridge", param="background")
+    from ...protocols.matrix import _hosted_tool_labels
+    from ...local_web_tools import is_openai_web_search_tool_type
+    for label in _hosted_tool_labels("responses", body):
+        kind = label.split(":")[-1]
+        if kind not in ("namespace", "custom") and not is_openai_web_search_tool_type(kind):
+            raise guard.GuardError(400, "invalid_request_error",
+                f"Responses {label} requires a native-capable candidate", param="tools", scope="candidate")
     custom_label = _custom_tool_label(body)
     if custom_label:
         _fail(
@@ -675,6 +682,11 @@ def translate_request(
     else:
         bridge_body["tool_choice"] = _map_tool_choice(choice, plan)
     input_items = responses_to_chat.resolve_input_items(bridge_body, api_key_name=api_key_name)
+    input_items = responses_to_chat.bridge_history_items(input_items)
+    try:
+        guard_request({**body, "input": input_items}, store_enabled=store_enabled)
+    except guard.GuardError as exc:
+        raise guard.GuardError(exc.status, exc.err_type, exc.message, param=exc.param, scope="candidate") from exc
     input_items = _degrade_reasoning_history(input_items)
     input_items = _map_namespaced_history(input_items, plan)
     input_items = _normalize_custom_tool_history(input_items, plan)
@@ -716,6 +728,8 @@ def translate_response(
     from ... import search_hosted_codec
     hosted = search_hosted_codec.anthropic_to_responses(message.get("content") or [])
     chat_obj = chat_to_anthropic.translate_response(message, model=model)
+    if message.get("stop_reason") == "pause_turn":
+        chat_obj["choices"][0]["finish_reason"] = "pause_turn"  # internal composition marker only
     # Preserve each readable thinking block at its original position. Native
     # signatures/redacted blocks are not OpenAI encrypted_content; the existing
     # drop policy still applies to readable summaries.

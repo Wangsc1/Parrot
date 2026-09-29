@@ -22,6 +22,7 @@ import httpx
 from . import channel_state, config, cooldown, network, quota_errors
 from .channel import registry
 from .channel.base import Channel
+from .protocols.terminal import non_stream_terminal_error
 
 
 ProgressCallback = Callable[[str], Awaitable[None]]
@@ -188,6 +189,15 @@ async def probe_channel_model(
             obj.get("type") == "error" or isinstance(obj.get("error"), dict)
         ):
             return False, elapsed_ms, f"upstream error: {json.dumps(obj.get('error', obj))[:200]}"
+
+        # A health/info endpoint can also return HTTP 200 JSON. Recovery needs
+        # a consumable model terminal, not just reachability. Reuse the runtime
+        # check; empty text, tool calls and length/incomplete remain legitimate.
+        terminal_error = non_stream_terminal_error(
+            obj, getattr(ch, "protocol", "anthropic"), allow_async=False,
+        )
+        if terminal_error:
+            return False, elapsed_ms, terminal_error
 
         return True, elapsed_ms, None
 

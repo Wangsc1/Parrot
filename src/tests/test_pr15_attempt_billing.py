@@ -316,7 +316,9 @@ def test_strict_normalization_observes_zero_and_terminal_errors(m):
         '{"input_tokens":1,"cost_in_usd_ticks":777}}}\n\n'
     )
     wrapped = mp.normalize_response_billing(wrapped_nonterminal)
-    assert wrapped.usage_observed is True
+    # An input-only object is incomplete, not proof that output usage was zero.
+    assert wrapped.usage_observed is False
+    assert wrapped.usage_invalid is True
     assert wrapped.actual_cost_ticks is None
 
 

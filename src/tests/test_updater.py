@@ -42,6 +42,7 @@ from src import config, state_db, updater
 def _fresh_updater():
     """每个测试前：初始化 state_db、复位状态机、清形态缓存、复位配置。"""
     state_db.init()
+    updater.start()
     updater._mode_cache = None
     # 复位 updateChecker 配置到一个已知基线
     config.update(lambda c: c.__setitem__("updateChecker", {
@@ -285,8 +286,10 @@ if [ "$1" = "compose" ]; then
   if [ "${2:-}" = "config" ]; then exit 0; fi
   if [ "${2:-}" = "up" ]; then echo true > "$FAKE_DOCKER_STATE"; exit 0; fi
 fi
+if [ "$1" = "image" ] && [ "${2:-}" = "inspect" ]; then echo sha256:new; exit 0; fi
 if [ "$1" = "inspect" ]; then
   if [ "$state" = "absent" ]; then exit 1; fi
+  if [ "${3:-}" = "{{.Image}}" ]; then echo sha256:new; exit 0; fi
   if [ "${2:-}" = "-f" ]; then echo "$state"; fi
   exit 0
 fi

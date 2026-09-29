@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
 from ...protocols.sse import split_sse_events
+from ._stream_chat_tools import ChatToolDeltaBuffer
 
 
 def _gen_id(prefix: str) -> str:
@@ -146,6 +147,7 @@ class StreamTranslator:
             previous_response_id=previous_response_id,
         )
         self._buf = b""
+        self._tool_deltas = ChatToolDeltaBuffer()
         # Store 写入上下文：当三者齐全（+ store enabled）时，close() 把本次响应
         # 存入 openai.store 以支持下次 previous_response_id 续接
         self._store_api_key_name = api_key_name or None
@@ -171,6 +173,8 @@ class StreamTranslator:
     def close(self) -> Iterator[bytes]:
         if self.state.terminal_emitted:
             return
+        for ready in self._tool_deltas.flush(self.state.finish_reason):
+            yield from self._handle_event(ready)
         self.state.terminal_emitted = True
 
         # 防御：即使上游一个 chunk 都没发就关闭（空流或立即 [DONE]），
@@ -198,23 +202,36 @@ class StreamTranslator:
     # --- 解析 ---
 
     def _handle_block(self, block: str) -> Iterator[bytes]:
+        if self.state.terminal_emitted:
+            return
         data_lines = [line[5:].lstrip(" ") for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.startswith("data:")]
         if not data_lines:
             return
         data_str = "\n".join(data_lines).strip()
         if data_str == "[DONE]":
-            return  # 收尾由 close() 做
+            # A valid empty completion must cross the commit gate too. DONE is
+            # the authoritative boundary; close() is idempotent at runtime EOF.
+            yield from self.close()
+            return
         try:
             evt = json.loads(data_str)
         except Exception:
             return
 
-        # 首个事件前发 response.created + in_progress
-        yield from self._ensure_created()
+        if not isinstance(evt, dict):
+            return
+        for ready in self._tool_deltas.feed(evt):
+            yield from self._handle_event(ready)
 
-        # 上游 error chunk：标记终止，下一次 close() 会 emit failed
-        if isinstance(evt, dict) and isinstance(evt.get("error"), dict):
+    def _handle_event(self, evt: dict) -> Iterator[bytes]:
+        if self.state.terminal_emitted:
+            return
+        yield from self._ensure_created()
+        if isinstance(evt.get("error"), dict):
             self.state.terminal_error = evt["error"]
+            self.state.terminal_emitted = True
+            yield from self._emit_failed(evt["error"])
+            self._save_to_store_if_configured()
             return
 
         choices = evt.get("choices") or []

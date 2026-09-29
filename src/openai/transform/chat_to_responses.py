@@ -44,6 +44,8 @@ def translate_request(body: dict) -> dict:
 
     调用方需在此之前完成 CapabilityGuard 的检查（参见 guard.guard_chat_to_responses）。
     """
+    from ._legacy_chat import normalize_request
+    body = normalize_request(body)
     payload: dict[str, Any] = {
         "model": body["model"],
         "input": _messages_to_input_items(body.get("messages") or []),
@@ -634,7 +636,7 @@ def _status_to_finish_reason(resp: dict, *, has_tool_calls: bool) -> str:
             return "length"
         if reason == "content_filter":
             return "content_filter"
-        return "stop"
+        return "length"
     if status in ("failed", "cancelled"):
         return "stop"
     # in_progress / queued / 未知 → 保守用 stop（若有 tool_calls 则 tool_calls）

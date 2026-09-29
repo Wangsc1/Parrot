@@ -1424,7 +1424,7 @@ def _permission_model_label(model: str) -> str:
     return model
 
 
-def _render_perm_edit(name: str, models: list[str], checked: set[str]) -> tuple[str, dict]:
+def _render_perm_edit(name: str, models: list[str], checked: set[str], unavailable=()) -> tuple[str, dict]:
     lines = [
         f"🎯 <b>编辑允许模型</b>: {ui.escape_html(name)}",
         "",
@@ -1438,6 +1438,8 @@ def _render_perm_edit(name: str, models: list[str], checked: set[str]) -> tuple[
     for idx, m in enumerate(models):
         mark = "☑" if m in checked else "☐"
         label = _permission_model_label(m)
+        if m in unavailable:
+            label += "（当前不可用）"
         cur.append(ui.btn(f"{mark} {label}", f"ak:pt:{_short_of(name)}:{idx}"))
         if len(cur) >= 2:
             rows.append(cur)
@@ -1464,6 +1466,10 @@ def on_perm_enter(chat_id: int, message_id: int, cb_id: str, short: str, page: i
         return
 
     models = _available_permission_models()
+    current = list(entry.get("allowedModels") or [])
+    unavailable = [model for model in current if model not in models]
+    # Inventory changes must never implicitly clear an existing restriction.
+    models = list(dict.fromkeys([*models, *unavailable]))
     if not models:
         ui.edit(
             chat_id, message_id,
@@ -1472,16 +1478,15 @@ def on_perm_enter(chat_id: int, message_id: int, cb_id: str, short: str, page: i
         )
         return
 
-    current = set(entry.get("allowedModels") or [])
-    # 交集：仅保留仍然存在的模型
-    checked = {m for m in current if m in models}
+    checked = set(current)
     states.set_state(chat_id, _PERM_STATE, {
         "name": name,
         "page": page,
         "models": models,     # 稳定顺序，用 idx 索引
-        "checked": list(checked),
+        "checked": current,
+        **({"unavailable": unavailable} if unavailable else {}),
     })
-    text, kb = _render_perm_edit(name, models, checked)
+    text, kb = _render_perm_edit(name, models, checked, unavailable)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
@@ -1511,7 +1516,7 @@ def on_perm_toggle(chat_id: int, message_id: int, cb_id: str, short: str, idx_st
     states.set_state(chat_id, _PERM_STATE, data)
 
     ui.answer_cb(cb_id)
-    text, kb = _render_perm_edit(data["name"], data["models"], checked)
+    text, kb = _render_perm_edit(data["name"], data["models"], checked, data.get("unavailable", ()))
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
@@ -1528,7 +1533,7 @@ def on_perm_clear(chat_id: int, message_id: int, cb_id: str, short: str) -> None
     data["checked"] = []
     states.set_state(chat_id, _PERM_STATE, data)
     ui.answer_cb(cb_id, "已清空（= 不限制）")
-    text, kb = _render_perm_edit(data["name"], data["models"], set())
+    text, kb = _render_perm_edit(data["name"], data["models"], set(), data.get("unavailable", ()))
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 

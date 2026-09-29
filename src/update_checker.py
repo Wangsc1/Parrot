@@ -190,13 +190,55 @@ def _pick_latest(releases: list, *, include_prerelease: bool) -> Optional[dict]:
     return fallback
 
 
+_workers_lock = threading.Lock()
+_workers = 0
+_stopping = False
+
+
+def start() -> None:
+    global _stopping
+    with _workers_lock:
+        _stopping = False
+
+
+def begin_shutdown() -> None:
+    global _stopping
+    with _workers_lock:
+        _stopping = True
+
+
+async def stop() -> None:
+    begin_shutdown()
+    while True:
+        with _workers_lock:
+            if not _workers:
+                return
+        await asyncio.sleep(0.02)
+
+
 def _check_once(*, push: bool = True, raise_on_error: bool = False) -> None:
+    """Track the actual synchronous worker, not its cancellable asyncio wrapper."""
+    global _workers
+    with _workers_lock:
+        if _stopping:
+            return
+        _workers += 1
+    try:
+        _check_once_impl(push=push, raise_on_error=raise_on_error)
+    finally:
+        with _workers_lock:
+            _workers -= 1
+
+
+def _check_once_impl(*, push: bool = True, raise_on_error: bool = False) -> None:
     """单次检查；API 可选择不推送并显式报告抓取失败，TG/后台默认不变。"""
     cfg = _cfg()
     if not cfg["enabled"] or not cfg["repo"]:
         return
     url = f"{cfg['apiBase']}/repos/{cfg['repo']}/releases?per_page=20"
     releases = _http_get_json(url)
+    if _stopping:
+        return
     if not isinstance(releases, list):
         if raise_on_error:
             raise RuntimeError("Release check failed")
@@ -237,7 +279,7 @@ def _check_once(*, push: bool = True, raise_on_error: bool = False) -> None:
         # 自动更新模式：检测到新版直接走自更新（仍是双重确认——staged 后等用户点确认）
         # 注意：只做"备份+拉取"进 staged，重启仍需用户在 TG 点确认（不绕过双重确认）。
         try:
-            if _cfg_auto_update() and tag not in ignored:
+            if not _stopping and _cfg_auto_update() and tag not in ignored:
                 from . import updater
                 if not updater.is_busy():
                     admin_chat = None

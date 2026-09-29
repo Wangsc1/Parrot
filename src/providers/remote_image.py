@@ -148,21 +148,32 @@ async def inline_remote_images(body: dict[str, Any]) -> dict[str, Any]:
     """Return a copy with Chat/Responses HTTPS image URLs replaced by data URLs."""
     out = copy.deepcopy(body)
 
-    async def visit(value: Any) -> None:
-        if isinstance(value, dict):
-            typ = str(value.get("type") or "")
-            if typ in {"input_image", "image_url"}:
-                holder = value.get("image_url")
+    # Images are protocol content parts, never arbitrary similarly shaped JSON
+    # in tools/schema/examples, metadata, tool arguments or tool result bodies.
+    for container in ("messages", "input"):
+        messages = out.get(container)
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("type", "message") != "message":
+                continue
+            if message.get("role", "user") not in {"system", "developer", "user", "assistant"}:
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") not in {"input_image", "image_url"}:
+                    continue
+                holder = part.get("image_url")
                 url = holder.get("url") if isinstance(holder, dict) else holder
                 if isinstance(url, str) and url.lower().startswith(("http://", "https://")):
                     raw, mime = await download_https_image(url)
                     data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-                    if isinstance(holder, dict): holder["url"] = data_url
-                    else: value["image_url"] = data_url
-            for child in list(value.values()):
-                await visit(child)
-        elif isinstance(value, list):
-            for child in value: await visit(child)
-
-    await visit(out)
+                    if isinstance(holder, dict):
+                        holder["url"] = data_url
+                    else:
+                        part["image_url"] = data_url
     return out

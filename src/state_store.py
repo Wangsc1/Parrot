@@ -462,7 +462,9 @@ class StateStore:
                 self._assert_mutable()
                 candidates = {
                     "runtime": {d: copy.deepcopy(migrated.get(d, {})) for d in RUNTIME_DOMAINS},
-                    "durable": {d: copy.deepcopy(migrated.get(d, {})) for d in DURABLE_DOMAINS},
+                    # An older schema cannot revoke domains it never owned.
+                    "durable": {d: copy.deepcopy(migrated[d] if d in migrated else self._data[d])
+                                for d in DURABLE_DOMAINS},
                 }
                 for payload in candidates.values(): self._payload_bytes(payload)
                 generations = {kind: self._generation[kind] + 1 for kind in candidates}

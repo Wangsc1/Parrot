@@ -120,7 +120,13 @@ def _cleanup():
     states.clear_all(); ui._code_to_name.clear(); yield; states.clear_all(); ui._code_to_name.clear()
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["caseId"])
-def test_update_strict_trace_without_restart_or_update(case, monkeypatch): assert_strict_equal(case, _run(case, monkeypatch))
+def test_update_strict_trace_without_restart_or_update(case, monkeypatch):
+    expected = deepcopy(case)
+    if case["caseId"] == "TG-UPD-01.cancel-staged-failure":
+        # M-04: the archived trace falsely claimed cancellation succeeded.
+        # Keep the archive intact and explicitly review this one corrected receipt.
+        expected["tgApi"][1]["payload"]["text"] = "❌ <b>取消更新失败</b>\n\nnot staged"
+    assert_strict_equal(expected, _run(case, monkeypatch))
 
 def test_update_case_callback_and_state_coverage_is_bidirectional():
     assert_capability_coverage({"TG-UPD-01"}, CASES); assert {c["caseId"] for c in CASES} == EXPECTED_CASE_IDS

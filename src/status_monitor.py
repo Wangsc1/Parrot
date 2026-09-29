@@ -109,7 +109,7 @@ def _cfg() -> dict:
     return {
         "enabled": bool(sm.get("enabled", True)),
         "intervalSeconds": int(sm.get("intervalSeconds", 60) or 60),
-        "targets": list(sm.get("targets") or ["claude", "openai", "cloudflare"]),
+        "targets": list(sm.get("targets", ["claude", "openai", "cloudflare"]) or []),
         # impact 推送门槛：低于该级别的 incident 不主动推（但仍记录 + 顶部 banner 不会显示）。
         # 默认 minor 起步——none/maintenance 静默处理。
         "minImpact": str(sm.get("minImpact", "minor")).lower(),
@@ -209,14 +209,22 @@ _active: dict[str, dict[str, dict]] = {p: {} for p in TARGETS}
 _initialized_providers: set[str] = set()
 
 
+def incident_resolved(incident: dict) -> bool:
+    """Terminal evidence, including postmortems/maintenance, not list absence."""
+    return bool(incident.get("resolved_at")) or (incident.get("status") or "").lower() in {
+        "resolved", "postmortem", "completed",
+    }
+
+
 def _set_active(provider: str, incidents: list[dict]) -> tuple[list[dict], list[dict]]:
-    """更新内存活跃 incident 表，返回 (新增的, 刚恢复的)。被 mute 的全程跳过。"""
+    """更新活跃表；缺席保留上次快照待确认，只有明确终态才算恢复。"""
     _load_muted_into_memory()
-    muted_ids: set[str] = _muted.get(provider, set()).copy() if provider in _muted else set()
+    with _mute_lock:
+        muted_ids = set(_muted.get(provider, ()))
+    observed = {i["id"]: i for i in incidents}
     new_active = {
-        i["id"]: i for i in incidents
-        if (i.get("status") or "").lower() != "resolved"
-        and i["id"] not in muted_ids
+        iid: inc for iid, inc in observed.items()
+        if not incident_resolved(inc) and iid not in muted_ids
     }
     newly_added: list[dict] = []
     just_resolved: list[dict] = []
@@ -226,11 +234,12 @@ def _set_active(provider: str, incidents: list[dict]) -> tuple[list[dict], list[
             if iid not in prev:
                 newly_added.append(inc)
         for iid, prev_inc in prev.items():
-            if iid not in new_active:
-                # mute 触发的退出不算 resolved
-                if iid in muted_ids:
-                    continue
-                latest = next((x for x in incidents if x.get("id") == iid), prev_inc)
+            if iid in muted_ids:
+                continue
+            latest = observed.get(iid)
+            if latest is None:
+                new_active[iid] = {**prev_inc, "_status_unconfirmed": True}
+            elif incident_resolved(latest):
                 just_resolved.append(latest)
         _active[provider] = new_active
     return newly_added, just_resolved
@@ -268,7 +277,8 @@ def get_active_summary() -> Optional[str]:
     if not parts:
         return None
     icon = "🔴" if worst_rank >= 3 else ("🟠" if worst_rank >= 2 else "🟡")
-    return f"{icon} <b>上游故障中</b>: {' · '.join(parts)} — 进入「⚙ 系统设置 → 📡 故障订阅」查看详情"
+    pending = "（含待确认事件）" if any(i.get("_status_unconfirmed") for incs in snap.values() for i in incs) else ""
+    return f"{icon} <b>上游故障中</b>{pending}: {' · '.join(parts)} — 进入「⚙ 系统设置 → 📡 故障订阅」查看详情"
 
 
 # ─── HTTP fetch ──────────────────────────────────────────────────
@@ -355,10 +365,11 @@ def _format_resolved(provider: str, incident: dict) -> str:
 # ─── 主轮询逻辑 ──────────────────────────────────────────────────
 
 
-def _process_provider(provider: str, *, push: bool, raise_on_error: bool = False) -> None:
+def _process_provider(provider: str, *, push: bool, raise_on_error: bool = False) -> list[dict] | None:
     """拉一次该 provider 的最新 incidents 并增量推送。
 
     push=False 仅 mark_seen + 更新内存活跃表（首轮启动用，不刷屏）。
+    返回本轮成功快照供 prime/mute 清理复用；None 是未知，不是空列表。
     """
     incidents = _fetch_incidents(provider)
     if incidents is None:
@@ -428,6 +439,7 @@ def _process_provider(provider: str, *, push: bool, raise_on_error: bool = False
                 notifier.notify_event("status_alert", _format_resolved(provider, inc))
             except Exception as exc:
                 print(f"[status_monitor] notify resolved failed: {exc}")
+    return incidents
 
 
 async def monitor_loop() -> None:
@@ -457,14 +469,12 @@ async def monitor_loop() -> None:
                 if p not in TARGETS:
                     continue
                 first_time = p not in _initialized_providers
-                await asyncio.to_thread(_process_provider, p, push=not first_time)
-                _initialized_providers.add(p)
-                # 顺手收集 live id 给 mute 清理用
-                try:
-                    incs = _fetch_incidents(p) or []
+                incs = await asyncio.to_thread(_process_provider, p, push=not first_time)
+                if incs is not None:
+                    _initialized_providers.add(p)
+                    # One successful observation owns both processing and cleanup.
+                    # Failed observations never consume prime or erase user mutes.
                     live_ids[p] = {i.get("id") for i in incs if i.get("id")}
-                except Exception:
-                    pass
             if live_ids:
                 try:
                     removed = await asyncio.to_thread(_cleanup_stale_mutes, live_ids)

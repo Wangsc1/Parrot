@@ -63,7 +63,7 @@ def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
 
 
 def _finish_reason(stop_reason: Optional[str], *, saw_tool: bool) -> str:
-    if stop_reason in {"max_tokens", "model_context_window_exceeded"}:
+    if stop_reason in {"max_tokens", "model_context_window_exceeded", "pause_turn"}:
         return "length"
     if stop_reason == "refusal":
         return "content_filter"
@@ -128,6 +128,7 @@ class _ToolState:
     id: str = ""
     name: str = ""
     args: str = ""
+    initial_input: dict = field(default_factory=dict)
     started: bool = False
     emitted: bool = False
 
@@ -193,6 +194,8 @@ class StreamTranslator:
         yield b"data: [DONE]\n\n"
 
     def _handle_event(self, event_name: str, data: dict) -> Iterator[bytes]:
+        if self.state.terminal_emitted:
+            return
         typ = str(data.get("type") or event_name or "")
         if typ == "error" or isinstance(data.get("error"), dict):
             err = data.get("error") if isinstance(data.get("error"), dict) else data
@@ -216,7 +219,12 @@ class StreamTranslator:
                 st = self._tool(idx)
                 st.id = str(block.get("id") or st.id or _gen_id("call_"))
                 st.name = str(block.get("name") or st.name or "tool")
+                st.initial_input = block.get("input") if isinstance(block.get("input"), dict) else {}
                 st.started = True
+            elif block.get("type") == "text" and isinstance(block.get("text"), str) and block["text"]:
+                yield from self._emit_role()
+                self.state.text_parts.append(block["text"])
+                yield _chat_chunk(self.state, delta={"content": block["text"]}, include_usage_null=self.state.include_usage)
             return
 
         if typ == "content_block_delta":
@@ -276,7 +284,7 @@ class StreamTranslator:
                 "index": st.chat_index,
                 "id": st.id or _gen_id("call_"),
                 "type": "function",
-                "function": {"name": st.name or "tool", "arguments": st.args or "{}"},
+                "function": {"name": st.name or "tool", "arguments": st.args or json.dumps(st.initial_input, ensure_ascii=False, separators=(",", ":"))},
             }]
         }, include_usage_null=self.state.include_usage)
 
@@ -295,7 +303,7 @@ class StreamTranslator:
                 calls.append({
                     "id": st.id,
                     "type": "function",
-                    "function": {"name": st.name or "tool", "arguments": st.args or "{}"},
+                    "function": {"name": st.name or "tool", "arguments": st.args or json.dumps(st.initial_input, ensure_ascii=False, separators=(",", ":"))},
                 })
         if calls:
             msg["tool_calls"] = calls

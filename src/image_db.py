@@ -148,6 +148,12 @@ def init() -> None:
     global _conn, _db_path
     with _lock:
         path = _resolve_db_path()
+        if _conn is not None and _db_path == path:
+            try:
+                _conn.execute("SELECT 1")
+                return
+            except sqlite3.ProgrammingError:
+                pass
         os.makedirs(os.path.dirname(path), exist_ok=True)
         _conn = sqlite3.connect(path, timeout=10, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
@@ -158,7 +164,9 @@ def init() -> None:
         _ensure_migrations(_conn)
         _conn.commit()
         _db_path = path
-        cleanup_stale_running(1800)
+        # No synchronous image from the previous process can still be running.
+        # Async video bindings remain resumable and are handled by their TTL.
+        cleanup_stale_running(1800, startup=True)
         print(f"[image_db] Using {path}")
 
 
@@ -450,7 +458,7 @@ def account_top(limit: int = 5) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def cleanup_stale_running(max_age_seconds: int = 1800) -> int:
+def cleanup_stale_running(max_age_seconds: int = 1800, *, startup: bool = False) -> int:
     cutoff = time.time() - int(max_age_seconds)
     with _lock:
         now = time.time()
@@ -458,15 +466,16 @@ def cleanup_stale_running(max_age_seconds: int = 1800) -> int:
             """UPDATE image_call_logs
                SET status='failed', finished_at=?, updated_at=?, error_type='stale',
                    error_message='process ended before media call completed'
-               WHERE status='running' AND created_at < ?""",
-            (now, now, cutoff),
+               WHERE status='running' AND media_type!='video'
+                 AND (? OR created_at < ?)""",
+            (now, now, bool(startup), cutoff),
         )
         _get_conn().execute(
             """UPDATE image_attempt_logs
                SET status='failed', finished_at=?, error_type='stale',
                    error_message='process ended before image attempt completed'
-               WHERE status='running' AND started_at < ?""",
-            (now, cutoff),
+               WHERE status='running' AND (? OR started_at < ?)""",
+            (now, bool(startup), cutoff),
         )
         _get_conn().commit()
         return int(cur.rowcount or 0)

@@ -118,6 +118,11 @@ def make_stream_translator(translator_ctx: Optional[dict]):
         body = translator_ctx.get("request_body") or {}
         if stop_sequences(body):
             translator = StopSequenceStream(translator, body)
+    if translator is not None and (translator_ctx or {}).get("response_translator") == "chat_to_responses":
+        from ..openai.transform.chat_stop import ChatStopStream, sequences
+        body = translator_ctx.get("request_body") or {}
+        if sequences(body):
+            translator = ChatStopStream(translator, body)
     if translator is not None and (translator_ctx or {}).get("managed_search_chat_tools"):
         from ..search_tool_stream import ChatToolNames
         return ChatToolNames(translator)
@@ -182,13 +187,24 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
     if not isinstance(translator_ctx, dict):
         return obj
     name = translator_ctx.get("response_translator")
+    from .terminal import non_stream_terminal_error
+    upstream_protocol = translator_ctx.get("upstream_protocol") or {
+        "chat_model_alias": "openai-chat", "chat_to_responses": "openai-responses",
+        "responses_to_chat": "openai-chat", "anthropic_to_chat": "openai-chat",
+        "anthropic_to_responses": "openai-responses", "chat_to_anthropic": "anthropic",
+        "responses_to_anthropic": "anthropic",
+    }.get(name, "")
+    terminal_error = non_stream_terminal_error(obj, upstream_protocol, allow_async=not name)
+    if terminal_error:
+        raise ValueError(terminal_error)
     model = translator_ctx.get("model_for_response") or ""
     if name == "chat_model_alias":
         from .model_alias import chat_response
         return chat_response(obj, model)
     if name == "chat_to_responses":
         from ..openai.transform.chat_to_responses import translate_response as _t
-        return _t(obj, model=model)
+        from ..openai.transform.chat_stop import apply_responses_stop
+        return _t(apply_responses_stop(obj, translator_ctx.get("request_body")), model=model)
     if name == "responses_to_chat":
         from ..openai.transform.responses_to_chat import translate_response as _t2
         return _t2(
@@ -360,6 +376,20 @@ async def prepare_non_stream_response(
         )
 
     toolkit = toolkit_for_channel(channel)
+    from .terminal import non_stream_terminal_error
+    protocol = getattr(channel, "protocol", "anthropic")
+    terminal_error = non_stream_terminal_error(obj, protocol, allow_async=not (translator_ctx or {}).get("response_translator"))
+    if terminal_error:
+        return PreparedNonStreamResponse(
+            obj=obj if isinstance(obj, dict) else None,
+            restored=restored, restored_text=restored_text,
+            error=AttemptResult(
+                outcome="upstream_malformed", connect_ms=connect_ms, total_ms=total_ms,
+                error_detail=terminal_error, full_response_text=restored_text,
+                translator_ctx=translator_ctx,
+                usage=toolkit["extract_usage_json"](obj) if isinstance(obj, dict) else {},
+            ),
+        )
 
     if toolkit["is_upstream_error_json"](obj):
         code, msg = protocol_errors.extract_error_info(obj, fallback="upstream error")

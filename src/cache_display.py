@@ -31,10 +31,9 @@ def prompt_total_from_row(row: dict, *, aggregate: bool = False) -> int:
     aggregate=False: request_log 行字段 input_tokens/cache_creation_tokens/cache_read_tokens
     aggregate=True : stats_summary 聚合字段 total_prompt_tokens 优先；否则 total_* 字段
 
-    兼容说明：OpenAI 旧日志一度把 upstream usage.input_tokens（已包含 cached_tokens）
-    直接落到 input_tokens，导致再加 cache_read 会重复计数。对 OpenAI 行，如果
-    `input_tokens >= cache_read_tokens` 且 cache_creation=0，按 OpenAI 原始口径
-    直接把 input_tokens 当完整 prompt 展示；否则走统一 Anthropic 风格公式。
+    行字段遵循统一口径：input_tokens 是非缓存输入。协议名和 token 大小
+    不能证明旧记录采用“含缓存总输入”口径，因此不据此猜测或扣减。
+    历史口径转换须由有明确版本证据的读取/迁移层负责。
     """
     if aggregate:
         explicit = row.get("total_prompt_tokens")
@@ -49,9 +48,6 @@ def prompt_total_from_row(row: dict, *, aggregate: bool = False) -> int:
     inp = _to_int(row.get("input_tokens"))
     cc = _to_int(row.get("cache_creation_tokens"))
     cr = _to_int(row.get("cache_read_tokens"))
-    upstream = str(row.get("upstream_protocol") or row.get("ingress_protocol") or "")
-    if upstream.startswith("openai") and cc == 0 and cr > 0 and inp >= cr:
-        return inp
     return prompt_total(inp, cc, cr)
 
 

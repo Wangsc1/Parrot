@@ -609,6 +609,8 @@ docker compose ps            # 状态
 docker compose down          # 停止 + 删容器（数据保留在 ./data）
 ```
 
+停止时使用同一个单调时钟请求排空截止（`shutdown.drainTimeoutSeconds` 默认仍为 80 秒），到期取消并等待请求收尾，再停止真实后台 worker、验证并 flush 状态快照；第二次信号不跳过 flush。默认及安装器生成的 Compose 已设置 `stop_grace_period: 150s`，为 worker 和落盘留出余量。已有部署需自行合并此字段；不应依赖 Docker 默认约 10 秒的停止窗口。自定义更长 drain、慢盘或长外部操作时也要扩大外层宽限，不能把不可中断 I/O 或 SIGKILL 当成已完成持久化。
+
 ### 升级到最新镜像
 
 ```bash
@@ -642,7 +644,7 @@ GPT/Grok/Antigravity 图片及 Grok 视频任务使用独立日志库 `data/imag
 
 `data/runtime-cache.json` 保存可重建的评分、冷却、亲和与配额缓存；`data/durable-state.json` 同步保存 updater、状态通知、视频任务与 compaction owner 等必须持久化状态。两者都是带 schema、单调 generation 和 checksum 的 0600 原子快照，并保留一份已验证 `.bak`。`state-migration.json` 最后写入，记录旧库规范路径、主文件及 WAL/SHM/journal 指纹和成功快照 generation。
 
-`stateDbPath` 仅指向旧版只读迁移源；`runtimeStatePath` / `durableStatePath` 的默认值和相对路径始终位于可写 `DATA_DIR`，与绝对旧库所在目录无关。首次升级会在 0700 私有临时目录复制完整 SQLite 文件集并恢复 WAL/hot journal；源文件不 checkpoint、不改名、不删除。若旧版本回滚后再次写入健康的 `state.db`，下一次升级会发现指纹变化、备份当前 JSON、重新导入两份快照并最后更新 manifest。若变化后的旧库损坏或不可读，现有 verified JSON 继续权威生效，不会被任何历史备份覆盖，source revision/manifest 保持未推进并在每次重启重新检查，直到源被修复、移除或归档。请在确认不再降级前保留旧库及 sidecar/历史备份。
+`stateDbPath` 仅指向旧版只读迁移源；`runtimeStatePath` / `durableStatePath` 的默认值和相对路径始终位于可写 `DATA_DIR`，与绝对旧库所在目录无关。首次升级会在 0700 私有临时目录复制完整 SQLite 文件集并恢复 WAL/hot journal；源文件不 checkpoint、不改名、不删除。若旧版本回滚后再次写入健康的 `state.db`，下一次升级会发现内容变化、备份当前 JSON、重新导入旧 schema 实际存在的持久域并最后更新 manifest；旧 schema 不认识的 durable 域继续保留。仅 mtime/路径或 SHM 锁元数据变化不会触发重导入；复制一致性仍单独校验完整指纹。若变化后的旧库损坏或不可读，现有 verified JSON 继续权威生效，不会被任何历史备份覆盖，source revision/manifest 保持未推进并在每次重启重新检查，直到源被修复、移除或归档。请在确认不再降级前保留旧库及 sidecar/历史备份。
 
 `data/openai_response_store.db`（SQLite）独立保存 `previous_response_id` history。旧版嵌入 `state.db` 的响应按源指纹执行 `INSERT OR IGNORE`；缺表或损坏只跳过该可选导入，不阻断独立 Store。
 
@@ -665,7 +667,13 @@ systemctl start/stop/restart/status <你的unit名>
 journalctl -u <你的unit名> -f
 ```
 
-数据文件默认在源码目录下（不设 `ANTHROPIC_PROXY_DATA_DIR` 时回退到 `BASE_DIR`）。
+数据文件默认在源码目录下（不设 `ANTHROPIC_PROXY_DATA_DIR` 时回退到 `BASE_DIR`）。源码代码备份只包含代码产物，不包含配置、状态快照或自定义运行数据路径；回滚不会恢复业务数据。旧 tar 备份恢复时也按代码白名单过滤。
+
+自更新仍是「备份/拉取 → staged → 二次确认」。确认后由备份目录中的一次性、仅依赖 Python 标准库的独立监护程序负责停止/启动、核对目标版本和代码身份；导入失败也能恢复代码和本次依赖安装改变的文件，并再次验证旧版健康。依赖安装前本地复制当前解释器的安装目录（site-packages/scripts），因此需预留对应磁盘空间；不会创建新部署体系或自动提升权限。共享解释器若在 staged 后被其它程序改写，回滚拒绝覆盖冲突并明确报失败，应由管理员处理。
+
+systemd 模式通过 `systemd-run` 一次性 unit 让监护者不受被更新服务 cgroup 停止影响，要求已有运行身份具备对应调度及服务控制权限；权限不足会明确拒绝派发，不自行授权。自行编写的服务建议 `TimeoutStopSec=150s`（按 drain 与实际 worker/磁盘上限加大），不要用第二次信号代替状态收尾。裸进程模式由独立监护者发送 TERM、等待退出后重新拉起，不再绕过 lifespan 使用线程 exec。上线前仍需在自己的 unit/文件系统/解释器环境演练；本仓库隔离测试不等于真实 systemd/Docker 验收。
+
+自更新 sidecar 的健康探针使用实际 `listen.port`，并限制 curl/Engine CLI 单次时间；成功要求目标版本和镜像身份一致。手工改变容器内端口时，还需同步修改 Compose/Dockerfile 固定端口的 healthcheck 与端口映射。
 
 ---
 

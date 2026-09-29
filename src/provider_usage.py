@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from . import network, state_db
+from . import channel_state, network, state_db
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,8 @@ _SCAN_INTERVAL = 60
 _GUARD = threading.Lock()
 # Serializes registry liveness checks with cache writes/deletes so a lifecycle
 # cleanup cannot race a late worker result into recreating an orphaned row.
+# Lock order matches registry deletion: channel mutation -> usage lifecycle -> guard.
+# Never hold usage lifecycle while acquiring channel mutation in the other order.
 _LIFECYCLE_LOCK = threading.RLock()
 _SECRET_LOCK = threading.Lock()
 _SECRET_CACHE: bytes | None = None
@@ -557,7 +559,7 @@ def cleanup_account_if_orphaned(aid: str | None) -> bool:
     """Delete cache/runtime only after the final live channel stops sharing aid."""
     if not aid:
         return False
-    with _LIFECYCLE_LOCK:
+    with channel_state.mutation_lock, _LIFECYCLE_LOCK:
         if _still_live(aid):
             return False
         state_db.provider_usage_delete(aid)
@@ -644,7 +646,7 @@ async def _worker(worker_id: int) -> None:
                 now_ms = int(time.time() * 1000)
                 retry_seconds = int(snap.pop("_retry_after_seconds", 0) or 0)
                 retry_at = now_ms + retry_seconds * 1000 if retry_seconds else 0
-                with _LIFECYCLE_LOCK:
+                with channel_state.mutation_lock, _LIFECYCLE_LOCK:
                     if _still_live(job.account_id):
                         state_db.provider_usage_save_success(
                             job.account_id, job.spec.adapter, snap,
@@ -671,7 +673,7 @@ async def _worker(worker_id: int) -> None:
                 elif isinstance(exc, RuntimeError) and str(exc) in {"上游拒绝当前 Key", "上游请求频率受限", "上游服务暂时不可用", "上游请求超时"}:
                     msg = str(exc)
                 retry_at = now_ms + (retry if retry is not None else 60) * 1000
-                with _LIFECYCLE_LOCK:
+                with channel_state.mutation_lock, _LIFECYCLE_LOCK:
                     if _still_live(job.account_id):
                         state_db.provider_usage_save_error(job.account_id, job.spec.adapter, msg, retry_at)
                         with _GUARD:

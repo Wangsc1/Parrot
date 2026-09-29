@@ -88,6 +88,8 @@ def _run(case: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any
     def process(provider, push=False):
         events.append(["process", provider, push])
         if rt.get("processFailure"): raise RuntimeError(rt["processFailure"])
+        # Successful processing now returns its observed snapshot; None means unknown.
+        return deepcopy(rt.get("recent", {}).get(provider, []))
     def recent(provider, limit=5):
         if provider in rt.get("recentFailure", {}): raise RuntimeError(rt["recentFailure"][provider])
         events.append(["recent", provider, limit]); return deepcopy(rt.get("recent", {}).get(provider, []))

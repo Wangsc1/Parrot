@@ -142,6 +142,7 @@ class CursorSession:
             for item in remaining:
                 self.events.put(SessionEvent(type="toolCall", exec=item))
             self.batch_state = "flushed"
+            self._reset_inactivity()
             self._flushed = list(remaining)
             self.events.put(SessionEvent(type="batchReady"))
         else:
@@ -321,6 +322,7 @@ class CursorSession:
             and self.state.checkpoint_after_exec
         ):
             self.batch_state = "flushed"
+            self._reset_inactivity()
             self.state.checkpoint_after_exec = False
             self._flushed = list(self.pending_execs)
             self.events.put(SessionEvent(type="batchReady"))

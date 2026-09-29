@@ -37,11 +37,11 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src import (
     __version__, drain,
-    affinity, apikey_limiter, auth, compact_rescue, config, cooldown,
+    affinity, apikey_limiter, auth, config, cooldown,
     errors, failover, fingerprint, image_db, load_balancing, log_db,
     model_mapping, model_metadata, model_pricing, model_state, model_validation, network,
     network_monitor, notifier, oauth_manager, probe, provider_usage, public_ip, scheduler, scorer,
-    state_db, status_monitor, token_counter, translation, update_checker, updater,
+    state_db, status_monitor, translation, update_checker, updater,
     upstream,
 )
 from src.channel import registry
@@ -64,7 +64,6 @@ from src.management_auth import (
 from src.management_control import OperationRegistry, OperationStore, StoreAuditSink
 from src.management_control.composition import ManagementControls
 from src import mcp
-from src.protocols import errors as protocol_errors
 from src.openai.codex_constants import codex_cli_version
 from src.openai.transform.guard import GuardError, guard_collection_fields
 from src.transform.cc_mimicry import (
@@ -590,6 +589,8 @@ async def lifespan(app: FastAPI):
             started_ns=background_started_ns,
             count=len(_background_tasks),
         )
+        updater.start()
+        update_checker.start()
         # 自更新：若进程是被自更新重启拉起的，恢复流程做健康检查/回滚
         try:
             with startup_timing.phase("lifespan.updater-resume"):
@@ -641,7 +642,9 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     pass
             drain.begin("lifespan_shutdown")
-            timeout = drain.shutdown_timeout_seconds()
+            updater.begin_shutdown()
+            update_checker.begin_shutdown()
+            timeout = drain.remaining_seconds()
             drained = await drain.wait_for_zero(timeout)
             if not drained:
                 print(f"[drain] lifespan shutdown timeout active={drain.active_count()} timeout={timeout}s")
@@ -654,9 +657,15 @@ async def lifespan(app: FastAPI):
             await _close_management_runtime(app)
             # Provider workers may mutate state; stop them before the final snapshot.
             await provider_usage.stop()
-            await upstream.close_client()
-            cursor_bridge_runtime.stop()
-            _finalize_state_store()
+            # Cancelling to_thread wrappers does not stop their workers.
+            # Join update/check workers before taking their StateStore away.
+            await update_checker.stop()
+            await updater.stop()
+            try:
+                await upstream.close_client()
+                cursor_bridge_runtime.stop()
+            finally:
+                _finalize_state_store()
     finally:
         if not management_close_started:
             management_close_started = True
@@ -972,72 +981,6 @@ def _first_route_channel_and_model(result) -> tuple[object | None, str | None]:
     for ch, resolved in list(getattr(result, "candidates", []) or []) + list(getattr(result, "saturated", []) or []):
         return ch, resolved
     return None, None
-
-
-def _channel_uses_max_context(ch: object, body: dict, resolved_model: str | None) -> bool:
-    """Whether this candidate will use its account/model Max Context tier."""
-    check = getattr(ch, "uses_max_context", None)
-    if not callable(check):
-        return False
-    try:
-        return bool(check(body, str(resolved_model or "")))
-    except Exception:
-        return False
-
-
-def _anthropic_to_openai_context_preflight(body: dict, result) -> dict | None:
-    """Return context overflow info for Anthropic→OpenAI cross-family calls.
-
-    Claude Code may believe a Claude-facing endpoint has a 1M context window even
-    when Parrot routes it to an OpenAI-family model with a smaller real window.
-    When model metadata is available, fail early with a Claude-Code-friendly
-    context_length_exceeded error so the client triggers its own autocompact.
-    """
-    if compact_rescue.is_claude_code_compact_request(body):
-        return None
-    routes = list(getattr(result, "candidates", []) or []) + list(
-        getattr(result, "saturated", []) or []
-    )
-    # This compatibility preflight is request-global. With multiple candidates,
-    # only the final per-candidate wire guard may reject a route: the next one
-    # can have a larger effective budget (including a currently queued route).
-    if len(routes) != 1:
-        return None
-    ch, resolved_model = routes[0]
-    if getattr(ch, "protocol", "anthropic") == "anthropic":
-        return None
-    metadata_model = str(
-        body.get("_client_visible_model") or body.get("model") or ""
-    ).strip()
-    budget = model_metadata.effective_request_budget(
-        metadata_model,
-        scope_key=str(getattr(ch, "key", "") or ""),
-        outbound_model=str(resolved_model or ""),
-        request_shape=body,
-        use_max_context=_channel_uses_max_context(ch, body, resolved_model),
-    )
-    safe_limit = budget.effective_input_budget
-    if not metadata_model or safe_limit is None or safe_limit <= 0:
-        return None
-    prompt_tokens = token_counter.count_request_tokens(body, model=metadata_model)
-    # Only the input side is judged here. A requested output limit above the
-    # route's maxOutputTokens is clamped per candidate in failover
-    # (_candidate_budget_body); rejecting it here would report a bogus
-    # "Prompt is too long: N > M" with N < M whenever a single route remains.
-    if prompt_tokens <= safe_limit:
-        return None
-    msg = protocol_errors.context_length_error_message_for_claude_code(
-        "context_length_exceeded: Your input exceeds the context window of this model. "
-        "Please adjust your input and try again.",
-        actual_tokens=prompt_tokens,
-        max_tokens=safe_limit,
-    )
-    return {
-        "message": msg,
-        "model": metadata_model,
-        "prompt_tokens": prompt_tokens,
-        "safe_limit": safe_limit,
-    }
 
 
 def _sanitize_headers(headers: dict) -> dict:
@@ -1523,28 +1466,10 @@ async def proxy_messages(request: Request):
         )
         return errors.json_error_response(status, err_type, msg)
 
-    preflight = _anthropic_to_openai_context_preflight(body, result)
-    if preflight:
-        msg = preflight["message"]
-        await asyncio.to_thread(
-            log_db.finish_error,
-            request_id,
-            msg,
-            0,
-            http_status=400,
-            total_ms=int((time.monotonic() - start_monotonic) * 1000),
-            affinity_hit=(1 if result.affinity_hit else 0),
-        )
-        print(
-            f"[context-guard] {client_ip} {key_name} → {model} routed_model={preflight['model']} "
-            f"prompt_tokens≈{preflight['prompt_tokens']} safe_limit={preflight['safe_limit']}"
-        )
-        return errors.json_error_response(
-            400,
-            errors.ErrType.INVALID_REQUEST,
-            msg,
-            code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
-        )
+    # Local token estimates are advisory, not a request-wide hard input cap.
+    # Adapters may discard opaque history before sending it, and only the
+    # upstream can judge its tokenizer's actual input limit. Output clamping
+    # and compact-rescue planning remain in their per-candidate paths.
 
     ts = time.strftime("%H:%M:%S", time.localtime(start_time))
     _first_list = result.candidates or result.saturated
@@ -1592,6 +1517,8 @@ class _DrainAwareServer(uvicorn.Server):
         super().__init__(*args, **kwargs)
         self._drain_loop: asyncio.AbstractEventLoop | None = None
         self._drain_shutdown_task: asyncio.Task | None = None
+        if self.config.timeout_graceful_shutdown is None:
+            self.config.timeout_graceful_shutdown = drain.shutdown_timeout_seconds()
 
     @contextmanager
     def capture_signals(self):  # pragma: no cover - exercised by live process
@@ -1609,13 +1536,16 @@ class _DrainAwareServer(uvicorn.Server):
         signame = signal.Signals(sig).name
         if self._drain_shutdown_task is not None and not self._drain_shutdown_task.done():
             print(f"[drain] received {signame} again; forcing immediate shutdown")
-            self.force_exit = True
+            drain.expedite()
+            self._drain_shutdown_task.cancel()
             self.should_exit = True
             return
         if self.should_exit:
-            self.force_exit = True
+            drain.expedite()
             return
         drain.begin(f"signal:{signame}")
+        updater.begin_shutdown()
+        update_checker.begin_shutdown()
         loop = self._drain_loop
         if loop is None or not loop.is_running():
             self.should_exit = True
@@ -1628,7 +1558,7 @@ class _DrainAwareServer(uvicorn.Server):
         self._drain_shutdown_task = asyncio.create_task(self._stop_after_drain(signame))
 
     async def _stop_after_drain(self, signame: str) -> None:
-        timeout = drain.shutdown_timeout_seconds()
+        timeout = drain.remaining_seconds()
         active = drain.active_count()
         if active:
             print(f"[drain] received {signame}; waiting active={active} timeout={timeout}s")
@@ -1638,6 +1568,30 @@ class _DrainAwareServer(uvicorn.Server):
         else:
             print(f"[drain] timeout; forcing server stop signame={signame} active={drain.active_count()}")
         self.should_exit = True
+
+    async def shutdown(self, sockets=None) -> None:
+        """Share the drain deadline; cancel/join requests before lifespan flush.
+
+        Uvicorn's stock shutdown cancels tasks but does not join their finalizers.
+        A second signal expedites requests, never skips durable-state cleanup.
+        """
+        drain.begin("uvicorn_shutdown")
+        updater.begin_shutdown()
+        update_checker.begin_shutdown()
+        for listener in self.servers:
+            listener.close()
+        for sock in sockets or ():
+            sock.close()
+        for connection in list(self.server_state.connections):
+            connection.shutdown()
+        try:
+            await asyncio.wait_for(self._wait_tasks_to_complete(), drain.remaining_seconds())
+        except asyncio.TimeoutError:
+            tasks = list(self.server_state.tasks)
+            for task in tasks:
+                task.cancel("Parrot drain deadline exceeded")
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.lifespan.shutdown()
 
 
 async def _serve_with_graceful_drain(server: uvicorn.Server) -> None:

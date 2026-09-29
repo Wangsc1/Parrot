@@ -91,9 +91,11 @@ class ModuleStatusGateway:
     def refresh_provider(self, provider: str, *, raise_on_error: bool = False) -> None:
         first = provider not in status_monitor._initialized_providers
         if raise_on_error:
-            status_monitor._process_provider(provider, push=not first, raise_on_error=True)
+            snapshot = status_monitor._process_provider(provider, push=not first, raise_on_error=True)
         else:
-            status_monitor._process_provider(provider, push=not first)
+            snapshot = status_monitor._process_provider(provider, push=not first)
+        if snapshot is None:
+            raise RuntimeError("Status refresh failed")
         status_monitor._initialized_providers.add(provider)
 
     def list_recent(self, provider: str, limit: int, *, raise_on_error: bool = False) -> list[dict[str, Any]]:
@@ -153,7 +155,7 @@ class StatusAlertControl:
     @staticmethod
     def _effective(root: dict[str, Any]) -> dict[str, Any]:
         raw = root.get("statusMonitor") or {}
-        targets = raw.get("targets") or list(STATUS_PROVIDERS)
+        targets = raw.get("targets", list(STATUS_PROVIDERS))
         notifications = root.get("notifications") or {}
         events = notifications.get("events") or {}
         return {
@@ -295,9 +297,20 @@ class StatusAlertControl:
     def refresh_direct(self, context: ManagementContext) -> int:
         require(context, Capability.WRITE)
         targets = self.get_settings(context).targets
+        failure: Exception | None = None
         for provider in targets:
             if provider in STATUS_PROVIDERS:
-                self._status.refresh_provider(provider)
+                try:
+                    self._status.refresh_provider(provider)
+                except Exception as exc:
+                    # TG refresh remains best effort across all selected targets.
+                    # Report failure after the pass without consuming failed prime
+                    # or replacing that provider's last valid snapshot.
+                    if failure is None:
+                        failure = exc
+        if failure is not None:
+            audit(self._audit_sink, context, action="status-alerts.refresh", target="status-alerts", result="failed")
+            raise failure
         audit(self._audit_sink, context, action="status-alerts.refresh", target="status-alerts")
         return len(targets)
 

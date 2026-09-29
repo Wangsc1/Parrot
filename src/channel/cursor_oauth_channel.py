@@ -333,6 +333,10 @@ class CursorOAuthChannel(OpenAIApiChannel):
         if anchor:
             material = f"{_request_api_key_name(requested_body)}:{anchor}".encode("utf-8")
             request.headers[cursor_runtime._SESSION_HEADER] = hashlib.sha256(material).hexdigest()
+        # Principal is a trusted routing fact, independent of user/cache anchors.
+        request.headers[cursor_runtime._PRINCIPAL_HEADER] = hashlib.sha256(
+            _request_api_key_name(requested_body).encode("utf-8")
+        ).hexdigest()
         request.headers[cursor_runtime._ACCOUNT_HEADER] = self.account_key
         request.headers["Authorization"] = f"Bearer {cursor_runtime.bearer_secret()}"
         request.body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
