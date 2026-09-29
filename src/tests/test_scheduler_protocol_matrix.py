@@ -196,7 +196,7 @@ def test_filter_candidates_records_guard_reason_for_non_user_anthropic_image(mon
     assert result.guard_error == "Anthropic→OpenAI Chat image input is only enabled for user messages: assistant:image"
 
 
-def test_responses_custom_tool_declaration_keeps_only_native_candidate(monkeypatch):
+def test_responses_text_custom_tool_declaration_keeps_anthropic_fallback(monkeypatch):
     channels = [_ch("a", "anthropic"), _ch("r", "openai-responses")]
     monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
     monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
@@ -205,13 +205,11 @@ def test_responses_custom_tool_declaration_keeps_only_native_candidate(monkeypat
     body = {"model": "m", "input": "hi", "tools": [{"type": "custom", "name": "shell"}]}
     available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
 
-    assert [ch.key for ch, _ in available] == ["r"]
+    assert [ch.key for ch, _ in available] == ["a", "r"]
     assert saturated == []
-    assert ("r", "real") in plans
-    assert ("a", "real") not in plans
-    assert guards == [
-        "OpenAI Responses→Anthropic custom tools/calls are not enabled yet: custom_tool_declaration",
-    ]
+    assert plans[("r", "real")].cost == 0
+    assert plans[("a", "real")].required_transforms == ["responses_to_anthropic"]
+    assert guards == []
 
 
 def test_responses_safe_custom_tool_history_keeps_anthropic_fallback(monkeypatch):
@@ -420,7 +418,7 @@ def test_x_search_history_candidate_binding_distinguishes_real_custom_and_mixed_
         }],
     }
     available, _, _, _ = scheduler._filter_candidates("m", "responses", body=ordinary_custom)
-    assert [ch.key for ch, _ in available] == ["api-r"]
+    assert [ch.key for ch, _ in available] == ["api-r", "anthropic"]
 
     mixed = {"model": "m", "input": [
         {"type": "x_search_call", "id": "xs_1", "status": "completed"},
@@ -451,7 +449,7 @@ def test_responses_include_only_encrypted_reasoning_can_fallback(monkeypatch):
     assert guards == []
 
 
-def test_responses_encrypted_reasoning_input_can_fallback_to_chat(monkeypatch):
+def test_responses_encrypted_reasoning_input_can_fallback_to_chat_and_anthropic(monkeypatch):
     channels = [_ch("a", "anthropic"), _ch("c", "openai-chat"), _ch("r", "openai-responses")]
     monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
     monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
@@ -460,14 +458,12 @@ def test_responses_encrypted_reasoning_input_can_fallback_to_chat(monkeypatch):
     body = {"model": "m", "input": [{"type": "reasoning", "encrypted_content": "gAAAA"}]}
     available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
 
-    assert [ch.key for ch, _ in available] == ["c", "r"]
+    assert [ch.key for ch, _ in available] == ["a", "c", "r"]
     assert saturated == []
     assert ("r", "real") in plans
     assert ("c", "real") in plans
-    assert ("a", "real") not in plans
-    assert guards == [
-        "OpenAI Responses→Anthropic include reasoning.encrypted_content / encrypted reasoning replay is not enabled yet",
-    ]
+    assert plans[("a", "real")].required_transforms == ["responses_to_anthropic"]
+    assert guards == []
 
 
 def test_responses_encrypted_reasoning_replay_routes_to_xai_oauth(monkeypatch):

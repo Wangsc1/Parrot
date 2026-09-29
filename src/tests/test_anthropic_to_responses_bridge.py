@@ -42,7 +42,7 @@ def test_translate_request_text_image_tools_and_history_lifting():
     assert out["instructions"] == "You are helpful."
     assert out["max_output_tokens"] == 100
     assert out["temperature"] == 0.2
-    assert out["tools"] == [{"type": "function", "name": "lookup", "parameters": {"type": "object"}, "description": "Lookup"}]
+    assert out["tools"] == [{"type": "function", "name": "lookup", "parameters": {"type": "object"}, "description": "Lookup", "strict": False}]
     assert out["tool_choice"] == {"type": "function", "name": "lookup"}
     assert out["parallel_tool_calls"] is False
 
@@ -116,7 +116,7 @@ def test_translate_request_preserves_user_documents():
         "content": [
             {"type": "input_text", "text": "read"},
             {"type": "input_text", "text": "Document context: customer contract"},
-            {"type": "input_file", "file_data": "JVBERi0xLjQ=", "filename": "brief.pdf"},
+            {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0xLjQ=", "filename": "brief.pdf"},
             {"type": "input_file", "file_url": "https://example.com/remote.pdf", "filename": "remote.pdf"},
         ],
     }]
@@ -153,7 +153,7 @@ def test_translate_request_preserves_tool_result_attachments():
         "output": [
             {"type": "input_text", "text": "see attached"},
             {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"},
-            {"type": "input_file", "file_data": "JVBERi0xLjQ=", "filename": "brief.pdf"},
+            {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0xLjQ=", "filename": "brief.pdf"},
             {"type": "input_text", "text": "Document context: remote contract"},
             {"type": "input_file", "file_url": "https://example.com/remote.pdf", "filename": "remote.pdf"},
         ],
@@ -328,13 +328,11 @@ def test_translate_request_allows_claude_code_system_message_role():
     }
 
 
-def test_translate_request_allows_stream_but_guards_stateful_thinking_and_builtin_tools():
+def test_translate_request_allows_stream_and_omits_foreign_thinking_but_guards_builtin_tools():
     streamed = anthropic_to_responses.translate_request({"stream": True, "messages": []})
     assert streamed["stream"] is True
-    with pytest.raises(GuardError):
-        anthropic_to_responses.translate_request({"messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}]}]})
-    with pytest.raises(GuardError):
-        anthropic_to_responses.translate_request({"messages": [{"role": "assistant", "content": [{"type": "redacted_thinking", "data": "opaque"}]}]})
+    assert anthropic_to_responses.translate_request({"messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}]}]})["input"] == []
+    assert anthropic_to_responses.translate_request({"messages": [{"role": "assistant", "content": [{"type": "redacted_thinking", "data": "opaque"}]}]})["input"] == []
     with pytest.raises(GuardError):
         anthropic_to_responses.translate_request({"messages": [{"role": "assistant", "content": [{
             "type": "image",
@@ -368,7 +366,7 @@ def test_translate_request_allows_stream_but_guards_stateful_thinking_and_builti
         "content": "failed",
         "is_error": True,
     }]}]})
-    assert errored_tool["input"] == [{"type": "function_call_output", "call_id": "call_1", "output": "failed"}]
+    assert errored_tool["input"] == [{"type": "function_call_output", "call_id": "call_1", "output": "[Tool execution failed]\nfailed"}]
     with pytest.raises(GuardError):
         anthropic_to_responses.translate_request({"context_management": {"clear_function_results": True}, "messages": []})
     with pytest.raises(GuardError):
@@ -480,8 +478,7 @@ def test_matrix_allows_safe_anthropic_to_responses_and_guards_unsafe_cases():
     assert doc_plan.required_transforms == ["anthropic_to_responses"]
 
     thinking = {"messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}]}]}
-    with pytest.raises(ProtocolGuardError):
-        DEFAULT_MATRIX.plan("anthropic", "openai-responses", features=extract_request_features("anthropic", thinking))
+    assert DEFAULT_MATRIX.plan("anthropic", "openai-responses", features=extract_request_features("anthropic", thinking)).required_transforms == ["anthropic_to_responses"]
 
     assistant_image = {"messages": [{"role": "assistant", "content": [{
         "type": "image",
@@ -619,7 +616,7 @@ def test_failover_non_stream_translator_returns_anthropic_message():
     assert out["stop_reason"] == "end_turn"
 
 
-def test_translate_response_drops_optional_empty_string_tool_args_by_schema():
+def test_translate_response_preserves_legal_optional_empty_string_tool_args():
     request_body = {
         "tools": [{
             "name": "GenericTool",
@@ -652,8 +649,12 @@ def test_translate_response_drops_optional_empty_string_tool_args_by_schema():
         "type": "tool_use",
         "id": "call_1",
         "name": "GenericTool",
-        "input": {"query": "x"},
+        "input": {"query": "x", "optional_note": ""},
     }]
+    # Only an explicit schema rejection permits this compatibility omission.
+    request_body["tools"][0]["input_schema"]["properties"]["optional_note"]["minLength"] = 1
+    strict = anthropic_to_responses.translate_response(resp, request_body=request_body)
+    assert strict["content"][0]["input"] == {"query": "x"}
 
 
 def test_translate_response_preserves_required_empty_and_nonempty_optional_tool_args():

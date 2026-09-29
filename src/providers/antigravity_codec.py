@@ -4,16 +4,20 @@ Channel converts ingress Responses-like payloads into Cloud Code envelopes.
 The adapter restores Gemini JSON / candidates SSE into standard Responses
 JSON / SSE *before* Parrot's Responses toolkit sees the bytes.
 
-Text deltas are snapshot-aware: if a later part starts with the previous
-text, only the suffix is emitted (cumulative Gemini). Otherwise the new
-text is treated as an incremental delta.
+Bare generateContent SSE uses incremental text, as in Google's public API.
+Cloud Code's private stream contract is not established by our fixtures:
+wrapped responses retain the old snapshot-aware compatibility path. Callers
+with a verified contract can select delta or cumulative mode explicitly;
+content prefixes never select the public protocol.
 """
 
 from __future__ import annotations
 
+import codecs
 import copy
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
@@ -335,8 +339,101 @@ def _tool_choice_config(tool_choice: Any, names: list[str]) -> dict[str, Any] | 
     return None
 
 
+def prepare_responses_request(payload: dict, *, api_key_name: str = "") -> tuple[dict, Any]:
+    """Resolve local Responses state and flatten ordinary namespace functions.
+
+    Reuse the tenant-checked Store/reference resolver and reversible tool-name
+    map rather than pretending Gemini has OpenAI's server-side state. This is
+    a provider-boundary operation, before the target allowlist removes fields.
+    """
+    from ..openai.transform import guard, responses_to_chat, responses_to_anthropic as bridge
+
+    def fail(message: str, param: str) -> None:
+        raise guard.GuardError(400, "invalid_request_error", message, param=param, scope="candidate")
+
+    for key in ("conversation", "background"):
+        if payload.get(key):
+            fail(f"Antigravity has no OpenAI {key} backend; use local previous_response_id or explicit input", key)
+    prepared = copy.deepcopy(payload)
+    items = responses_to_chat.resolve_input_items(payload, api_key_name=api_key_name)
+    for item in items:
+        if not isinstance(item, dict):
+            fail("Gemini input items must be objects", "input")
+        typ = item.get("type") or ("message" if item.get("role") else "")
+        if typ not in {"message", "reasoning", "function_call", "function_call_output"}:
+            fail(f"Antigravity cannot replay OpenAI input type {typ!r} as Gemini content", "input")
+        if typ == "function_call" and not _complete_call(item):
+            fail("Cannot replay malformed function_call arguments as Gemini Struct", "input")
+        if typ == "message" and isinstance(item.get("content"), list):
+            for part in item["content"]:
+                if not isinstance(part, dict):
+                    continue
+                nested = part.get("file") if isinstance(part.get("file"), dict) else {}
+                if part.get("file_id") or nested.get("file_id"):
+                    fail("OpenAI file_id has no local Gemini file content; provide file_data or file_url", "input")
+    tools = prepared.get("tools") or []
+    # Only ordinary client functions are promised here. Hosted tools and
+    # custom/grammar tools need their own execution/validation contract.
+    for tool in tools:
+        if not isinstance(tool, dict):
+            fail("Gemini tools must be objects", "tools")
+        typ = tool.get("type") or "function"
+        if typ == "namespace":
+            if any(not isinstance(child, dict) or child.get("type", "function") != "function"
+                   for child in tool.get("tools") or []):
+                fail("Antigravity namespace children must be ordinary function tools", "tools")
+            if tool.get("description"):
+                for child in tool.get("tools") or []:
+                    child["description"] = str(tool["description"]) + "\n" + str(child.get("description") or "")
+        elif typ == "custom":
+            fail("Antigravity requires JSON-schema function tools; custom tool format conversion is not implemented", "tools")
+        elif typ != "function":
+            fail(f"Antigravity has no execution backend for OpenAI tool type {typ!r}", "tools")
+    plan = bridge.NamespaceToolMap()
+    prepared["tools"] = bridge._flatten_response_tools(tools, plan)
+    prepared["tool_choice"] = bridge._map_tool_choice(prepared.get("tool_choice"), plan)
+    choice = prepared["tool_choice"]
+    if isinstance(choice, dict) and choice.get("type") == "allowed_tools":
+        selected = {tool["name"] for tool in choice["tools"]}
+        prepared["tools"] = [tool for tool in prepared["tools"] if tool["name"] in selected]
+        mode = choice.get("mode", "auto")
+        if mode not in {"auto", "required"}:
+            fail("allowed_tools mode must be auto or required", "tool_choice")
+        # Gemini's AUTO has no reliable subset restriction; expose exactly the
+        # permitted declarations instead of silently widening allowed tools.
+        prepared["tool_choice"] = mode
+    prepared["input"] = bridge._map_namespaced_history(items, plan)
+    prepared.pop("previous_response_id", None)
+    return prepared, plan
+
+
+def _restore_tool_identity(item: dict, plan: Any = None) -> dict:
+    if plan is None:
+        return item
+    from ..openai.transform.responses_to_anthropic import restore_output_item
+    return restore_output_item(item, plan)
+
+
 def responses_to_gemini(payload: dict) -> dict[str, Any]:
-    """Convert an internal Responses-like request into Gemini generateContent."""
+    """Convert an internal Responses-like request into Gemini generateContent.
+
+    Channel callers prepare once and retain the returned identity map for
+    response restoration. Direct callers still must not silently lose local
+    references or namespace declarations.
+    """
+    raw_items = payload.get("input")
+    needs_prepare = payload.get("previous_response_id") or payload.get("conversation") or payload.get("background")
+    needs_prepare = needs_prepare or any(
+        isinstance(tool, dict) and tool.get("type") not in {None, "function"}
+        for tool in payload.get("tools") or []
+    )
+    if isinstance(raw_items, list):
+        needs_prepare = needs_prepare or any(
+            isinstance(item, dict) and (item.get("namespace") or item.get("type") == "item_reference")
+            for item in raw_items
+        )
+    if needs_prepare:
+        payload, _ = prepare_responses_request(payload, api_key_name=str(payload.get("_api_key_name") or ""))
     contents: list[dict[str, Any]] = []
     system_parts: list[dict[str, str]] = []
     call_names: dict[str, str] = {}
@@ -348,7 +445,9 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
         system_parts.append({"text": instructions})
 
     raw_input = payload.get("input")
-    items = list(raw_input) if isinstance(raw_input, list) else []
+    items = ([{"type": "message", "role": "user", "content": raw_input}]
+             if isinstance(raw_input, str)
+             else list(raw_input) if isinstance(raw_input, list) else [])
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -589,7 +688,9 @@ def unwrap_cloud_code(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     inner = payload.get("response")
-    if isinstance(inner, dict) and ("candidates" in inner or "usageMetadata" in inner or "error" in inner):
+    if isinstance(inner, dict) and any(key in inner for key in (
+        "candidates", "usageMetadata", "usage_metadata", "error", "promptFeedback", "prompt_feedback",
+    )):
         return inner
     return payload
 
@@ -599,12 +700,15 @@ def _usage_from_gemini(meta: Any) -> dict[str, Any] | None:
         return None
     prompt = int(meta.get("promptTokenCount") or 0)
     candidates = int(meta.get("candidatesTokenCount") or 0)
-    total = int(meta.get("totalTokenCount") or (prompt + candidates))
     cached = int(meta.get("cachedContentTokenCount") or 0)
     thoughts = int(meta.get("thoughtsTokenCount") or 0)
+    output = candidates + thoughts
+    # An explicit upstream total (even zero) is authoritative, not a checksum
+    # to be overwritten when other provider accounting components differ.
+    total = int(meta["totalTokenCount"]) if meta.get("totalTokenCount") is not None else prompt + output
     return {
         "input_tokens": prompt,
-        "output_tokens": candidates,
+        "output_tokens": output,
         "total_tokens": total,
         "input_tokens_details": {"cached_tokens": cached},
         "output_tokens_details": {"reasoning_tokens": thoughts},
@@ -613,11 +717,68 @@ def _usage_from_gemini(meta: Any) -> dict[str, Any] | None:
 
 def _finish_to_status(reason: str | None) -> tuple[str, dict | None]:
     value = str(reason or "").upper()
+    if value == "STOP":
+        return "completed", None
     if value in {"MAX_TOKENS", "LENGTH"}:
         return "incomplete", {"reason": "max_output_tokens"}
-    if value in {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "RECITATION"}:
+    if value in {
+        "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "RECITATION", "SPII",
+        "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION", "ESCALATION",
+    }:
         return "incomplete", {"reason": "content_filter"}
-    return "completed", None
+    if value in {
+        "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "MISSING_THOUGHT_SIGNATURE",
+        "MALFORMED_RESPONSE", "PUP_LIMITED_DISABLED",
+    }:
+        return "failed", None
+    # Responses has no standard incomplete reason for EOF / unknown Gemini
+    # reasons. Inventing one lets downstream bridges mistake it for normal
+    # stop. Use an explicit failure, retaining recoverable output items.
+    return "failed", None
+
+
+def _terminal_details(reason: str | None, feedback: Any, error: Any = None):
+    status, incomplete = _finish_to_status(reason)
+    response_error = None
+    if isinstance(feedback, dict):
+        block = feedback.get("blockReason") or feedback.get("block_reason")
+        if block and block != "BLOCK_REASON_UNSPECIFIED":
+            status, incomplete = "incomplete", {"reason": "content_filter"}
+    if error is not None:
+        err = error if isinstance(error, dict) else {"message": str(error)}
+        status, incomplete = "failed", None
+        response_error = {
+            "message": str(err.get("message") or "antigravity error"),
+            "code": str(err.get("status") or err.get("code") or "api_error"),
+        }
+    elif status == "failed":
+        response_error = {
+            "code": "gemini_" + str(reason).lower() if reason else "upstream_stream_incomplete",
+            "message": f"Gemini generation ended with {reason}" if reason else "Gemini response ended without finishReason",
+        }
+    return status, incomplete, response_error
+
+
+def _complete_call(item: dict) -> bool:
+    if not item.get("name"):
+        return False
+    try:
+        return isinstance(json.loads(item.get("arguments") or ""), dict)
+    except (ValueError, TypeError):
+        return False
+
+
+def _provider_metadata(reason=None, feedback=None, error=None, finish_message=None) -> dict:
+    details = {}
+    if reason:
+        details["finishReason"] = reason
+    if finish_message:
+        details["finishMessage"] = finish_message
+    if feedback is not None:
+        details["promptFeedback"] = copy.deepcopy(feedback)
+    if error is not None:
+        details["error"] = copy.deepcopy(error)
+    return {"gemini": details}
 
 
 def _inline_image_part(part: dict) -> dict[str, Any] | None:
@@ -705,32 +866,28 @@ def gemini_parts_to_output_items(parts: list[Any]) -> list[dict[str, Any]]:
     return items
 
 
-def gemini_to_responses(payload: dict, *, model: str) -> dict[str, Any]:
+def gemini_to_responses(payload: dict, *, model: str, namespace_tool_map: Any = None) -> dict[str, Any]:
     data = unwrap_cloud_code(payload)
-    if data.get("error"):
-        err = data["error"] if isinstance(data["error"], dict) else {"message": str(data["error"])}
-        return {
-            "id": _gen_id("resp_"),
-            "object": "response",
-            "created_at": int(time.time()),
-            "status": "failed",
-            "error": {
-                "message": str(err.get("message") or "antigravity error"),
-                "code": str(err.get("status") or err.get("code") or "api_error"),
-            },
-            "model": model,
-            "output": [],
-            "output_text": "",
-            "usage": None,
-        }
     candidate = {}
     candidates = data.get("candidates")
     if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
         candidate = candidates[0]
     content = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
     parts = content.get("parts") if isinstance(content.get("parts"), list) else []
-    items = gemini_parts_to_output_items(parts)
-    status, incomplete = _finish_to_status(candidate.get("finishReason") or candidate.get("finish_reason"))
+    items = [_restore_tool_identity(item, namespace_tool_map) for item in gemini_parts_to_output_items(parts)]
+    reason = candidate.get("finishReason") or candidate.get("finish_reason")
+    feedback = data.get("promptFeedback", data.get("prompt_feedback"))
+    error = data.get("error", payload.get("error"))
+    invalid_calls = [it for it in items if it["type"] == "function_call" and not _complete_call(it)]
+    if invalid_calls and reason == "STOP" and error is None:
+        error = {"code": "gemini_malformed_function_call", "message": "Invalid Gemini function call arguments"}
+    status, incomplete, response_error = _terminal_details(reason, feedback, error)
+    for item in items:
+        if item["type"] == "function_call":
+            if item in invalid_calls or reason in {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"}:
+                item["status"] = "incomplete"
+        elif status != "completed":
+            item["status"] = "incomplete"
     output_text = "".join(
         (it.get("content") or [{}])[0].get("text", "")
         for it in items
@@ -741,8 +898,9 @@ def gemini_to_responses(payload: dict, *, model: str) -> dict[str, Any]:
         "object": "response",
         "created_at": int(time.time()),
         "status": status,
-        "error": None,
+        "error": response_error,
         "incomplete_details": incomplete,
+        "provider_metadata": _provider_metadata(reason, feedback, error, candidate.get("finishMessage")),
         "model": model,
         "output": items,
         "output_text": output_text,
@@ -757,7 +915,19 @@ def _emit(event: str, data: dict) -> bytes:
 class GeminiStreamToResponses:
     """Convert Gemini / Cloud Code candidates SSE into Responses SSE."""
 
-    def __init__(self, *, model: str, request_body: dict | None = None):
+    def __init__(self, *, model: str, request_body: dict | None = None, stream_mode: str = "auto",
+                 namespace_tool_map: Any = None, local_store_context: dict | None = None):
+        self.namespace_tool_map = namespace_tool_map
+        self.local_store_context = local_store_context
+        # auto is envelope-based, never content-based: public Gemini is delta;
+        # private Cloud Code keeps its historical compatibility behaviour.
+        if stream_mode not in {"auto", "delta", "cumulative", "cloud_code_legacy"}:
+            raise ValueError(f"Unknown Gemini stream mode: {stream_mode}")
+        self.stream_mode = stream_mode
+        self.active_mode: str | None = None
+        self.decoder = codecs.getincrementaldecoder("utf-8")()
+        self.wire_format: str | None = None
+        self.closed = False
         self.model = model
         self.request_body = request_body or {}
         self.resp_id = _gen_id("resp_")
@@ -770,11 +940,17 @@ class GeminiStreamToResponses:
         self.text_item: dict[str, Any] | None = None
         self.reasoning_item: dict[str, Any] | None = None
         self.fc_items: dict[int, dict[str, Any]] = {}
-        self.closed_items: list[dict[str, Any]] = []
+        self.closed_items: dict[int, dict[str, Any]] = {}
         self.seen_text = ""
         self.seen_thought = ""
-        self.seen_fc_args: dict[int, str] = {}
+        self.fc_ids: dict[str, int] = {}
+        self.fc_slots: dict[int, int] = {}
         self.finish_reason: str | None = None
+        self.finish_message: str | None = None
+        self.prompt_feedback: dict | None = None
+        self.upstream_error: Any = None
+        self.item_status = "completed"
+        self.usage_meta: dict[str, Any] = {}
         self.usage: dict[str, Any] | None = None
 
     def _next_seq(self) -> int:
@@ -812,33 +988,51 @@ class GeminiStreamToResponses:
             "response": skeleton,
         })
 
+    def _wire_error(self, code: str, message: str) -> bytes:
+        error = {"code": code, "message": message, "raw": self.buffer}
+        if self.wire_format == "json":
+            self.finished = True
+            return _json_dumps(gemini_to_responses({"error": error}, model=self.model)).encode("utf-8")
+        return b"".join(self._finalize(error=error))
+
     def feed(self, chunk: bytes) -> bytes:
-        if not chunk:
+        if not chunk or self.finished or self.closed:
             return b""
-        text = chunk.decode("utf-8", errors="replace")
-        if text.lstrip().startswith("{") and "\ndata:" not in text and not self.buffer:
+        try:
+            self.buffer += self.decoder.decode(chunk)
+        except UnicodeDecodeError as exc:
+            return self._wire_error("invalid_upstream_utf8", str(exc))
+        if self.wire_format is None and self.buffer.lstrip():
+            self.wire_format = "json" if self.buffer.lstrip().startswith("{") else "sse"
+        if self.wire_format == "json":
             try:
-                payload = json.loads(text)
+                payload = json.loads(self.buffer)
             except json.JSONDecodeError:
-                payload = None
-            if isinstance(payload, dict) and not self.created:
-                converted = gemini_to_responses(payload, model=self.model)
-                return json.dumps(converted, ensure_ascii=False).encode("utf-8")
-        self.buffer += text
+                return b""  # A JSON response may also span arbitrary network chunks.
+            self.finished = True
+            self.buffer = ""
+            response = gemini_to_responses(payload, model=self.model, namespace_tool_map=self.namespace_tool_map)
+            self._save_local_response(response)
+            return _json_dumps(response).encode("utf-8")
         out = bytearray()
-        while True:
-            split_at = self.buffer.find("\n\n")
-            if split_at < 0:
-                crlf = self.buffer.find("\r\n\r\n")
-                if crlf < 0:
-                    break
-                block, self.buffer = self.buffer[:crlf], self.buffer[crlf + 4:]
-            else:
-                block, self.buffer = self.buffer[:split_at], self.buffer[split_at + 2:]
+        while not self.finished:
+            boundary = re.search(r"\r?\n\r?\n", self.buffer)
+            if boundary is None:
+                break
+            block, self.buffer = self.buffer[:boundary.start()], self.buffer[boundary.end():]
             out.extend(b"".join(self._handle_block(block)))
         return bytes(out)
 
     def close(self) -> bytes:
+        if self.closed or self.finished:
+            return b""
+        self.closed = True
+        try:
+            self.buffer += self.decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            return self._wire_error("invalid_upstream_utf8", str(exc))
+        if self.wire_format == "json":
+            return self._wire_error("invalid_upstream_json", "Truncated Gemini JSON response")
         leftover = self.buffer.strip()
         self.buffer = ""
         out = bytearray()
@@ -849,6 +1043,8 @@ class GeminiStreamToResponses:
         return bytes(out)
 
     def _handle_block(self, block: str) -> Iterator[bytes]:
+        if self.finished:
+            return
         data_lines: list[str] = []
         for raw_line in block.splitlines():
             line = raw_line.strip("\r")
@@ -864,26 +1060,47 @@ class GeminiStreamToResponses:
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
+            yield from self._finalize(error={
+                "code": "invalid_upstream_json", "message": "Invalid Gemini SSE JSON", "raw": raw,
+            })
             return
         if not isinstance(payload, dict):
-            return
-        if payload.get("error"):
-            yield from self._ensure_created()
-            yield from self._finalize(error=payload.get("error"))
+            yield from self._finalize(error={
+                "code": "invalid_upstream_json", "message": "Gemini SSE payload must be an object", "raw": raw,
+            })
             return
         data = unwrap_cloud_code(payload)
-        yield from self._ingest_gemini(data)
+        if self.active_mode is None:
+            self.active_mode = self.stream_mode if self.stream_mode != "auto" else (
+                "cloud_code_legacy" if data is not payload else "delta"
+            )
+        if data is not payload and payload.get("error") is not None:
+            data = dict(data, error=payload["error"])
+        try:
+            yield from self._ingest_gemini(data)
+        except ValueError as exc:
+            yield from self._finalize(error={
+                "code": "invalid_upstream_stream", "message": str(exc), "chunk": data,
+            })
 
     def _ingest_gemini(self, data: dict) -> Iterator[bytes]:
         yield from self._ensure_created()
-        usage = _usage_from_gemini(data.get("usageMetadata") or data.get("usage_metadata"))
-        if usage:
-            self.usage = usage
+        meta = data.get("usageMetadata") or data.get("usage_metadata")
+        if isinstance(meta, dict):
+            self.usage_meta.update(meta)
+            self.usage = _usage_from_gemini(self.usage_meta)
+        if data.get("error") is not None:
+            self.upstream_error = data["error"]
+        feedback = data.get("promptFeedback", data.get("prompt_feedback"))
+        if isinstance(feedback, dict):
+            self.prompt_feedback = feedback
         candidates = data.get("candidates")
         candidate = candidates[0] if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict) else {}
         reason = candidate.get("finishReason") or candidate.get("finish_reason")
         if reason:
             self.finish_reason = str(reason)
+        if candidate.get("finishMessage"):
+            self.finish_message = str(candidate["finishMessage"])
         content = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
         parts = content.get("parts") if isinstance(content.get("parts"), list) else []
         fc_seen = 0
@@ -907,7 +1124,9 @@ class GeminiStreamToResponses:
             image = _inline_image_part(part)
             if image:
                 yield from self._on_image(image)
-        if self.finish_reason:
+        blocked = (self.prompt_feedback or {}).get("blockReason") or (self.prompt_feedback or {}).get("block_reason")
+        terminal_reason = self.finish_reason and self.finish_reason != "FINISH_REASON_UNSPECIFIED"
+        if terminal_reason or self.upstream_error is not None or (blocked and blocked != "BLOCK_REASON_UNSPECIFIED"):
             yield from self._finalize()
 
     def _close_text(self) -> Iterator[bytes]:
@@ -934,7 +1153,7 @@ class GeminiStreamToResponses:
         })
         completed = {
             "type": "message", "id": item["id"], "role": "assistant",
-            "status": "completed", "content": [part],
+            "status": self.item_status, "content": [part],
         }
         yield _emit("response.output_item.done", {
             "type": "response.output_item.done",
@@ -942,7 +1161,7 @@ class GeminiStreamToResponses:
             "output_index": item["output_index"],
             "item": completed,
         })
-        self.closed_items.append(completed)
+        self.closed_items[item["output_index"]] = completed
         self.text_item = None
 
     def _close_reasoning(self) -> Iterator[bytes]:
@@ -970,7 +1189,7 @@ class GeminiStreamToResponses:
             "type": "reasoning",
             "id": item["id"],
             "summary": [{"type": "summary_text", "text": item["text"]}] if item["text"] else [],
-            "status": "completed",
+            "status": self.item_status,
         }
         if item.get("signature"):
             completed["encrypted_content"] = item["signature"]
@@ -980,41 +1199,66 @@ class GeminiStreamToResponses:
             "output_index": item["output_index"],
             "item": completed,
         })
-        self.closed_items.append(completed)
+        self.closed_items[item["output_index"]] = completed
         self.reasoning_item = None
 
     def _close_function_calls(self) -> Iterator[bytes]:
         for idx in sorted(self.fc_items):
             item = self.fc_items[idx]
-            yield _emit("response.function_call_arguments.done", {
-                "type": "response.function_call_arguments.done",
-                "sequence_number": self._next_seq(),
-                "item_id": item["id"],
-                "output_index": item["output_index"],
-                "arguments": item["arguments"],
-            })
+            # Struct args are whole snapshots, not JSON string deltas. Buffer
+            # until closure so {"x":1} -> {"x":1,"y":2} needs no retraction.
+            if item["arguments"]:
+                yield _emit("response.function_call_arguments.delta", {
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": self._next_seq(),
+                    "item_id": item["id"], "output_index": item["output_index"],
+                    "delta": item["arguments"],
+                })
+            complete = _complete_call(item) and self.finish_reason not in {
+                "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL",
+            }
+            if complete:
+                yield _emit("response.function_call_arguments.done", {
+                    "type": "response.function_call_arguments.done",
+                    "sequence_number": self._next_seq(),
+                    "item_id": item["id"],
+                    "output_index": item["output_index"],
+                    "arguments": item["arguments"],
+                })
             completed = {
                 "type": "function_call",
                 "id": item["id"],
                 "call_id": item["call_id"],
                 "name": item["name"],
                 "arguments": item["arguments"],
-                "status": "completed",
+                "status": "completed" if complete else "incomplete",
             }
             if item.get("signature"):
                 completed["encrypted_content"] = item["signature"]
+            completed = _restore_tool_identity(completed, self.namespace_tool_map)
             yield _emit("response.output_item.done", {
                 "type": "response.output_item.done",
                 "sequence_number": self._next_seq(),
                 "output_index": item["output_index"],
                 "item": completed,
             })
-            self.closed_items.append(completed)
+            self.closed_items[item["output_index"]] = completed
         self.fc_items.clear()
 
+    def _text_delta(self, previous: str, current: str) -> str:
+        if self.active_mode == "delta":
+            return current
+        if self.active_mode == "cumulative":
+            if not current.startswith(previous):
+                raise ValueError("Gemini cumulative text revised an already emitted prefix")
+            return current[len(previous):]
+        # Explicit legacy-only compatibility. No captured private contract is
+        # available to disambiguate identical incremental chunks here.
+        return _delta_from_snapshot(previous, current)
+
     def _on_text(self, text: str) -> Iterator[bytes]:
-        delta = _delta_from_snapshot(self.seen_text, text)
-        self.seen_text = text if text.startswith(self.seen_text) else (self.seen_text + delta)
+        delta = self._text_delta(self.seen_text, text)
+        self.seen_text += delta
         if not delta:
             return
         yield from self._close_reasoning()
@@ -1076,11 +1320,11 @@ class GeminiStreamToResponses:
             "output_index": output_index,
             "item": item,
         })
-        self.closed_items.append(item)
+        self.closed_items[output_index] = item
 
     def _on_thought(self, text: str, signature: str) -> Iterator[bytes]:
-        delta = _delta_from_snapshot(self.seen_thought, text)
-        self.seen_thought = text if text.startswith(self.seen_thought) else (self.seen_thought + delta)
+        delta = self._text_delta(self.seen_thought, text)
+        self.seen_thought += delta
         if self.reasoning_item is None:
             item = {
                 "id": _gen_id("rs_"),
@@ -1117,91 +1361,144 @@ class GeminiStreamToResponses:
             "delta": delta,
         })
 
-    def _on_function_call(self, index: int, call: dict, *, signature: str = "") -> Iterator[bytes]:
+    def _on_function_call(self, slot: int, call: dict, *, signature: str = "") -> Iterator[bytes]:
         yield from self._close_text()
         yield from self._close_reasoning()
         name = str(call.get("name") or "")
-        args = _as_json_str(call.get("args") if "args" in call else call.get("arguments") or {})
+        native_id = str(call.get("id") or "").strip()
+        index = self.fc_ids.get(native_id) if native_id else None
+        if index is None and not native_id and self.active_mode != "delta":
+            # Only the private compatibility/cumulative branch has positional
+            # snapshots. Names guard against per-packet index resets; explicit
+            # native ids always win, even for parallel calls to the same tool.
+            previous = self.fc_slots.get(slot)
+            prior = self.fc_items.get(previous)
+            if prior and not prior["native_id"] and (not name or prior["name"] == name):
+                index = previous
+        if index is None:
+            index = len(self.fc_items)
         item = self.fc_items.get(index)
+        if item is not None and name and item["name"] and name != item["name"]:
+            raise ValueError(f"Gemini function call id {native_id!r} changed name")
         if item is None:
-            native_id = str(call.get("id") or "").strip()
             item = {
                 "id": _gen_id("fc_"),
-                "call_id": native_id or f"call_{index + 1}",
+                "call_id": native_id or _gen_id("call_"),
+                "native_id": native_id,
                 "output_index": self._alloc_index(),
                 "name": name,
                 "arguments": "",
                 "signature": signature,
             }
             self.fc_items[index] = item
-            self.seen_fc_args[index] = ""
+            if native_id:
+                self.fc_ids[native_id] = index
             yield _emit("response.output_item.added", {
                 "type": "response.output_item.added",
                 "sequence_number": self._next_seq(),
                 "output_index": item["output_index"],
-                "item": {
+                "item": _restore_tool_identity({
                     "type": "function_call",
                     "id": item["id"],
                     "call_id": item["call_id"],
                     "name": name,
                     "arguments": "",
                     "status": "in_progress",
-                },
+                }, self.namespace_tool_map),
             })
         elif name and not item["name"]:
             item["name"] = name
-        prev = self.seen_fc_args.get(index, "")
-        delta = _delta_from_snapshot(prev, args)
-        self.seen_fc_args[index] = args if args.startswith(prev) else (prev + delta)
-        if not delta:
-            return
-        item["arguments"] += delta
-        yield _emit("response.function_call_arguments.delta", {
-            "type": "response.function_call_arguments.delta",
-            "sequence_number": self._next_seq(),
-            "item_id": item["id"],
-            "output_index": item["output_index"],
-            "delta": delta,
-        })
+        self.fc_slots[slot] = index
+        if signature:
+            item["signature"] = signature
+        raw_args = call.get("args") if "args" in call else call.get("arguments")
+        if raw_args is None:
+            if not item["arguments"]:
+                item["arguments"] = "{}"
+        elif isinstance(raw_args, str):
+            # String fragments are a private compatibility extension; the
+            # public FunctionCall.args field is a complete protobuf Struct.
+            previous = item["arguments"] if item.get("string_args") else ""
+            item["arguments"] = previous + self._text_delta(previous, raw_args)
+            item["string_args"] = True
+        else:
+            item["arguments"] = _as_json_str(raw_args)
+            item["string_args"] = False
 
     def _finalize(self, error: Any = None) -> Iterator[bytes]:
         if self.finished:
             return
         self.finished = True
+        if error is not None:
+            self.upstream_error = error
+        if self.finish_reason == "STOP" and self.upstream_error is None and any(
+            not _complete_call(item) for item in self.fc_items.values()
+        ):
+            self.upstream_error = {
+                "code": "gemini_malformed_function_call", "message": "Invalid Gemini function call arguments",
+            }
+        status, incomplete, response_error = _terminal_details(
+            self.finish_reason, self.prompt_feedback, self.upstream_error,
+        )
+        self.item_status = "completed" if status == "completed" else "incomplete"
         yield from self._ensure_created()
         yield from self._close_text()
         yield from self._close_reasoning()
         yield from self._close_function_calls()
-        status, incomplete = _finish_to_status(self.finish_reason)
-        if error:
-            status = "failed"
-            incomplete = None
+        output = [self.closed_items[idx] for idx in sorted(self.closed_items)]
         output_text = "".join(
             (it.get("content") or [{}])[0].get("text", "")
-            for it in self.closed_items
+            for it in output
             if it.get("type") == "message" and it.get("content")
         )
         response = self._skeleton(status)
-        response["output"] = list(self.closed_items)
+        response["output"] = output
         response["output_text"] = output_text
         response["usage"] = self.usage
         response["incomplete_details"] = incomplete
-        if error:
-            err = error if isinstance(error, dict) else {"message": str(error)}
-            response["error"] = {
-                "message": str(err.get("message") or "antigravity error"),
-                "code": str(err.get("status") or err.get("code") or "api_error"),
-            }
+        response["error"] = response_error
+        response["provider_metadata"] = _provider_metadata(
+            self.finish_reason, self.prompt_feedback, self.upstream_error, self.finish_message,
+        )
+        if status == "failed":
             event = "response.failed"
         elif status == "incomplete":
             event = "response.incomplete"
         else:
             event = "response.completed"
+        self._save_local_response(response)
         yield _emit(event, {
             "type": event,
             "sequence_number": self._next_seq(),
             "response": response,
         })
+
+    def _save_local_response(self, response: dict) -> None:
+        ctx = self.local_store_context
+        if ctx is None:
+            return
+        from ..openai import store
+        response["previous_response_id"] = ctx.get("parent_id")
+        response["store"] = False
+        if self.request_body.get("store") is False or not store.is_enabled():
+            return
+        if response.get("status") not in {"completed", "incomplete"}:
+            return
+        try:
+            store.save(
+                response["id"], ctx.get("parent_id"), api_key_name=ctx["api_key_name"],
+                model=self.model, channel_key=ctx["channel_key"],
+                input_items=ctx["current_input_items"], output_items=response["output"],
+            )
+            # save() intentionally no-ops before application Store init.
+            # Verify the record rather than advertising a phantom anchor.
+            store.lookup(response["id"], api_key_name=ctx["api_key_name"])
+            response["store"] = True
+        except Exception:
+            # A useful generation is not discarded due to persistence trouble,
+            # but never advertise a resumable response that was not stored.
+            logging.getLogger(__name__).warning("Antigravity local response Store write failed", exc_info=True)
+            response.setdefault("provider_metadata", {}).setdefault("gemini", {})["local_store"] = "unavailable"
 
 
 def restore_antigravity_bytes(

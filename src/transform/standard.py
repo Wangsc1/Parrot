@@ -14,7 +14,6 @@ from .. import cache_hints
 from .cc_mimicry import (
     PARROT_WANTS_FAST_MODE_KEY,
     _normalize_messages_for_api,
-    _strip_assistant_thinking_blocks,
     _strip_message_cache_control,
     _strip_tool_cache_control,
     apply_opus_adaptive_thinking,
@@ -30,7 +29,8 @@ def standard_transform(body: dict) -> dict:
     explicit_cache_control = cache_hints.has_anthropic_cache_control(body)
     messages = body.get("messages", [])
     messages = _normalize_messages_for_api(messages)
-    messages = _strip_assistant_thinking_blocks(messages)
+    # Native thinking/signature and redacted_thinking are replay state, notably
+    # across tool_result continuations. Do not apply CC's lossy retry policy here.
     if not explicit_cache_control:
         messages = _strip_message_cache_control(messages)
 

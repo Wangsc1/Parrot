@@ -1,4 +1,4 @@
-"""Claude Code 2.1.280 model defaults, not an account authorization catalog.
+"""Claude Code model defaults, not an account authorization catalog.
 
 Source: v280's embedded model catalog (max_output_tokens / capabilities),
 Jyr / vCt / L_ capability gates, and the Fable/Opus/Haiku wire captures.
@@ -28,6 +28,7 @@ _PROFILES = {
     "claude-sonnet-4-5": CCModelProfile(32000, "enabled", context_management=True),
     "claude-sonnet-4-6": CCModelProfile(32000, "adaptive", True, True),
     "claude-sonnet-5": CCModelProfile(64000, "adaptive", True, True),
+    "claude-sonnet-5-5": CCModelProfile(128000, "adaptive", True, True),
     "claude-opus-4-0": CCModelProfile(32000, "enabled", context_management=True),
     "claude-opus-4-1": CCModelProfile(32000, "enabled", context_management=True),
     # L_ explicitly permits effort on Opus 4.5, but vCt rejects adaptive.
@@ -44,6 +45,7 @@ _PROFILES = {
 }
 _ALIASES = {
     "claude-sonnet-4": "claude-sonnet-4-0",
+    "claude-sonnet-5.5": "claude-sonnet-5-5",
     "claude-opus-4": "claude-opus-4-0",
     "claude-fable-5.1": "claude-fable-5-1",
     "claude-opus-5.5": "claude-opus-5-5",

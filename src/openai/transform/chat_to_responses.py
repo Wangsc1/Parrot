@@ -62,9 +62,15 @@ def translate_request(body: dict) -> dict:
     elif "max_tokens" in body:
         payload["max_output_tokens"] = body["max_tokens"]
 
-    # response_format → text.format；两边结构同构（type:text/json_object/json_schema）
+    # Chat nests schema metadata; Responses puts it directly on text.format.
     if "response_format" in body:
-        payload.setdefault("text", {})["format"] = body["response_format"]
+        fmt = body["response_format"]
+        if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
+            schema = fmt.get("json_schema")
+            if not isinstance(schema, dict):
+                _fail("response_format.json_schema must be an object", param="response_format")
+            fmt = {**schema, "type": "json_schema"}
+        payload.setdefault("text", {})["format"] = fmt
 
     # Chat logprobs → Responses include/top_logprobs.  Responses only returns
     # output text logprobs when explicitly requested through include.

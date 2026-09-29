@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
 from ...protocols.usage import legacy_usage_from_anthropic_json
+from ...protocols.sse import split_sse_events
 
 
 def _gen_id(prefix: str) -> str:
@@ -46,7 +47,7 @@ def _error_chunk(err: dict) -> bytes:
 def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
     event_name: Optional[str] = None
     data_lines: list[str] = []
-    for line in block.split("\n"):
+    for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = line.strip()
         if line.startswith("event:"):
             event_name = line[6:].strip() or None
@@ -62,10 +63,12 @@ def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
 
 
 def _finish_reason(stop_reason: Optional[str], *, saw_tool: bool) -> str:
+    if stop_reason in {"max_tokens", "model_context_window_exceeded"}:
+        return "length"
+    if stop_reason == "refusal":
+        return "content_filter"
     if saw_tool or stop_reason == "tool_use":
         return "tool_calls"
-    if stop_reason == "max_tokens":
-        return "length"
     if stop_reason in ("stop_sequence", "end_turn"):
         return "stop"
     return "stop"
@@ -159,9 +162,8 @@ class StreamTranslator:
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         if not chunk:
             return
-        self._buf += chunk
-        while b"\n\n" in self._buf:
-            block_bytes, self._buf = self._buf.split(b"\n\n", 1)
+        self._buf, blocks = split_sse_events(self._buf + chunk)
+        for block_bytes in blocks:
             block = block_bytes.decode("utf-8", errors="replace")
             if not block.strip():
                 continue

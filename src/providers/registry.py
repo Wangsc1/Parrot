@@ -97,3 +97,16 @@ async def restore_response_bytes(
         translator_ctx=translator_ctx,
     )
     return await adapter_for_channel(channel).restore_response_bytes(chunk, ctx)
+
+
+async def finish_response_bytes(
+    channel,
+    *,
+    dynamic_map: Optional[dict] = None,
+    translator_ctx: Optional[dict] = None,
+) -> bytes:
+    """Return the provider's final restored bytes before protocol EOF handling."""
+    ctx = ProviderAttemptContext(
+        channel=channel, dynamic_map=dynamic_map, translator_ctx=translator_ctx,
+    )
+    return await adapter_for_channel(channel).finish_response_bytes(ctx)

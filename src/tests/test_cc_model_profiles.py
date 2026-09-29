@@ -56,6 +56,9 @@ def decoded(request):
     ("claude-sonnet-4-20250514", 32000, "enabled", False),
     ("claude-sonnet-4-5-20250929", 32000, "enabled", False),
     ("claude-sonnet-4-6", 32000, "adaptive", True),
+    ("claude-sonnet-5", 64000, "adaptive", True),
+    ("claude-sonnet-5-5", 128000, "adaptive", True),
+    ("claude-sonnet-5.5", 128000, "adaptive", True),
     ("claude-opus-4-1-20250805", 32000, "enabled", False),
     ("claude-opus-4-5", 32000, "enabled", True),
     ("claude-opus-4-8", 64000, "adaptive", True),
@@ -106,7 +109,11 @@ async def test_channel_default_profiles(auth, model, maximum, thinking, effort):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auth", ["api_key", "oauth", "compatible"])
-@pytest.mark.parametrize("model,kind", [("claude-haiku-4-5", "enabled"), ("claude-opus-5", "adaptive"), ("GLM-5", None)])
+@pytest.mark.parametrize("model,kind", [
+    ("claude-haiku-4-5", "enabled"), ("claude-opus-5", "adaptive"),
+    ("claude-sonnet-5-5", "adaptive"), ("claude-sonnet-5.5", "adaptive"),
+    ("GLM-5", None),
+])
 @pytest.mark.parametrize("ingress", ["chat", "responses"])
 async def test_bridge_defaults_and_explicit_controls(auth, model, kind, ingress):
     base = {"model": model, "stream": False}
@@ -129,6 +136,26 @@ async def test_bridge_defaults_and_explicit_controls(auth, model, kind, ingress)
     assert "thinking" not in wire
     if ingress == "chat":
         assert wire["stop_sequences"] == ["done"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth", ["api_key", "oauth", "compatible"])
+@pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-sonnet-5.5"])
+async def test_sonnet_55_adaptive_capabilities(auth, model):
+    req = await channel(auth, model).build_upstream_request({
+        "model": model, "messages": [{"role": "user", "content": "hello"}],
+    }, model)
+    wire = decoded(req)
+    assert wire["thinking"] == {"type": "adaptive", "display": "omitted"}
+    assert wire["output_config"] == {"effort": "high"}
+    assert wire["context_management"] == {
+        "edits": [{"type": "clear_thinking_20251015", "keep": "all"}],
+    }
+    assert wire["diagnostics"] == {"previous_message_id": None}
+    assert {
+        cc.INTERLEAVED_THINKING_BETA, cc.THINKING_TOKEN_COUNT_BETA,
+        cc.CONTEXT_MANAGEMENT_BETA, cc.EFFORT_BETA,
+    }.issubset(req.headers["anthropic-beta"].split(","))
 
 
 @pytest.mark.asyncio
@@ -157,6 +184,8 @@ async def test_explicit_fallback_is_preserved_and_beta_is_opt_in(auth, fallback)
 @pytest.mark.parametrize("model,thinking,output", [
     ("claude-haiku-4-5", {"type": "enabled", "budget_tokens": 2048, "display": "summarized"}, {}),
     ("claude-opus-5", {"type": "disabled"}, {"effort": "low"}),
+    ("claude-sonnet-5-5", {"type": "disabled"}, {"effort": "low"}),
+    ("claude-sonnet-5.5", {"type": "adaptive", "display": "summarized"}, {"effort": "max"}),
     ("claude-fable-5.1", {"type": "adaptive", "display": "summarized"}, {"effort": "max"}),
     ("GLM-5", {"type": "enabled", "budget_tokens": 2048}, {"effort": "medium"}),
 ])
@@ -252,7 +281,7 @@ async def test_haiku_omit_thinking_preserves_remaining_betas_and_explicit_fallba
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["claude-haiku-4-5", "claude-fable-5.1", "GLM-5"])
+@pytest.mark.parametrize("model", ["claude-haiku-4-5", "claude-fable-5.1", "claude-sonnet-5-5", "claude-sonnet-5.5", "GLM-5"])
 async def test_non_cc_channels_keep_standard_defaults(model):
     req = await channel("api_key", model, mimicry=False).build_upstream_request({
         "model": model, "messages": [{"role": "user", "content": "hi"}],

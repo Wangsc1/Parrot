@@ -38,10 +38,11 @@ def test_shared_sse_splitter_accepts_crlf_across_network_chunks():
     first = created[:-1]
 
     remaining, blocks = split_sse_events(first)
-    assert blocks == []
-    assert remaining == first
-
+    # CR is itself a legal ending: the event may dispatch before its optional
+    # LF arrives. The LF must not create an event or pollute the next block.
+    first_blocks = blocks
     remaining, blocks = split_sse_events(remaining + created[-1:] + completed)
+    blocks = first_blocks + blocks
     assert remaining == b""
     assert len(blocks) == 2
     assert blocks[0].startswith(b"event: response.created\r\n")

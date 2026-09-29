@@ -337,20 +337,24 @@ def test_response_id_collision_cannot_replace_another_api_key(isolated_store):
 
 
 
-def test_expand_history_cycle_and_depth_are_bounded(isolated_store):
+def test_expand_history_cycle_and_explicit_depth_fail_without_partial_history(isolated_store):
     _save("chain-a")
     _save("chain-b", parent_id="chain-a")
     _save("chain-c", parent_id="chain-b")
+    complete = store.expand_history("chain-c", api_key_name="key-a")
+    assert [item["id"] for item in complete] == ["chain-a", "chain-b", "chain-c"]
+    with pytest.raises(store.ResponseHistoryError, match="max_depth=2"):
+        store.expand_history("chain-c", api_key_name="key-a", max_depth=2)
     conn = store._get_conn()
     conn.execute(
         "UPDATE openai_response_store SET parent_id='chain-c' WHERE response_id='chain-a'"
     )
     conn.commit()
 
-    bounded = store.expand_history("chain-c", api_key_name="key-a", max_depth=2)
-    assert [item["id"] for item in bounded] == ["chain-b", "chain-c"]
-    cyclic = store.expand_history("chain-c", api_key_name="key-a", max_depth=50)
-    assert [item["id"] for item in cyclic] == ["chain-a", "chain-b", "chain-c"]
+    with pytest.raises(store.ResponseHistoryError, match="cycle"):
+        store.expand_history("chain-c", api_key_name="key-a")
+    with pytest.raises(store.ResponseHistoryError, match="cycle"):
+        store.expand_history("chain-c", api_key_name="key-a", max_depth=50)
 
 
 def test_legacy_missing_database_or_table_is_a_clean_miss(isolated_store):

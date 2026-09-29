@@ -439,8 +439,8 @@ def test_translate_request_allows_noop_text_response_format_and_text_modality():
     assert "modalities" not in out
 
 
-def test_translate_request_strips_openai_only_chat_controls():
-    out = chat_to_anthropic.translate_request({
+def test_translate_request_strips_openai_only_chat_controls_but_not_missing_schema():
+    body = {
         "reasoning_effort": "high",
         "response_format": {"type": "json_schema"},
         "modalities": ["text"],
@@ -448,7 +448,13 @@ def test_translate_request_strips_openai_only_chat_controls():
         "presence_penalty": 0.2,
         "messages": [{"role": "assistant", "reasoning_content": "hidden"}],
         "tools": [{"type": "web_search_preview"}],
-    })
+    }
+    with pytest.raises(GuardError, match="requires a schema object") as caught:
+        chat_to_anthropic.translate_request(body)
+    assert caught.value.param == "response_format"
+    # Without a structured-output request, unrelated legacy hints still degrade.
+    body.pop("response_format")
+    out = chat_to_anthropic.translate_request(body)
 
     assert out["messages"] == [{"role": "assistant", "content": [{"type": "text", "text": ""}]}]
     assert "tools" not in out
@@ -481,8 +487,14 @@ def test_translate_request_uses_anthropic_output_whitelist_for_chat_controls():
         "verbosity": "high",
     }
 
+    with pytest.raises(GuardError, match="requires a schema object"):
+        chat_to_anthropic.translate_request(body)
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}},
+              "required": ["answer"], "additionalProperties": False}
+    body["response_format"]["json_schema"] = {"name": "result", "schema": schema, "strict": True}
     out = chat_to_anthropic.translate_request(body)
 
+    assert out["output_config"]["format"] == {"type": "json_schema", "schema": schema}
     assert set(out) <= common.ANTHROPIC_BRIDGE_REQ_ALLOWED
     assert out["messages"] == [{"role": "user", "content": [{
         "type": "text",
@@ -496,9 +508,12 @@ def test_anthropic_bridge_allowlist_is_protocol_subset_not_source_validator():
     assert common.ANTHROPIC_BRIDGE_REQ_ALLOWED < common.ANTHROPIC_MESSAGES_REQ_ALLOWED
     # These official Anthropic fields require native/provider/state adapters and
     # must not pass through the generic OpenAI-family bridge by accident.
-    for field in ("thinking", "output_config", "context_management", "container", "mcp_servers", "top_k"):
+    for field in ("context_management", "container", "mcp_servers", "top_k"):
         assert field in common.ANTHROPIC_MESSAGES_REQ_ALLOWED
         assert field not in common.ANTHROPIC_BRIDGE_REQ_ALLOWED
+    # Responses→Claude explicitly generates these two native controls; generic
+    # Chat→Claude still never passes client-provided controls straight through.
+    assert {"thinking", "output_config"} <= common.ANTHROPIC_BRIDGE_REQ_ALLOWED
 
 
 def test_translate_request_guards_chat_content_that_would_be_lost():

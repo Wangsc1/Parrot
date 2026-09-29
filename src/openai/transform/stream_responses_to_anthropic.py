@@ -15,7 +15,9 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
 from ...protocols import errors as protocol_errors
+from ...protocols.sse import split_sse_events
 from . import common
+from ._stream_response_text_order import TextOutputOrder
 from ...protocols.usage import legacy_usage_from_openai_responses_json
 
 
@@ -30,7 +32,7 @@ def _emit(event: str, data: dict) -> bytes:
 def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
     event_name: Optional[str] = None
     data_lines: list[str] = []
-    for line in block.split("\n"):
+    for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = line.strip()
         if line.startswith("event:"):
             event_name = line[6:].strip() or None
@@ -93,11 +95,13 @@ def _anthropic_usage_from_responses_usage(usage: Optional[dict]) -> dict[str, in
 
 
 def _stop_reason(status: Optional[str], incomplete_reason: Optional[str], *, saw_tool: bool) -> str:
-    if saw_tool:
-        return "tool_use"
-    if status == "incomplete" and incomplete_reason in ("max_output_tokens", "max_tokens"):
-        return "max_tokens"
-    return "end_turn"
+    if status == "incomplete":
+        if incomplete_reason in ("max_output_tokens", "max_tokens"):
+            return "max_tokens"
+        if incomplete_reason == "content_filter":
+            return "refusal"
+        return "pause_turn"
+    return "tool_use" if saw_tool else "end_turn"
 
 
 @dataclass
@@ -119,6 +123,7 @@ class _ToolState:
     args: str = ""
     started: bool = False
     stopped: bool = False
+    args_emitted: bool = False
 
 
 @dataclass
@@ -155,6 +160,8 @@ class _State:
 class StreamTranslator:
     """OpenAI Responses SSE → Anthropic SSE."""
 
+    preserves_incomplete = True
+
     def __init__(
         self,
         *,
@@ -180,20 +187,28 @@ class StreamTranslator:
         self._buf = b""
         self._hosted_seen: set[str] = set()
         self._hosted_blocks: list[tuple[int, dict]] = []
+        self._pending_hosted: tuple[str, int | None] | None = None
+        self._deferred_events: list[tuple[str, dict]] = []
+        self._pending_reasoning: tuple[str, int | None] | None = None
+        self._deferred_reasoning: list[tuple[str, dict]] = []
+        self._item_ids_by_output_index: dict[int, str] = {}
+        self._active_text_item: str | None = None
+        self._text_emitted_by_part: dict[tuple[str, int], str] = {}
+        self._text_order = TextOutputOrder(max_output_is_error=False)
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         if not chunk:
             return
-        self._buf += chunk
-        while b"\n\n" in self._buf:
-            block_bytes, self._buf = self._buf.split(b"\n\n", 1)
+        self._buf, blocks = split_sse_events(self._buf + chunk)
+        for block_bytes in blocks:
             block = block_bytes.decode("utf-8", errors="replace")
             if not block.strip():
                 continue
             event_name, data = _parse_event_block(block)
             if event_name is None and data is None:
                 continue
-            yield from self._handle_event(event_name or "", data or {})
+            for ready_name, ready_data in self._text_order.feed(event_name or "", data or {}):
+                yield from self._handle_event(ready_name, ready_data)
 
     def close(self) -> Iterator[bytes]:
         if self.state.terminal_emitted:
@@ -220,6 +235,90 @@ class StreamTranslator:
     # ─── event handling ──────────────────────────────────────────
 
     def _handle_event(self, event_name: str, data: dict) -> Iterator[bytes]:
+        # The final reasoning summary determines thinking vs redacted_thinking.
+        # Do not commit later text/tool blocks until that earlier item is done.
+        if self._pending_reasoning is not None:
+            pending_id, pending_index = self._pending_reasoning
+            item = data.get("item") if isinstance(data.get("item"), dict) else {}
+            oi = data.get("output_index")
+            same_item = (str(item.get("id") or data.get("item_id") or "") == pending_id
+                         or (isinstance(oi, int) and oi == pending_index))
+            if event_name in ("error", "response.failed") or data.get("type") == "error":
+                self._pending_reasoning = None
+                self._deferred_reasoning.clear()
+            elif event_name == "response.output_item.done" and item.get("type") == "reasoning" and same_item:
+                self._pending_reasoning = None
+                yield from self._on_output_item_done(data, item)
+                deferred, self._deferred_reasoning = self._deferred_reasoning, []
+                for name, frame in deferred:
+                    yield from self._handle_event(name, frame)
+                return
+            elif event_name in ("response.completed", "response.incomplete"):
+                resp = _response_from_event(data)
+                snapshot = next((i for i in resp.get("output") or [] if isinstance(i, dict)
+                                 and i.get("type") == "reasoning" and str(i.get("id") or "") == pending_id), None)
+                if snapshot is None:
+                    self._deferred_reasoning.append((event_name, data))
+                    return
+                self._pending_reasoning = None
+                yield from self._on_output_item_done({"output_index": pending_index, "item": snapshot}, snapshot)
+                deferred, self._deferred_reasoning = self._deferred_reasoning, []
+                for name, frame in deferred:
+                    yield from self._handle_event(name, frame)
+            elif ((isinstance(oi, int) and isinstance(pending_index, int) and oi < pending_index)
+                  or (event_name == "response.reasoning_summary_text.delta" and same_item)):
+                self._pending_reasoning = None
+                try:
+                    yield from self._handle_event(event_name, data)
+                finally:
+                    self._pending_reasoning = (pending_id, pending_index)
+                return
+            elif event_name != "keepalive":
+                self._deferred_reasoning.append((event_name, data))
+                return
+        # A hosted call's final evidence can arrive after later items. Defer
+        # those items until its done event so their Anthropic blocks cannot be
+        # emitted ahead of the hosted result.
+        if self._pending_hosted is not None and (event_name in ("error", "response.failed") or data.get("type") == "error"):
+            self._pending_hosted = None
+            self._deferred_events.clear()
+        if self._pending_hosted is not None:
+            item = data.get("item") if isinstance(data.get("item"), dict) else {}
+            pending_id, pending_index = self._pending_hosted
+            # A preceding output item may itself finish after hosted.added.
+            # Its missing suffix still belongs before the hosted blocks.
+            prior_index = data.get("output_index")
+            if isinstance(prior_index, int) and isinstance(pending_index, int) and prior_index < pending_index:
+                self._pending_hosted = None
+                try:
+                    yield from self._handle_event(event_name, data)
+                finally:
+                    self._pending_hosted = (pending_id, pending_index)
+                return
+            if (event_name == "response.output_item.done" and item.get("type") == "web_search_call"
+                    and (str(item.get("id") or "") == pending_id or data.get("output_index") == pending_index)):
+                self._pending_hosted = None
+                yield from self._on_output_item_done(data, item)
+                deferred, self._deferred_events = self._deferred_events, []
+                for name, frame in deferred:
+                    yield from self._handle_event(name, frame)
+                return
+            if event_name in ("response.completed", "response.incomplete"):
+                resp = _response_from_event(data)
+                hosted = next((i for i in resp.get("output") or [] if isinstance(i, dict)
+                               and i.get("type") == "web_search_call" and str(i.get("id") or "") == pending_id), None)
+                if hosted is not None:
+                    self._pending_hosted = None
+                    yield from self._emit_hosted_search(hosted)
+                    deferred, self._deferred_events = self._deferred_events, []
+                    for name, frame in deferred:
+                        yield from self._handle_event(name, frame)
+                else:
+                    self._deferred_events.append((event_name, data))
+                    return
+            elif event_name != "keepalive":
+                self._deferred_events.append((event_name, data))
+                return
         if event_name == "error" or data.get("type") == "error" or isinstance(data.get("error"), dict):
             err = data.get("error") if isinstance(data.get("error"), dict) else data
             yield _emit("error", {"type": "error", "error": _normalize_error_for_anthropic(err)})
@@ -236,6 +335,13 @@ class StreamTranslator:
 
         if event_name == "response.output_item.added":
             item = data.get("item") if isinstance(data.get("item"), dict) else {}
+            if isinstance(data.get("output_index"), int) and isinstance(item.get("id"), str):
+                self._item_ids_by_output_index[data["output_index"]] = item["id"]
+            if item.get("type") == "web_search_call" and item.get("id"):
+                self._pending_hosted = (str(item["id"]), data.get("output_index"))
+                return
+            if item.get("type") == "reasoning" and self.allow_reasoning_bridge and item.get("id"):
+                self._pending_reasoning = (str(item["id"]), data.get("output_index"))
             yield from self._on_output_item_added(data, item)
             return
 
@@ -247,7 +353,15 @@ class StreamTranslator:
         if event_name == "response.content_part.added":
             part = data.get("part") if isinstance(data.get("part"), dict) else {}
             if part.get("type") in ("output_text", "refusal"):
-                yield from self._ensure_text_block()
+                yield from self._ensure_text_for_item(data)
+            return
+
+        if event_name in ("response.output_text.done", "response.refusal.done", "response.content_part.done"):
+            part = data.get("part") if isinstance(data.get("part"), dict) else {}
+            text = (part.get("text") or part.get("refusal") if event_name == "response.content_part.done"
+                    else data.get("text") or data.get("refusal"))
+            if event_name != "response.content_part.done" or part.get("type") in ("output_text", "refusal"):
+                yield from self._emit_text_tail(data, text)
             return
 
         if event_name == "response.reasoning_summary_text.delta":
@@ -260,7 +374,7 @@ class StreamTranslator:
         if event_name in ("response.output_text.delta", "response.refusal.delta"):
             delta = data.get("delta")
             if isinstance(delta, str) and delta:
-                yield from self._emit_text_delta(delta)
+                yield from self._emit_text_for_item(data, delta)
             return
 
         if event_name == "response.function_call_arguments.delta":
@@ -274,27 +388,22 @@ class StreamTranslator:
         if event_name in ("response.completed", "response.incomplete", "response.failed"):
             resp = _response_from_event(data)
             self._capture_response_metadata(resp)
-            for item in resp.get("output") or []:
-                if isinstance(item, dict) and item.get("type") == "web_search_call":
-                    yield from self._emit_hosted_search(item)
+            if event_name != "response.failed":
+                for index, item in enumerate(resp.get("output") or []):
+                    if not isinstance(item, dict):
+                        continue
+                    output_index = next((oi for oi, item_id in self._item_ids_by_output_index.items()
+                                         if item_id == item.get("id")), index)
+                    yield from self._on_output_item_done({"output_index": output_index, "item": item}, item)
             self.state.status = str(resp.get("status") or event_name.removeprefix("response."))
             details = resp.get("incomplete_details") if isinstance(resp.get("incomplete_details"), dict) else {}
             self.state.incomplete_reason = details.get("reason") if isinstance(details, dict) else None
             usage = resp.get("usage")
             if isinstance(usage, dict):
                 self.state.usage = usage
-            if protocol_errors.is_responses_max_output_incomplete(data, event_name):
-                msg = protocol_errors.responses_max_output_context_error_message(self.state.incomplete_reason)
-                yield _emit("error", {
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "code": protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
-                        "message": msg,
-                    },
-                })
-                self.state.terminal_emitted = True
-            elif event_name == "response.failed":
+            if event_name != "response.failed" and not self.state.message_started:
+                yield from self._emit_message_start()
+            if event_name == "response.failed":
                 err = (
                     resp.get("error")
                     if isinstance(resp.get("error"), dict)
@@ -335,6 +444,14 @@ class StreamTranslator:
 
     def _on_output_item_done(self, data: dict, item: dict) -> Iterator[bytes]:
         item_type = item.get("type")
+        if isinstance(item.get("id"), str) and isinstance(data.get("output_index"), int):
+            self._item_ids_by_output_index[data["output_index"]] = item["id"]
+        if item_type == "message":
+            for content_index, part in enumerate(item.get("content") or []):
+                if isinstance(part, dict) and part.get("type") in ("output_text", "refusal"):
+                    value = part.get("text") if part.get("type") == "output_text" else part.get("refusal")
+                    yield from self._emit_text_tail({**data, "item_id": item.get("id"), "content_index": content_index}, value)
+            return
         if item_type == "web_search_call":
             yield from self._emit_hosted_search(item)
             return
@@ -359,6 +476,8 @@ class StreamTranslator:
             yield from self._emit_redacted_reasoning(signature)
         key = self._key_from_item_event(data, item)
         st = self._tool_state(key)
+        if st.stopped:
+            return  # done + terminal is one completion, not a second JSON value.
         self._update_tool_metadata(st, data, item, key)
         done_args = item.get("arguments")
         if self._should_buffer_tool_args(st) and isinstance(done_args, str):
@@ -441,6 +560,32 @@ class StreamTranslator:
             "content_block": {"type": "text", "text": ""},
         })
 
+    def _text_key(self, data: dict) -> tuple[str, int]:
+        oi = data.get("output_index")
+        item_id = data.get("item_id") or (self._item_ids_by_output_index.get(oi) if isinstance(oi, int) else None)
+        return str(item_id or f"index:{oi}"), int(data.get("content_index", 0) or 0)
+
+    def _ensure_text_for_item(self, data: dict) -> Iterator[bytes]:
+        item_key = self._text_key(data)[0]
+        if self._active_text_item is not None and self._active_text_item != item_key:
+            yield from self._stop_text_if_needed()
+        yield from self._ensure_text_block()
+        self._active_text_item = item_key
+
+    def _emit_text_for_item(self, data: dict, text: str) -> Iterator[bytes]:
+        yield from self._ensure_text_for_item(data)
+        key = self._text_key(data)
+        self._text_emitted_by_part[key] = self._text_emitted_by_part.get(key, "") + text
+        yield from self._emit_text_delta(text)
+
+    def _emit_text_tail(self, data: dict, value: Any) -> Iterator[bytes]:
+        if not isinstance(value, str) or not value:
+            return
+        key = self._text_key(data)
+        existing = self._text_emitted_by_part.get(key, "")
+        if value.startswith(existing) and len(value) > len(existing):
+            yield from self._emit_text_for_item(data, value[len(existing):])
+
     def _emit_text_delta(self, text: str) -> Iterator[bytes]:
         yield from self._ensure_text_block()
         self.state.text_blocks[self.state.text_index].append(text)
@@ -461,6 +606,7 @@ class StreamTranslator:
     def _stop_text_if_needed(self) -> Iterator[bytes]:
         if self.state.text_started and not self.state.text_stopped:
             self.state.text_stopped = True
+            self._active_text_item = None
             yield _emit("content_block_stop", {"type": "content_block_stop", "index": self.state.text_index})
 
     def _reasoning_for_item(self, data: dict, item: dict) -> _ReasoningState:
@@ -479,7 +625,8 @@ class StreamTranslator:
         if st is None:
             st = _ReasoningState(key=key, block_index=self.state.alloc_index())
             self.state.reasoning[key] = st
-        self.state.active_reasoning_key = key
+        if not st.stopped:
+            self.state.active_reasoning_key = key
         return st
 
     def _reasoning_for_event(self, data: dict) -> _ReasoningState:
@@ -525,12 +672,24 @@ class StreamTranslator:
     def _stop_active_reasoning(self) -> Iterator[bytes]:
         key = self.state.active_reasoning_key
         if key and key in self.state.reasoning:
-            yield from self._stop_reasoning(self.state.reasoning[key])
+            st = self.state.reasoning[key]
+            if not st.thinking and st.signature and not st.started:
+                st.stopped = True
+                self.state.active_reasoning_key = None
+                yield from self._emit_redacted_reasoning(st.signature, block_index=st.block_index)
+            elif st.thinking or st.started:
+                yield from self._stop_reasoning(st)
 
     def _stop_all_reasoning(self) -> Iterator[bytes]:
         for st in sorted(self.state.reasoning.values(), key=lambda value: value.block_index):
             if not st.stopped:
-                yield from self._stop_reasoning(st)
+                if not st.thinking and st.signature and not st.started:
+                    st.stopped = True
+                    if self.state.active_reasoning_key == st.key:
+                        self.state.active_reasoning_key = None
+                    yield from self._emit_redacted_reasoning(st.signature, block_index=st.block_index)
+                else:
+                    yield from self._stop_reasoning(st)
 
     def _emit_redacted_reasoning(self, signature: str, *, block_index: int | None = None) -> Iterator[bytes]:
         if not signature or signature in self.state.seen_reasoning_signatures:
@@ -602,11 +761,12 @@ class StreamTranslator:
         })
 
     def _flush_buffered_tool_args_if_needed(self, st: _ToolState) -> Iterator[bytes]:
-        if not self._should_buffer_tool_args(st):
+        if not self._should_buffer_tool_args(st) or st.args_emitted or st.stopped:
             return
         args_json = self._sanitized_tool_args_json(st)
         yield from self._start_tool_if_needed(st)
         if args_json:
+            st.args_emitted = True
             yield _emit("content_block_delta", {
                 "type": "content_block_delta",
                 "index": st.block_index,
@@ -628,6 +788,13 @@ class StreamTranslator:
     # ─── tool key helpers ────────────────────────────────────────
 
     def _key_from_item_event(self, data: dict, item: dict) -> str:
+        item_id = item.get("id") or data.get("item_id")
+        if item_id and item_id in self.state.item_id_to_key:
+            return self.state.item_id_to_key[item_id]
+        if item.get("call_id"):
+            for key, state in self.state.tools.items():
+                if state.id == item["call_id"]:
+                    return key
         if isinstance(data.get("output_index"), int):
             return f"oi:{data['output_index']}"
         item_id = item.get("id") or data.get("item_id")

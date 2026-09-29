@@ -242,15 +242,23 @@ def anthropic_reasoning_config_is_mappable(body: dict[str, Any] | None, *, targe
     """
     if not isinstance(body, dict):
         return False
-    has_reasoning_control = body.get("thinking") is not None or body.get("output_config") is not None
-    return bool(has_reasoning_control and resolve_anthropic_reasoning_effort(body, target_model=target_model))
+    output_config = body.get("output_config")
+    has_effort = isinstance(output_config, dict) and output_config.get("effort") is not None
+    thinking = body.get("thinking")
+    # Output format/task-budget hints are not reasoning controls. In particular,
+    # format-only requests must reach the structured-output converter.
+    if not has_effort and (thinking is None or (isinstance(thinking, dict) and thinking.get("type") == "disabled")):
+        return True
+    return bool(resolve_anthropic_reasoning_effort(body, target_model=target_model))
 
 
 def anthropic_thinking_is_disabled(body: dict[str, Any] | None) -> bool:
     if not isinstance(body, dict):
         return False
     thinking = body.get("thinking")
-    return isinstance(thinking, dict) and str(thinking.get("type") or "").strip().lower() == "disabled" and body.get("output_config") is None
+    output_config = body.get("output_config")
+    has_effort = isinstance(output_config, dict) and output_config.get("effort") is not None
+    return isinstance(thinking, dict) and str(thinking.get("type") or "").strip().lower() == "disabled" and not has_effort
 
 
 def anthropic_context_management_is_ignorable(value: Any) -> bool:
@@ -299,7 +307,11 @@ def _schema_allows_string(schema: Any) -> bool:
 
 
 def optional_empty_string_fields_from_tool_schema(schema: Any) -> set[str]:
-    """Return optional string fields where provider "" should mean omitted."""
+    """Optional strings whose schema explicitly rejects empty values.
+
+    Optional is not synonymous with empty-is-absent: an empty suffix can be an
+    intentional override of a default. Only omit demonstrably invalid empties.
+    """
     if not isinstance(schema, dict):
         return set()
     props = schema.get("properties")
@@ -311,6 +323,9 @@ def optional_empty_string_fields_from_tool_schema(schema: Any) -> set[str]:
         str(name)
         for name, prop_schema in props.items()
         if str(name) not in required and _schema_allows_string(prop_schema)
+        and ((isinstance(prop_schema.get("minLength"), (int, float)) and prop_schema["minLength"] > 0)
+             or (isinstance(prop_schema.get("enum"), list) and "" not in prop_schema["enum"])
+             or ("const" in prop_schema and prop_schema["const"] != ""))
     }
 
 
@@ -322,7 +337,14 @@ def optional_empty_string_fields_by_tool_from_anthropic_tools(tools: Any) -> dic
         name = str(tool.get("name") or "")
         if not name:
             continue
-        fields = optional_empty_string_fields_from_tool_schema(tool.get("input_schema"))
+        schema = tool.get("input_schema") or {}
+        fields = optional_empty_string_fields_from_tool_schema(schema)
+        # Claude Code Read's pages is an optional nonempty page selector despite
+        # older published schemas lacking minLength. Do not generalize this
+        # established compatibility fix to arbitrary tools/optional strings.
+        props = schema.get("properties") or {} if isinstance(schema, dict) else {}
+        if name == "Read" and "file_path" in props and "pages" in props and "pages" not in (schema.get("required") or []):
+            fields.add("pages")
         if fields:
             out[name] = fields
     return out
@@ -333,10 +355,15 @@ def optional_empty_string_fields_by_tool_from_responses_tools(tools: Any) -> dic
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
-        name = str(tool.get("name") or "")
+        definition = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = str(definition.get("name") or "")
         if not name:
             continue
-        fields = optional_empty_string_fields_from_tool_schema(tool.get("parameters"))
+        schema = definition.get("parameters") or {}
+        fields = optional_empty_string_fields_from_tool_schema(schema)
+        props = schema.get("properties") or {} if isinstance(schema, dict) else {}
+        if name == "Read" and "file_path" in props and "pages" in props and "pages" not in (schema.get("required") or []):
+            fields.add("pages")
         if fields:
             out[name] = fields
     return out

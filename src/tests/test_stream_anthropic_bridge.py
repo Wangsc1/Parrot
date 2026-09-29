@@ -260,6 +260,7 @@ def test_anthropic_stream_to_responses_text_tool_and_usage():
     chunks += list(tr.feed(b'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\\"q\\\":\\\"ping\\\"}"}}\n\n'))
     chunks += list(tr.feed(b'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n'))
     chunks += list(tr.feed(b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":2}}\n\n'))
+    chunks += list(tr.feed(b'event: message_stop\ndata: {"type":"message_stop"}\n\n'))
     chunks += list(tr.close())
 
     events = _events(chunks)
@@ -291,6 +292,7 @@ def test_anthropic_stream_to_responses_usage_delta_does_not_zero_prompt_cache():
     chunks += list(tr.feed(b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'))
     chunks += list(tr.feed(b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}\n\n'))
     chunks += list(tr.feed(b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":3}}\n\n'))
+    chunks += list(tr.feed(b'event: message_stop\ndata: {"type":"message_stop"}\n\n'))
     chunks += list(tr.close())
 
     completed = [d for e, d in _events(chunks) if e == "response.completed"][0]["response"]
@@ -444,7 +446,7 @@ def test_matrix_allows_openai_stream_to_anthropic_stream_upstream():
     assert DEFAULT_MATRIX.plan("responses", "anthropic", features=extract_request_features("responses", resp_body)).required_transforms == ["responses_to_anthropic"]
 
 
-def test_responses_stream_to_anthropic_drops_optional_empty_string_tool_args_by_schema():
+def test_responses_stream_to_anthropic_preserves_valid_optional_empty_string():
     request_body = {
         "tools": [{
             "name": "GenericTool",
@@ -471,9 +473,9 @@ def test_responses_stream_to_anthropic_drops_optional_empty_string_tool_args_by_
     assert deltas == [{
         "type": "content_block_delta",
         "index": 0,
-        "delta": {"type": "input_json_delta", "partial_json": '{"query":"x"}'},
+        "delta": {"type": "input_json_delta", "partial_json": '{"query":"x","optional_note":""}'},
     }]
-    assert tr.get_downstream_anthropic_assistant()["content"][0]["input"] == {"query": "x"}
+    assert tr.get_downstream_anthropic_assistant()["content"][0]["input"] == {"query": "x", "optional_note": ""}
 
 
 def test_responses_stream_to_anthropic_keeps_required_empty_and_nonempty_optional_args():

@@ -989,6 +989,8 @@ def test_matrix_guards_responses_stateful_file_audio_and_allows_request_controls
         {"input": "hi", "truncation": "auto"},
         {"input": "hi", "include": ["unsupported.include"]},
         {"input": "hi", "include": ["reasoning.encrypted_content"]},
+        {"input": [{"type": "reasoning", "encrypted_content": "gAAAA"}, {"role": "user", "content": "hi"}]},
+        {"input": "hi", "tools": [{"type": "custom", "name": "shell", "format": {"type": "text"}}]},
     ]
 
     for body in control_bodies:
@@ -1001,7 +1003,6 @@ def test_matrix_guards_responses_stateful_file_audio_and_allows_request_controls
         {"conversation": "conv_1", "input": "hi"},
         {"background": True, "input": "hi"},
         {"input": [{"type": "item_reference", "id": "item_1"}]},
-        {"input": [{"type": "reasoning", "encrypted_content": "gAAAA"}]},
         {"input": [{"type": "input_file", "file_id": "file_1"}]},
     ]
 
@@ -1156,14 +1157,13 @@ def test_matrix_allows_internal_prompt_cache_hints_to_anthropic():
         )
         assert plan.required_transforms == ["anthropic_to_chat" if upstream == "openai-chat" else "anthropic_to_responses"]
 
-    with pytest.raises(ProtocolGuardError, match="custom_tool_declaration"):
-        DEFAULT_MATRIX.plan(
-            "responses", "anthropic",
-            features=extract_request_features(
-                "responses",
-                {"input": "hi", "tools": [{"type": "custom", "name": "shell"}]},
-            ),
-        )
+    assert DEFAULT_MATRIX.plan(
+        "responses", "anthropic",
+        features=extract_request_features(
+            "responses",
+            {"input": "hi", "tools": [{"type": "custom", "name": "shell"}]},
+        ),
+    ).required_transforms == ["responses_to_anthropic"]
 
     assert DEFAULT_MATRIX.plan(
         "responses", "anthropic",
@@ -1176,14 +1176,13 @@ def test_matrix_allows_internal_prompt_cache_hints_to_anthropic():
         ),
     ).required_transforms == ["responses_to_anthropic"]
 
-    with pytest.raises(ProtocolGuardError):
-        DEFAULT_MATRIX.plan(
-            "responses", "anthropic",
-            features=extract_request_features(
-                "responses",
-                {"input": [{"type": "custom_tool_call", "call_id": "c1", "name": "shell", "input": "raw text"}]},
-            ),
-        )
+    assert DEFAULT_MATRIX.plan(
+        "responses", "anthropic",
+        features=extract_request_features(
+            "responses",
+            {"input": [{"type": "custom_tool_call", "call_id": "c1", "name": "shell", "input": "raw text"}]},
+        ),
+    ).required_transforms == ["responses_to_anthropic"]
 
 
 def test_matrix_rejects_images_when_channel_cannot_transport_them():

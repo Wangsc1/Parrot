@@ -255,6 +255,69 @@ def _codex_tools_contain_function_name(raw_tools: Any, name: str) -> bool:
     return False
 
 
+def _select_allowed_tools(definitions: list, choice: dict) -> tuple[list, str]:
+    """Compile allowed_tools without broadening the set or its calling mode."""
+    config = choice.get("allowed_tools") if isinstance(choice.get("allowed_tools"), dict) else choice
+    mode = config.get("mode", "auto")
+    allowed = config.get("tools")
+    if mode not in ("auto", "required") or not isinstance(allowed, list):
+        raise ValueError("allowed_tools requires tools[] and mode auto or required")
+    matched = set()
+
+    def select(tools, namespace=None):
+        selected = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "namespace":
+                children = select(tool.get("tools") or [], tool.get("name"))
+                if children:
+                    selected.append({**tool, "tools": children})
+                continue
+            hits = []
+            mcp_names = []
+            whole_mcp_server = False
+            for i, ref in enumerate(allowed):
+                if not isinstance(ref, dict) or ref.get("type") != tool.get("type"):
+                    continue
+                if ref.get("namespace") != namespace:
+                    continue
+                fn = ref.get("function")
+                name = ref.get("name") or (fn.get("name") if isinstance(fn, dict) else None)
+                if ref.get("type") in ("function", "custom") and (not name or name != tool.get("name")):
+                    continue
+                if ref.get("type") == "mcp":
+                    if not ref.get("server_label") or ref["server_label"] != tool.get("server_label"):
+                        continue
+                    if name:
+                        prior = tool.get("allowed_tools")
+                        prior_names = prior.get("tool_names") if isinstance(prior, dict) else prior
+                        if isinstance(prior_names, list) and name not in prior_names:
+                            continue
+                        mcp_names.append(name)
+                    else:
+                        whole_mcp_server = True
+                elif name and name != tool.get("name"):
+                    continue
+                hits.append(i)
+            if hits:
+                matched.update(hits)
+                if tool.get("type") == "mcp" and mcp_names and not whole_mcp_server:
+                    prior = tool.get("allowed_tools")
+                    names = list(dict.fromkeys(mcp_names))
+                    narrowed = {**prior, "tool_names": names} if isinstance(prior, dict) else names
+                    tool = {**tool, "allowed_tools": narrowed}
+                selected.append(tool)
+        return selected
+
+    selected = select(definitions)
+    if len(matched) != len(allowed):
+        raise ValueError("allowed_tools references a tool not present in the supplied definitions")
+    if mode == "required" and not selected:
+        raise ValueError("allowed_tools mode=required needs at least one allowed tool")
+    return selected, mode if selected else "none"
+
+
 def _normalize_codex_tool_choice(body: dict) -> bool:
     """把 tool_choice 规范化成 Codex endpoint 接受的结构。
 
@@ -267,6 +330,14 @@ def _normalize_codex_tool_choice(body: dict) -> bool:
     choice_type = _first_non_empty_string(choice.get("type"))
     if not choice_type:
         return False
+    if choice_type == "allowed_tools":
+        try:
+            selected, mode = _select_allowed_tools(body.get("tools") or [], choice)
+        except ValueError as exc:
+            raise GuardError(400, "invalid_request_error", str(exc), param="tool_choice", scope="candidate") from exc
+        body["tools"] = selected
+        body["tool_choice"] = mode
+        return True
     if choice_type == "function":
         fn = choice.get("function")
         name = _first_non_empty_string(choice.get("name"))
@@ -576,6 +647,11 @@ def _prepare_responses_lite_tool_choice(body: dict, thread_context: str | None) 
             body.pop("tools", None)
             return
         selected = []
+    elif isinstance(choice, dict) and choice.get("type") == "allowed_tools":
+        if body.get("previous_response_id"):
+            raise ValueError("Lite allowed_tools on a WS continuation requires a full request without previous_response_id")
+        selected, mode = _select_allowed_tools(definitions, choice)
+        body["tool_choice"] = mode
     elif isinstance(choice, dict):
         if body.get("previous_response_id"):
             raise ValueError("Lite named tool_choice on a WS continuation requires a full request without previous_response_id")

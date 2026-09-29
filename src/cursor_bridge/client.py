@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import threading
 import time
 import uuid
@@ -21,7 +20,7 @@ from .errors import (
 )
 from .models import CursorModel, list_cursor_models
 from .openai_messages import conversation_fingerprint, parse_messages, select_tools_for_choice
-from .request_builder import build_mcp_tools, build_run_request_bytes, enabled_tool_names
+from .request_builder import build_mcp_tools, build_run_request_bytes, decode_checkpoint, enabled_tool_names
 from .retry import clamp_max_retries, retry_delay_s, should_retry
 from .session import CursorSession, SessionEvent, new_conversation_id
 from .thinking import ThinkingTagFilter
@@ -31,21 +30,32 @@ SessionFactory = Callable[..., CursorSession]
 
 
 def _final_usage(usage: dict[str, int] | None, output_parts: list[str]) -> dict[str, int] | None:
-    if usage is None and not output_parts:
-        return None
-    estimated_output = 0
-    output_text = "".join(output_parts)
-    if output_text:
-        estimated_output = max(1, int(math.ceil(len(output_text.encode("utf-8", errors="replace")) / 3)))
-    current = usage or {}
-    completion = max(int(current.get("completion_tokens") or 0), estimated_output)
-    total = max(int(current.get("total_tokens") or 0), completion)
-    prompt = max(0, total - completion)
-    return {
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": prompt + completion,
-    }
+    """Report observed counters, never present a text estimate as exact usage.
+
+    Missing counters stay absent unless two known counters determine the third.
+    Keep output_parts in the helper signature for compatibility with callers.
+    """
+    current = dict(usage or {})
+    prompt = current.get("prompt_tokens")
+    completion = current.get("completion_tokens")
+    total = current.get("total_tokens")
+    if total is None and prompt is not None and completion is not None:
+        current["total_tokens"] = prompt + completion
+    elif prompt is None and total is not None and completion is not None and total >= completion:
+        current["prompt_tokens"] = total - completion
+    elif completion is None and total is not None and prompt is not None and total >= prompt:
+        current["completion_tokens"] = total - prompt
+    return current or None
+
+
+def _event_usage(event: SessionEvent) -> dict[str, int] | None:
+    # Session events distinguish an absent counter from an observed zero.
+    usage = {}
+    if event.output_tokens is not None:
+        usage["completion_tokens"] = event.output_tokens
+    if event.total_tokens is not None:
+        usage["total_tokens"] = event.total_tokens
+    return _final_usage(usage, [])
 
 
 def _split_context_tier(model: str) -> tuple[str, bool]:
@@ -66,6 +76,7 @@ class ConversationState:
     checkpoint: bytes | None = None
     blob_store: dict[str, bytes] = field(default_factory=dict)
     live: CursorSession | None = None
+    answered_tool_ids: set[str] = field(default_factory=set)
 
 
 class CursorClient:
@@ -178,17 +189,29 @@ class CursorClient:
         with self._conversation_lock:
             state = self._conversations.setdefault(key, ConversationState())
 
-        resumed = bool(parsed.tool_results and state.live is not None and state.live.alive)
+        pending_ids = {item.tool_call_id for item in state.live.pending_execs} if state.live is not None else set()
+        result_ids = {item.tool_call_id for item in parsed.tool_results}
+        resumed = bool(
+            state.live is not None and state.live.alive
+            and result_ids & pending_ids
+            and result_ids <= pending_ids | state.answered_tool_ids
+        )
         if resumed:
             assert state.live is not None
             state.live.send_tool_results(
                 [
                     {"tool_call_id": item.tool_call_id, "content": item.content, "is_error": False}
-                    for item in parsed.tool_results
+                    for item in parsed.tool_results if item.tool_call_id in pending_ids
                 ]
             )
+            state.answered_tool_ids.update(result_ids & pending_ids)
             session = state.live
         else:
+            # A dead/mismatched tool stream cannot accept Exec replies through
+            # a new UserMessageAction. Rebuild the ordered transcript instead of
+            # attaching tool text to an opaque checkpoint with pending calls.
+            if parsed.tool_results or pending_ids:
+                self._reset_conversation(state)
             session = self._open_session(
                 state,
                 model_id=model_id,
@@ -241,13 +264,12 @@ class CursorClient:
         if state.live is not None:
             state.live.close()
             state.live = None
-        user_text = parsed.user_text
-        if not user_text and parsed.tool_results:
-            user_text = "\n".join(item.content for item in parsed.tool_results)
+        has_checkpoint = decode_checkpoint(state.checkpoint) is not None
+        cloud_rule = parsed.system_prompt if has_checkpoint else parsed.reconstruction_prompt
         request_bytes = build_run_request_bytes(
             model_id=model_id,
-            system_prompt=parsed.system_prompt,
-            user_text=user_text,
+            system_prompt=cloud_rule,
+            user_text=parsed.user_text,
             turns=parsed.turns,
             conversation_id=state.conversation_id,
             checkpoint=state.checkpoint,
@@ -264,7 +286,9 @@ class CursorClient:
             blob_store=state.blob_store,
             mcp_tools=mcp_tools,
             enabled_tools=enabled,
-            cloud_rule=parsed.system_prompt or None,
+            # RequestContext callbacks must see the same reconstruction as
+            # the initial Run request, not just the first system instruction.
+            cloud_rule=cloud_rule or None,
             on_checkpoint=lambda blob, target=state: setattr(target, "checkpoint", blob),
             account_key=self.account_key,
             channel_key=self.channel_key,
@@ -280,6 +304,7 @@ class CursorClient:
         state.conversation_id = new_conversation_id()
         state.checkpoint = None
         state.blob_store.clear()
+        state.answered_tool_ids.clear()
 
     def _retry_or_raise(
         self,
@@ -406,11 +431,7 @@ class CursorClient:
                 )
                 tool_index += 1
             elif event.type == "usage":
-                best_usage = {
-                    "prompt_tokens": max(0, event.total_tokens - event.output_tokens),
-                    "completion_tokens": event.output_tokens,
-                    "total_tokens": event.total_tokens,
-                }
+                best_usage = _event_usage(event)
             elif event.type == "batchReady":
                 flushed = tag_filter.flush()
                 if flushed.reasoning:
@@ -440,6 +461,7 @@ class CursorClient:
                         auth_retried=auth_retried,
                     )
                     if retry:
+                        best_usage = None
                         current = open_session()
                         continue
                 if event.error:
@@ -526,11 +548,7 @@ class CursorClient:
                 if event.type == "text":
                     (reasoning if event.is_thinking else text).append(event.text)
                 elif event.type == "usage":
-                    usage = {
-                        "prompt_tokens": max(0, event.total_tokens - event.output_tokens),
-                        "completion_tokens": event.output_tokens,
-                        "total_tokens": event.total_tokens,
-                    }
+                    usage = _event_usage(event)
                 elif event.type == "toolCall" and event.exec is not None:
                     tool_calls.append({
                         "id": event.exec.tool_call_id,

@@ -242,12 +242,20 @@ def test_restore_static_tool_prefix_only_protocol_tool_name_fields(m):
     assert restored["content"][1]["name"] == "sessions_list"
 
 
-def test_restore_tool_name_field_in_incomplete_sse_json(m):
+def test_restore_tool_name_waits_for_complete_sse_event(m):
     cc = m["cc_mimicry"]
     raw = b'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"cc_sess_list"'
-    restored = cc._restore_tool_names_in_chunk(raw)
+    # Stateless inspection must not regex-rewrite incomplete protocol JSON.
+    assert cc._restore_tool_names_in_chunk(raw) == raw
+    state = cc.ToolNameRestoreMap()
+    assert cc._restore_tool_names_in_chunk(raw, state) == b""
+    assert cc._restore_tool_names_in_chunk(b',"input":{}}}', state) == b""
+    restored = cc._restore_tool_names_in_chunk(b'\n\n', state)
     assert b'"name":"sessions_list"' in restored
     assert b'cc_sess_list' not in restored
+    # A framed but malformed JSON event is retained, not made executable.
+    bad = b'data: {"name":"cc_sess_list"\n\n'
+    assert cc._restore_tool_names_in_chunk(bad, cc.ToolNameRestoreMap()) == bad
 
 
 

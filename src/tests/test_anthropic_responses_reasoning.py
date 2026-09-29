@@ -105,6 +105,78 @@ def test_stream_thinking_events_final_items_and_tool_order(bytewise, monkeypatch
     assert b"redacted-secret" not in raw
 
 
+@pytest.mark.parametrize("bytewise", [False, True])
+@pytest.mark.parametrize("blocks", [
+    ("thinking", "text", "tool_use"),
+    ("text", "tool_use", "text", "tool_use"),
+    ("tool_use", "text"),
+    ("text", "text"),
+])
+def test_each_text_block_finishes_in_place_without_merging_across_tools(blocks, bytewise, monkeypatch):
+    saved = []
+    monkeypatch.setattr(store, "is_enabled", lambda: True)
+    monkeypatch.setattr(store, "save", lambda **kw: saved.append(kw))
+    tr = make_stream_translator({**CTX, "api_key_name": "test", "current_input_items": []})
+    chunks = []
+    expected_text = []
+    for index, typ in enumerate(blocks):
+        if typ == "text":
+            block = {"type": "text", "text": f"start-{index}:"}
+            delta = _delta(index, "text_delta", text=f"end-{index}")
+            expected_text.append(f"start-{index}:end-{index}")
+        elif typ == "thinking":
+            block = {"type": "thinking", "thinking": ""}
+            delta = _delta(index, "thinking_delta", thinking="consider")
+        else:
+            block = {"type": "tool_use", "id": f"call_{index}", "name": "lookup", "input": {}}
+            delta = _delta(index, "input_json_delta", partial_json='{"q":"x"}')
+        wire = _wire(_start(index, block), delta, _stop(index))
+        pieces = (bytes([b]) for b in wire) if bytewise else [wire]
+        chunks += [chunk for piece in pieces for chunk in tr.feed(piece)]
+        done = [e for e in _events(chunks) if e["type"] == "response.output_item.done"]
+        # The text item must finish at its own block_stop, before the next tool starts.
+        assert [e["output_index"] for e in done] == list(range(index + 1))
+    chunks += list(tr.feed(_wire(
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use" if "tool_use" in blocks else "end_turn"}},
+        {"type": "message_stop"},
+    )))
+    chunks += list(tr.close())
+    assert list(tr.close()) == []
+    events = _events(chunks)
+    output = events[-1]["response"]["output"]
+    expected_types = [{"thinking": "reasoning", "text": "message", "tool_use": "function_call"}[typ] for typ in blocks]
+    assert [item["type"] for item in output] == expected_types
+    assert len({item["id"] for item in output}) == len(output)
+    assert [item["content"][0]["text"] for item in output if item["type"] == "message"] == expected_text
+    assert events[-1]["response"]["output_text"] == "".join(expected_text)
+    assert [e["sequence_number"] for e in events] == list(range(1, len(events) + 1))
+    done = [e for e in events if e["type"] == "response.output_item.done"]
+    assert [e["item"] for e in done] == output == saved[0]["output_items"]
+    for index, item in enumerate(output):
+        if item["type"] == "message":
+            text_deltas = [e for e in events if e["type"] == "response.output_text.delta" and e["output_index"] == index]
+            assert "".join(e["delta"] for e in text_deltas) == item["content"][0]["text"]
+            assert all(e["item_id"] == item["id"] for e in text_deltas)
+
+
+@pytest.mark.parametrize("stop_reason", ["end_turn", "max_tokens"])
+def test_close_finishes_unstopped_text_once(stop_reason):
+    tr = make_stream_translator(CTX)
+    chunks = list(tr.feed(_wire(
+        _start(0, {"type": "text", "text": "initial"}),
+        _delta(0, "text_delta", text=" tail"),
+        {"type": "message_delta", "delta": {"stop_reason": stop_reason}},
+        {"type": "message_stop"},
+    ))) + list(tr.close())
+    events = _events(chunks)
+    done = [e for e in events if e["type"] == "response.output_item.done"]
+    assert len(done) == 1
+    assert done[0]["item"]["content"][0]["text"] == "initial tail"
+    assert events[-1]["response"]["output"] == [done[0]["item"]]
+    assert events[-1]["type"] == ("response.incomplete" if stop_reason == "max_tokens" else "response.completed")
+    assert list(tr.close()) == []
+
+
 def test_thinking_is_visible_through_production_commit_gate():
     tr = make_stream_translator(CTX)
     gate = SseCommitGate(protocol="responses", stream_translator=tr)
@@ -122,6 +194,7 @@ def test_close_finishes_reasoning_without_block_stop_once():
     chunks = list(tr.feed(_wire(
         _start(0, {"type": "thinking", "thinking": "已有思考"}),
         {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}},
+        {"type": "message_stop"},
     ))) + list(tr.close())
     events = _events(chunks)
     assert sum(e["type"] == "response.reasoning_summary_text.done" for e in events) == 1
@@ -169,22 +242,30 @@ def test_nonstream_thinking_and_native_tool_continuation(mode, monkeypatch):
         "usage": {"input_tokens": 5, "output_tokens": 7},
     }
     out = apply_non_stream_response_translator(message, {**CTX, "api_key_name": "test", "current_input_items": []})
-    expected_types = (["reasoning"] if mode == "passthrough" else []) + ["message", "function_call"]
+    expected_types = (["reasoning", "reasoning"] if mode == "passthrough" else []) + ["message", "function_call"]
     assert [item["type"] for item in out["output"]] == expected_types
     if mode == "passthrough":
-        assert out["output"][0]["summary"] == [{"type": "summary_text", "text": "先分析再检查"}]
+        assert [item["summary"] for item in out["output"] if item["type"] == "reasoning"] == [
+            [{"type": "summary_text", "text": "先分析"}],
+            [{"type": "summary_text", "text": "再检查"}],
+        ]
     assert saved[0]["output_items"] == out["output"]
     assert out["output_text"] == "正文"
     assert "encrypted_content" not in json.dumps(out)
-    # OpenBear replays output items verbatim with the next tool result. A
-    # display-only summary must not turn that request into an encrypted-history
-    # guard error or alter the original tool call/result payload.
+    # OpenBear replays output items verbatim with the next tool result. Readable
+    # summaries follow the configured bridge policy; no signed/opaque replay
+    # is attempted and the original tool call/result payload stays intact.
     followup = responses_to_anthropic.translate_request({
         "model": "GLM-5.3",
         "input": [{"role": "user", "content": "查一下"}, *out["output"],
                   {"type": "function_call_output", "call_id": "call_1", "output": "结果"}],
     })
+    summaries = ([
+        {"type": "text", "text": "[Previous assistant reasoning summary]\n先分析"},
+        {"type": "text", "text": "[Previous assistant reasoning summary]\n再检查"},
+    ] if mode == "passthrough" else [])
     assert followup["messages"][-2]["content"] == [
+        *summaries,
         {"type": "text", "text": "正文"},
         {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"q": "x"}},
     ]

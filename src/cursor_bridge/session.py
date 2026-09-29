@@ -36,8 +36,9 @@ class SessionEvent:
     text: str = ""
     is_thinking: bool = False
     exec: PendingExec | None = None
-    output_tokens: int = 0
-    total_tokens: int = 0
+    # None means no upstream counter was observed; zero is a real value.
+    output_tokens: int | None = None
+    total_tokens: int | None = None
     error: str | None = None
     retry_hint: RetryHint | None = None
     http_status: int | None = None
@@ -46,8 +47,9 @@ class SessionEvent:
 @dataclass
 class StreamState:
     pending_execs: list[PendingExec] = field(default_factory=list)
-    output_tokens: int = 0
-    total_tokens: int = 0
+    # None means no upstream counter was observed; zero is a real value.
+    output_tokens: int | None = None
+    total_tokens: int | None = None
     end_stream_seen: bool = False
     checkpoint_after_exec: bool = False
 
@@ -284,7 +286,7 @@ class CursorSession:
         elif case == "thinking_delta" and update.thinking_delta.text:
             self.events.put(SessionEvent(type="text", text=update.thinking_delta.text, is_thinking=True))
         elif case == "token_delta":
-            self.state.output_tokens += update.token_delta.tokens
+            self.state.output_tokens = (self.state.output_tokens or 0) + update.token_delta.tokens
             self.events.put(
                 SessionEvent(
                     type="usage",

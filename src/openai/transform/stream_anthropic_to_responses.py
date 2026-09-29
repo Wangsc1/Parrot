@@ -14,8 +14,9 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
 from .common import build_response_skeleton, build_response_usage, reasoning_passthrough_enabled
-from .responses_to_anthropic import NamespaceToolMap
+from .responses_to_anthropic import NamespaceToolMap, _CUSTOM_RAW_KEY
 from ...protocols.usage import legacy_usage_from_anthropic_json
+from ...protocols.sse import split_sse_events
 
 
 def _gen_id(prefix: str) -> str:
@@ -29,7 +30,7 @@ def _emit(event: str, data: dict) -> bytes:
 def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
     event_name: Optional[str] = None
     data_lines: list[str] = []
-    for line in block.split("\n"):
+    for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = line.strip()
         if line.startswith("event:"):
             event_name = line[6:].strip() or None
@@ -98,12 +99,21 @@ class _ReasoningState:
 
 
 @dataclass
+class _TextState:
+    item_id: str
+    output_index: int
+    text_parts: list[str] = field(default_factory=list)
+    done: bool = False
+
+
+@dataclass
 class _ToolState:
     block_index: int
     output_index: int
     id: str = ""
     name: str = ""
     args: str = ""
+    initial_input: dict = field(default_factory=dict)
     started: bool = False
     done: bool = False
 
@@ -117,17 +127,13 @@ class _State:
     request_body: Optional[dict] = None
     created_emitted: bool = False
     terminal_emitted: bool = False
-    message_item_started: bool = False
-    content_part_started: bool = False
-    message_item_done: bool = False
-    msg_item_id: str = ""
     sequence: int = 0
     next_output_index: int = 0
-    text_output_index: int = -1
-    text_parts: list[str] = field(default_factory=list)
+    messages: dict[int, _TextState] = field(default_factory=dict)
     tools: dict[int, _ToolState] = field(default_factory=dict)
     reasoning: dict[int, _ReasoningState] = field(default_factory=dict)
     stop_reason: Optional[str] = None
+    message_stopped: bool = False
     usage: Optional[dict] = None
 
     def next_seq(self) -> int:
@@ -171,13 +177,13 @@ class StreamTranslator:
         self._store_current_input = current_input_items
         self._namespace_tool_map = namespace_tool_map
         self._reasoning_enabled = reasoning_passthrough_enabled()
+        self._invalid_tool = False
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         if not chunk:
             return
-        self._buf += chunk
-        while b"\n\n" in self._buf:
-            block_bytes, self._buf = self._buf.split(b"\n\n", 1)
+        self._buf, blocks = split_sse_events(self._buf + chunk)
+        for block_bytes in blocks:
             block = block_bytes.decode("utf-8", errors="replace")
             if not block.strip():
                 continue
@@ -191,28 +197,47 @@ class StreamTranslator:
             return
         self.state.terminal_emitted = True
         yield from self._ensure_created()
-        for st in self.state.reasoning.values():
-            yield from self._finish_reasoning(st)
-        yield from self._close_message_item_if_needed()
-        yield from self._close_all_tools()
+        pending = [
+            (st.output_index, self._finish_reasoning(st))
+            for st in self.state.reasoning.values() if not st.done
+        ]
+        pending.extend(
+            (st.output_index, self._close_message_item_if_needed(st))
+            for st in self.state.messages.values() if not st.done
+        )
+        pending.extend(
+            (st.output_index, self._finish_tool(st))
+            for st in self.state.tools.values() if st.started and not st.done
+        )
+        for _, events in sorted(pending, key=lambda pair: pair[0]):
+            yield from events
+        if self.state.terminal_emitted and self._invalid_tool:
+            return
         status, incomplete = _status_from_stop(
             self.state.stop_reason,
             has_tool=any(t.started for t in self.state.tools.values()),
         )
+        if self.state.stop_reason is None or not self.state.message_stopped or self._buf.strip():
+            status, incomplete = "failed", None
         resp = self._response_skeleton(status=status)
         resp["output"] = self._collect_output_items()
         resp["output_text"] = self._output_text()
         resp["usage"] = _responses_usage_from_anthropic(self.state.usage)
         if incomplete:
             resp["incomplete_details"] = incomplete
-        yield _emit(f"response.{status if status != 'completed' else 'completed'}", {
-            "type": f"response.{status if status != 'completed' else 'completed'}",
+        if status == "failed":
+            resp["error"] = {"type": "upstream_error", "code": "incomplete_stream", "message": "Anthropic stream ended without a complete message_stop"}
+        yield _emit(f"response.{status}", {
+            "type": f"response.{status}",
             "sequence_number": self.state.next_seq(),
             "response": resp,
         })
-        self._save_to_store_if_configured()
+        if status != "failed":
+            self._save_to_store_if_configured()
 
     def _handle_event(self, event_name: str, data: dict) -> Iterator[bytes]:
+        if self.state.terminal_emitted:
+            return
         typ = str(data.get("type") or event_name or "")
         if typ == "error" or isinstance(data.get("error"), dict):
             yield from self._ensure_created()
@@ -255,12 +280,13 @@ class StreamTranslator:
             if btype == "thinking":
                 yield from self._emit_reasoning(int(data.get("index", 0) or 0), block.get("thinking"))
             elif btype == "text":
-                yield from self._ensure_message_text_item()
+                yield from self._emit_text(int(data.get("index", 0) or 0), block.get("text"))
             elif btype == "tool_use":
                 idx = int(data.get("index", 0) or 0)
                 st = self._tool(idx)
                 st.id = str(block.get("id") or st.id or _gen_id("call_"))
                 st.name = str(block.get("name") or st.name or "tool")
+                st.initial_input = block.get("input") if isinstance(block.get("input"), dict) else {}
                 st.started = True
                 yield from self._ensure_created()
                 yield _emit("response.output_item.added", {
@@ -277,19 +303,7 @@ class StreamTranslator:
             if dt == "thinking_delta":
                 yield from self._emit_reasoning(int(data.get("index", 0) or 0), delta.get("thinking"))
             elif dt == "text_delta":
-                text = delta.get("text")
-                if isinstance(text, str) and text:
-                    yield from self._ensure_message_text_item()
-                    self.state.text_parts.append(text)
-                    yield _emit("response.output_text.delta", {
-                        "type": "response.output_text.delta",
-                        "sequence_number": self.state.next_seq(),
-                        "item_id": self.state.msg_item_id,
-                        "output_index": self.state.text_output_index,
-                        "content_index": 0,
-                        "delta": text,
-                        "logprobs": [],
-                    })
+                yield from self._emit_text(int(data.get("index", 0) or 0), delta.get("text"))
             elif dt == "input_json_delta":
                 idx = int(data.get("index", 0) or 0)
                 if idx in self._hosted_blocks:
@@ -309,6 +323,8 @@ class StreamTranslator:
                         if identity is not None and identity.kind == "custom"
                         else "response.function_call_arguments.delta"
                     )
+                    if identity is not None and identity.kind == "custom" and self._is_raw_custom(st):
+                        return  # JSON string escaping is not a raw-text delta; emit decoded text at block end.
                     yield _emit(event, {
                         "type": event,
                         "sequence_number": self.state.next_seq(),
@@ -320,12 +336,19 @@ class StreamTranslator:
 
         if typ == "content_block_stop":
             idx = int(data.get("index", 0) or 0)
+            message = self.state.messages.get(idx)
+            if message is not None:
+                yield from self._close_message_item_if_needed(message)
             reasoning = self.state.reasoning.get(idx)
             if reasoning is not None:
                 yield from self._finish_reasoning(reasoning)
             st = self.state.tools.get(idx)
             if st is not None and st.started and not st.done:
                 yield from self._finish_tool(st)
+            return
+
+        if typ == "message_stop":
+            self.state.message_stopped = True
             return
 
         if typ == "message_delta":
@@ -344,57 +367,70 @@ class StreamTranslator:
         yield _emit("response.created", {"type": "response.created", "sequence_number": self.state.next_seq(), "response": created})
         yield _emit("response.in_progress", {"type": "response.in_progress", "sequence_number": self.state.next_seq(), "response": created})
 
-    def _ensure_message_text_item(self) -> Iterator[bytes]:
+    def _emit_text(self, block_index: int, text: Any) -> Iterator[bytes]:
         yield from self._ensure_created()
-        if not self.state.message_item_started:
-            self.state.message_item_started = True
-            self.state.text_output_index = self.state.alloc_output_index()
-            self.state.msg_item_id = f"msg_{self.state.resp_id}_0"
+        st = self.state.messages.get(block_index)
+        if st is None:
+            # Each Anthropic text block owns one Responses message. A later text
+            # block must not be appended across an intervening tool/reasoning item.
+            st = _TextState(
+                item_id=f"msg_{self.state.resp_id}_{block_index}",
+                output_index=self.state.alloc_output_index(),
+            )
+            self.state.messages[block_index] = st
             yield _emit("response.output_item.added", {
                 "type": "response.output_item.added",
                 "sequence_number": self.state.next_seq(),
-                "output_index": self.state.text_output_index,
-                "item": {"id": self.state.msg_item_id, "type": "message", "status": "in_progress", "content": [], "role": "assistant"},
+                "output_index": st.output_index,
+                "item": {"id": st.item_id, "type": "message", "status": "in_progress", "content": [], "role": "assistant"},
             })
-        if not self.state.content_part_started:
-            self.state.content_part_started = True
             yield _emit("response.content_part.added", {
                 "type": "response.content_part.added",
                 "sequence_number": self.state.next_seq(),
-                "item_id": self.state.msg_item_id,
-                "output_index": self.state.text_output_index,
+                "item_id": st.item_id,
+                "output_index": st.output_index,
                 "content_index": 0,
                 "part": {"type": "output_text", "annotations": [], "logprobs": [], "text": ""},
             })
-
-    def _close_message_item_if_needed(self) -> Iterator[bytes]:
-        if not self.state.message_item_started or self.state.message_item_done:
-            return
-        text = "".join(self.state.text_parts)
-        if self.state.content_part_started:
-            yield _emit("response.output_text.done", {
-                "type": "response.output_text.done",
+        if isinstance(text, str) and text and not st.done:
+            st.text_parts.append(text)
+            yield _emit("response.output_text.delta", {
+                "type": "response.output_text.delta",
                 "sequence_number": self.state.next_seq(),
-                "item_id": self.state.msg_item_id,
-                "output_index": self.state.text_output_index,
+                "item_id": st.item_id,
+                "output_index": st.output_index,
                 "content_index": 0,
-                "text": text,
+                "delta": text,
                 "logprobs": [],
             })
-            yield _emit("response.content_part.done", {
-                "type": "response.content_part.done",
-                "sequence_number": self.state.next_seq(),
-                "item_id": self.state.msg_item_id,
-                "output_index": self.state.text_output_index,
-                "content_index": 0,
-                "part": {"type": "output_text", "annotations": [], "logprobs": [], "text": text},
-            })
-        self.state.message_item_done = True
+
+    def _close_message_item_if_needed(self, st: _TextState) -> Iterator[bytes]:
+        if st.done:
+            return
+        st.done = True
+        text = "".join(st.text_parts)
+        yield _emit("response.output_text.done", {
+            "type": "response.output_text.done",
+            "sequence_number": self.state.next_seq(),
+            "item_id": st.item_id,
+            "output_index": st.output_index,
+            "content_index": 0,
+            "text": text,
+            "logprobs": [],
+        })
+        yield _emit("response.content_part.done", {
+            "type": "response.content_part.done",
+            "sequence_number": self.state.next_seq(),
+            "item_id": st.item_id,
+            "output_index": st.output_index,
+            "content_index": 0,
+            "part": {"type": "output_text", "annotations": [], "logprobs": [], "text": text},
+        })
         yield _emit("response.output_item.done", {
             "type": "response.output_item.done",
             "sequence_number": self.state.next_seq(),
-            "output_index": self.state.text_output_index,
-            "item": self._message_output_item(),
+            "output_index": st.output_index,
+            "item": self._message_output_item(st),
         })
 
     def _emit_reasoning(self, block_index: int, text: Any) -> Iterator[bytes]:
@@ -474,15 +510,37 @@ class StreamTranslator:
 
     def _finish_tool(self, st: _ToolState) -> Iterator[bytes]:
         st.done = True
-        args = st.args or "{}"
+        args = st.args or json.dumps(st.initial_input, ensure_ascii=False, separators=(",", ":"))
         identity = self._tool_identity(st)
-        if identity is not None and identity.kind == "custom":
+        if identity is not None and identity.kind == "custom" and self._is_raw_custom(st):
+            try:
+                wrapped = json.loads(args)
+                if not isinstance(wrapped, dict) or not isinstance(wrapped.get(_CUSTOM_RAW_KEY), str):
+                    raise ValueError("missing raw input")
+                raw = wrapped[_CUSTOM_RAW_KEY]
+            except (ValueError, TypeError):
+                st.done = False
+                self._invalid_tool = True
+                self.state.terminal_emitted = True
+                yield _emit("response.failed", {"type": "response.failed", "sequence_number": self.state.next_seq(),
+                    "response": {**self._response_skeleton(status="failed"), "output": self._collect_output_items(),
+                    "error": {"code": "invalid_tool_input", "message": "Claude custom tool input was not a raw-text wrapper"}}})
+                return
+            yield _emit("response.custom_tool_call_input.delta", {
+                "type": "response.custom_tool_call_input.delta", "sequence_number": self.state.next_seq(),
+                "item_id": f"fc_{st.id}", "output_index": st.output_index, "delta": raw,
+            })
             yield _emit("response.custom_tool_call_input.done", {
                 "type": "response.custom_tool_call_input.done",
                 "sequence_number": self.state.next_seq(),
                 "item_id": f"fc_{st.id}",
                 "output_index": st.output_index,
-                "input": args,
+                "input": raw,
+            })
+        elif identity is not None and identity.kind == "custom":
+            yield _emit("response.custom_tool_call_input.done", {
+                "type": "response.custom_tool_call_input.done", "sequence_number": self.state.next_seq(),
+                "item_id": f"fc_{st.id}", "output_index": st.output_index, "input": args,
             })
         else:
             yield _emit("response.function_call_arguments.done", {
@@ -500,28 +558,28 @@ class StreamTranslator:
             "item": self._tool_output_item(st),
         })
 
-    def _close_all_tools(self) -> Iterator[bytes]:
-        for idx in sorted(self.state.tools.keys()):
-            st = self.state.tools[idx]
-            if st.started and not st.done:
-                yield from self._finish_tool(st)
-
-    def _message_output_item(self) -> dict:
+    def _message_output_item(self, st: _TextState) -> dict:
         return {
-            "id": self.state.msg_item_id,
+            "id": st.item_id,
             "type": "message",
-            "status": "completed",
+            "status": "completed" if st.done else "in_progress",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": "".join(self.state.text_parts), "annotations": []}],
+            "content": [{"type": "output_text", "text": "".join(st.text_parts), "annotations": []}],
         }
 
     def _output_text(self) -> str:
-        return "".join(self.state.text_parts)
+        return "".join(
+            "".join(st.text_parts)
+            for st in sorted(self.state.messages.values(), key=lambda value: value.output_index)
+        )
 
     def _tool_identity(self, st: _ToolState):
         if self._namespace_tool_map is None:
             return None
         return self._namespace_tool_map.identity_for_flat(st.name)
+
+    def _is_raw_custom(self, st: _ToolState) -> bool:
+        return self._namespace_tool_map is not None and st.name in self._namespace_tool_map.raw_custom_flats
 
     def _tool_output_item(
         self, st: _ToolState, *, status: str = "completed", value: str | None = None,
@@ -530,25 +588,35 @@ class StreamTranslator:
         name = identity.child_name if identity is not None else (st.name or "tool")
         item = {
             "id": f"fc_{st.id}", "type": "function_call", "status": status,
-            "arguments": st.args or "{}" if value is None else value,
+            "arguments": (st.args or json.dumps(st.initial_input, ensure_ascii=False, separators=(",", ":"))) if value is None else value,
             "call_id": st.id, "name": name,
         }
         if identity is not None and identity.namespace is not None:
             item["namespace"] = identity.namespace
         if identity is not None and identity.kind == "custom":
             item["type"] = "custom_tool_call"
-            item["input"] = item.pop("arguments")
+            wrapped = item.pop("arguments")
+            if not self._is_raw_custom(st):
+                item["input"] = wrapped
+            elif status == "in_progress":
+                item["input"] = ""
+            else:
+                try:
+                    decoded = json.loads(wrapped)
+                    item["input"] = decoded[_CUSTOM_RAW_KEY] if isinstance(decoded, dict) and isinstance(decoded.get(_CUSTOM_RAW_KEY), str) else ""
+                except (ValueError, TypeError):
+                    item["input"] = ""
         return item
 
     def _collect_output_items(self) -> list[dict]:
         items: list[dict] = []
         pairs: list[tuple[int, dict]] = list(self._hosted_items.values())
         pairs.extend((st.output_index, self._reasoning_output_item(st)) for st in self.state.reasoning.values())
-        if self.state.message_item_started:
-            pairs.append((self.state.text_output_index, self._message_output_item()))
+        pairs.extend((st.output_index, self._message_output_item(st)) for st in self.state.messages.values())
         for st in self.state.tools.values():
             if st.started:
-                pairs.append((st.output_index, self._tool_output_item(st)))
+                pairs.append((st.output_index, self._tool_output_item(
+                    st, status="completed" if st.done else "in_progress")))
         for _, item in sorted(pairs, key=lambda x: x[0]):
             items.append(item)
         return items

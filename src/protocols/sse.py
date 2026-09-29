@@ -1,11 +1,13 @@
 """Shared, byte-oriented Server-Sent Events framing helpers.
 
-SSE permits both LF (``\n\n``) and CRLF (``\r\n\r\n``) blank-line event
+SSE permits LF, CRLF and bare CR line endings and blank-line event
 separators.  HTTP clients expose wire bytes unchanged, so protocol adapters must
 not assume that CRLF has already been normalized for them.
 """
 
 from __future__ import annotations
+
+import re
 
 
 def _next_event_separator(buf: bytes) -> tuple[int, int]:
@@ -15,13 +17,14 @@ def _next_event_separator(buf: bytes) -> tuple[int, int]:
     this byte-oriented avoids corrupting a partial UTF-8 sequence while callers
     buffer incremental network reads.
     """
-    lf_at = buf.find(b"\n\n")
-    crlf_at = buf.find(b"\r\n\r\n")
-    if lf_at < 0 and crlf_at < 0:
-        return -1, 0
-    if crlf_at < 0 or (lf_at >= 0 and lf_at < crlf_at):
-        return lf_at, 2
-    return crlf_at, 4
+    # Tokenize line endings before looking for adjacent ones. A backtracking
+    # (CRLF|CR|LF){2} regex can incorrectly split a *single* CRLF into CR + LF.
+    previous = None
+    for ending in re.finditer(rb"\r\n|\r|\n", buf):
+        if previous is not None and ending.start() == previous.end():
+            return previous.start(), ending.end() - previous.start()
+        previous = ending
+    return -1, 0
 
 
 def split_sse_events(buf: bytes) -> tuple[bytes, list[bytes]]:
@@ -33,6 +36,9 @@ def split_sse_events(buf: bytes) -> tuple[bytes, list[bytes]]:
     """
     events: list[bytes] = []
     while True:
+        # Empty events carry no data. This also consumes the optional LF when
+        # the preceding chunk ended with a CR that dispatched a blank line.
+        buf = buf.lstrip(b"\r\n")
         separator_at, separator_len = _next_event_separator(buf)
         if separator_at < 0:
             break

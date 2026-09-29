@@ -32,6 +32,10 @@ class ResponseNotFound(Exception):
     pass
 
 
+class ResponseHistoryError(ResponseNotFound):
+    """A corrupt or explicitly bounded chain cannot be replayed losslessly."""
+
+
 class ResponseExpired(Exception):
     pass
 
@@ -473,12 +477,20 @@ def lookup(response_id: str, *, api_key_name: str) -> StoredResponse:
 
 
 def expand_history(response_id: str, *, api_key_name: str,
-                   max_depth: int = 50) -> list[dict]:
-    """沿 parent_id 展开为老→新 items；遇到循环或超过 max_depth 时截断。"""
+                   max_depth: int | None = None) -> list[dict]:
+    """Replay the complete chain, oldest first; never return a truncated prefix.
+
+    TTL and ownership checks remain in lookup for *every* ancestor. An optional
+    caller-supplied bound is a safety limit, not permission to discard history.
+    """
     chain: list[StoredResponse] = []
     seen: set[str] = set()
     cur: Optional[str] = response_id
-    while cur and cur not in seen and len(chain) < max_depth:
+    while cur:
+        if cur in seen:
+            raise ResponseHistoryError(f"cycle in response history at {cur}")
+        if max_depth is not None and len(chain) >= max_depth:
+            raise ResponseHistoryError(f"response history exceeds max_depth={max_depth}")
         seen.add(cur)
         rec = lookup(cur, api_key_name=api_key_name)
         chain.append(rec)

@@ -67,7 +67,7 @@ ANTHROPIC_MESSAGES_REQ_ALLOWED: frozenset[str] = frozenset({
 
 ANTHROPIC_BRIDGE_REQ_ALLOWED: frozenset[str] = frozenset({
     "model", "messages", "max_tokens", "cache_control", "metadata", "service_tier", "speed",
-    "stop_sequences", "stream", "system", "temperature", "tool_choice",
+    "stop_sequences", "stream", "system", "temperature", "thinking", "output_config", "tool_choice",
     "tools", "top_p",
 }) | PARROT_INTERNAL_REQ_FIELDS
 

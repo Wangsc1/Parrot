@@ -568,6 +568,7 @@ async def aggregate_stream_as_non_stream_response(
     else:
         builder = toolkit["stream_builder"]()
     tracker = toolkit["stream_tracker"]()
+    tracker.preserve_incomplete = (translator_ctx or {}).get("response_translator") == "anthropic_to_responses"
     builder.feed(first_chunk_restored)
     tracker.feed(first_chunk_restored)
     raw_buf.extend(
@@ -594,6 +595,7 @@ async def aggregate_stream_as_non_stream_response(
         return StreamAsNonStreamResult(error=with_partial_billing(err))
 
     while not (chat_upstream and builder.done_received):
+        eof = False
         try:
             chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
         except asyncio.CancelledError:
@@ -610,7 +612,8 @@ async def aggregate_stream_as_non_stream_response(
         except StopAsyncIteration:
             if timing is not None:
                 timing.mark_io_complete()
-            break
+            eof = True
+            chunk = b""
         except httpx.TimeoutException as exc:
             await close_response_context(ctx)
             return StreamAsNonStreamResult(
@@ -633,12 +636,17 @@ async def aggregate_stream_as_non_stream_response(
                 )))
             )
         try:
-            restored_chunk = await provider_registry.restore_response_bytes(
-                channel,
-                chunk,
-                dynamic_map=dynamic_map,
-                translator_ctx=translator_ctx,
-            )
+            if eof:
+                restored_chunk = await provider_registry.finish_response_bytes(
+                    channel, dynamic_map=dynamic_map, translator_ctx=translator_ctx,
+                )
+            else:
+                restored_chunk = await provider_registry.restore_response_bytes(
+                    channel,
+                    chunk,
+                    dynamic_map=dynamic_map,
+                    translator_ctx=translator_ctx,
+                )
         except Exception as exc:
             raw_buf.extend(bytes(chunk))
             await close_response_context(ctx)
@@ -665,6 +673,8 @@ async def aggregate_stream_as_non_stream_response(
         ):
             await close_response_context(ctx)
             return StreamAsNonStreamResult(error=with_partial_billing(err))
+        if eof:
+            break
 
     response_headers = metadata_from_response(response).forward_headers()
     await close_response_context(ctx)
@@ -773,7 +783,18 @@ async def _read_until_first_downstream_chunk(
         return downstream_chunks, err
 
     while True:
-        chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
+        try:
+            chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
+        except StopAsyncIteration:
+            if timing is not None:
+                timing.mark_io_complete()
+            restored = await provider_registry.finish_response_bytes(
+                channel, dynamic_map=dynamic_map, translator_ctx=translator_ctx,
+            )
+            downstream_chunks, err = await feed_restored(restored) if restored else ([], None)
+            if downstream_chunks or err is not None:
+                return downstream_chunks, err
+            raise
         restored = await restore(chunk)
         downstream_chunks, err = await feed_restored(restored)
         if downstream_chunks or err is not None:
@@ -857,6 +878,7 @@ async def prepare_stream_response_start(
         partial_state["tracker"] = tracker
     ch_proto = getattr(channel, "protocol", "anthropic")
     stream_translator = make_stream_translator(translator_ctx)
+    tracker.preserve_incomplete = bool(getattr(stream_translator, "preserves_incomplete", False))
 
     def _attach_precommit_response(result: AttemptResult) -> AttemptResult:
         """Keep pre-commit SSE bytes and strict tracker billing facts together."""
@@ -940,26 +962,6 @@ async def prepare_stream_response_start(
             )
         if pre_visible_error:
             await close_response_context(ctx)
-            # A Responses ``response.incomplete`` before any downstream-visible
-            # bytes can be surfaced by the commit gate as a pre-commit error.
-            # ``max_output_tokens`` is request/context-budget scoped, not an
-            # unhealthy upstream: preserve its normalized 400 semantics so the
-            # failover loop does not cool down the only eligible channel.
-            if protocol_errors.is_responses_max_output_incomplete(pre_visible_error):
-                message = protocol_errors.responses_max_output_context_error_message(
-                    protocol_errors.responses_incomplete_reason(pre_visible_error)
-                )
-                return HttpStreamStartResult(
-                    error=_attach_precommit_response(AttemptResult(
-                        outcome="request_invalid",
-                        connect_ms=connect_ms,
-                        first_byte_ms=first_byte_ms,
-                        http_status=400,
-                        error_code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
-                        error_detail=message,
-                        translator_ctx=translator_ctx,
-                    ))
-                )
             return HttpStreamStartResult(
                 error=_attach_precommit_response(AttemptResult(
                     outcome="upstream_error_json",
@@ -1062,6 +1064,7 @@ async def read_next_stream_step(
 ) -> HttpStreamReadStep:
     """Read and normalize one post-commit HTTP SSE stream step."""
     while True:
+        eof = False
         try:
             chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
         except BusinessTimeoutError as exc:
@@ -1074,7 +1077,8 @@ async def read_next_stream_step(
         except StopAsyncIteration:
             if timing is not None:
                 timing.mark_io_complete()
-            return HttpStreamReadStep(kind="end")
+            eof = True
+            chunk = b""
         except httpx.TimeoutException as exc:
             outcome = classify_httpx_timeout(exc)
             return HttpStreamReadStep(
@@ -1096,12 +1100,19 @@ async def read_next_stream_step(
             )
 
         try:
-            restored = await provider_registry.restore_response_bytes(
-                channel,
-                chunk,
-                dynamic_map=dynamic_map,
-                translator_ctx=translator_ctx,
-            )
+            if eof:
+                restored = await provider_registry.finish_response_bytes(
+                    channel, dynamic_map=dynamic_map, translator_ctx=translator_ctx,
+                )
+                if not restored:
+                    return HttpStreamReadStep(kind="end")
+            else:
+                restored = await provider_registry.restore_response_bytes(
+                    channel,
+                    chunk,
+                    dynamic_map=dynamic_map,
+                    translator_ctx=translator_ctx,
+                )
         except Exception as exc:
             try:
                 tracker.feed(chunk)

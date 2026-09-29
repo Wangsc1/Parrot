@@ -935,7 +935,6 @@ def test_claude_tool_schema_is_sanitized(m):
 
 def test_anthropic_thinking_history_replays_as_thought(m):
     from src.openai.transform import anthropic_to_responses
-    from src.openai.transform.guard import GuardError
 
     history = {
         "model": "claude-sonnet-4-6",
@@ -950,8 +949,10 @@ def test_anthropic_thinking_history_replays_as_thought(m):
             {"role": "user", "content": "again"},
         ],
     }
-    with pytest.raises(GuardError, match="thinking/redacted_thinking"):
-        anthropic_to_responses.translate_request(history, target_model="claude-sonnet-4-6")
+    portable = anthropic_to_responses.translate_request(history, target_model="claude-sonnet-4-6")
+    assert all(item.get("type") != "reasoning" for item in portable["input"])
+    assert [item["role"] for item in portable["input"]] == ["user", "assistant", "user"]
+    assert [part["text"] for item in portable["input"] for part in item["content"]] == ["hi", "ok", "again"]
     mapped = anthropic_to_responses.translate_request(
         history, target_model="claude-sonnet-4-6", allow_reasoning_effort=True,
     )

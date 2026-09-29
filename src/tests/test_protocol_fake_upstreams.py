@@ -284,6 +284,7 @@ class FakeWebSocket:
         self.sent_texts: list[str] = []
         self.close_calls: list[tuple[int, str]] = []
         self.accepted = False
+        self._closed = asyncio.Event()
 
     async def accept(self):
         from starlette.websockets import WebSocketState
@@ -295,6 +296,9 @@ class FakeWebSocket:
             text = self._first_text
             self._first_text = None
             return {"type": "websocket.receive", "text": text}
+        # Stay connected while the HTTP bridge runs. An immediate synthetic
+        # disconnect now correctly cancels upstream work before any output.
+        await self._closed.wait()
         return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_text(self, text: str):
@@ -307,6 +311,7 @@ class FakeWebSocket:
         from starlette.websockets import WebSocketState
         self.close_calls.append((code, reason))
         self.application_state = WebSocketState.DISCONNECTED
+        self._closed.set()
 
 
 class FakeOAuthResponseWs:
@@ -838,7 +843,7 @@ async def test_anthropic_client_document_to_openai_chat_fake_upstream(m):
     assert payload["messages"] == [{"role": "user", "content": [
         {"type": "text", "text": "read"},
         {"type": "file", "file": {
-            "file_data": "JVBERi0xLjQ=",
+            "file_data": "data:application/pdf;base64,JVBERi0xLjQ=",
             "filename": "brief.pdf",
         }},
     ]}]
@@ -970,7 +975,7 @@ async def test_anthropic_client_document_to_openai_responses_fake_upstream(m):
     payload = captured["payload"]
     assert payload["input"] == [{"type": "message", "role": "user", "content": [
         {"type": "input_text", "text": "read"},
-        {"type": "input_file", "file_data": "JVBERi0xLjQ=", "filename": "brief.pdf"},
+        {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0xLjQ=", "filename": "brief.pdf"},
         {"type": "input_file", "file_url": "https://example.com/remote.pdf", "filename": "remote.pdf"},
     ]}]
     out = json.loads(resp.body)
@@ -1304,7 +1309,7 @@ async def test_anthropic_client_tool_result_attachments_to_openai_responses_fake
         "output": [
             {"type": "input_text", "text": "see attached"},
             {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"},
-            {"type": "input_file", "file_data": "JVBERi0xLjQ=", "filename": "brief.pdf"},
+            {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0xLjQ=", "filename": "brief.pdf"},
             {"type": "input_text", "text": "Document context: remote contract"},
             {"type": "input_file", "file_url": "https://example.com/remote.pdf", "filename": "remote.pdf"},
         ],
@@ -1551,8 +1556,8 @@ async def test_responses_terminal_event_finishes_without_waiting_for_http_eof(m)
     assert hanging.closed.is_set()
 
 
-async def test_chat_precommit_max_output_is_request_invalid_without_cooldown(m):
-    """A pre-visible Responses incomplete event is request-scoped, not channel health."""
+async def test_chat_precommit_max_output_is_length_without_cooldown(m):
+    """Output exhaustion is a protocol terminal, not a 400/context error."""
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()
@@ -1586,19 +1591,19 @@ async def test_chat_precommit_max_output_is_request_invalid_without_cooldown(m):
         "stream": True,
         "messages": [{"role": "user", "content": "ping"}],
     })
+    text = await _consume_streaming_to_string(resp)
     await mc.aclose()
 
-    assert resp.status_code == 400
-    error = json.loads(resp.body)["error"]
-    assert error["code"] == "context_length_exceeded"
-    assert "max_output_tokens" in error["message"]
+    assert resp.status_code == 200
+    assert '"finish_reason": "length"' in text
+    assert "context_length_exceeded" not in text
     latest = m["log_db"]._get_conn().execute(
         "SELECT status, http_status, error_message FROM request_log ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert latest is not None
-    assert latest["status"] == "error"
-    assert latest["http_status"] == 400
-    assert "max_output_tokens" in latest["error_message"]
+    assert latest["status"] == "success"
+    assert latest["http_status"] == 200
+    assert latest["error_message"] is None
     assert m["cooldown"].get_state(
         "api:responses-precommit-max-output", "gpt-real",
     ) is None
@@ -3948,10 +3953,10 @@ async def test_native_responses_error_terminal_finalizes_before_yield(m, termina
                 "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
             },
         })
-        expected_output = b"context_length_exceeded"
-        expected_http_status = 400
-        expected_error = "max_output_tokens"
-        expected_retry_outcome = "request_invalid"
+        expected_output = b"event: response.incomplete"
+        expected_http_status = 200
+        expected_error = None
+        expected_retry_outcome = "success"
 
     hanging = TerminalThenHangByteStream([visible_prefix, terminal_payload])
     router.register(
@@ -3999,9 +4004,15 @@ async def test_native_responses_error_terminal_finalizes_before_yield(m, termina
              FROM request_log ORDER BY id DESC LIMIT 1"""
     ).fetchone()
     assert row is not None
-    assert row["status"] == "error"
+    assert row["status"] == ("error" if terminal_kind == "failed" else "success")
     assert row["http_status"] == expected_http_status
-    assert expected_error in row["error_message"]
+    if expected_error is None:
+        assert row["error_message"] is None
+        assert any(json.loads(line[5:]).get("response", {}).get("status") == "incomplete"
+                   for line in emitted.splitlines() if line.startswith(b"data: {"))
+        assert b"context_length_exceeded" not in emitted
+    else:
+        assert expected_error in row["error_message"]
     retry = m["log_db"]._get_conn().execute(
         "SELECT outcome FROM retry_chain WHERE request_id=?",
         (row["request_id"],),
@@ -4120,11 +4131,11 @@ async def test_queued_responses_terminal_releases_slot_before_yield(m, terminal_
                 "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
             },
         })
-        expected_output = b"context_length_exceeded"
-        expected_status = "error"
-        expected_http_status = 400
-        expected_error = "max_output_tokens"
-        expected_retry_outcome = "request_invalid"
+        expected_output = b"event: response.incomplete"
+        expected_status = "success"
+        expected_http_status = 200
+        expected_error = None
+        expected_retry_outcome = "success"
 
     hanging = TerminalThenHangByteStream([visible_prefix, terminal_payload])
     router.register(

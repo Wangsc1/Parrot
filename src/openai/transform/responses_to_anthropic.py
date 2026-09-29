@@ -5,8 +5,8 @@ This module intentionally composes the already-tested Responses↔Chat and
 Chat↔Anthropic translators instead of duplicating the whole mapping table.
 
 Compatibility policy preserves input/function-call/tool-result content, maps
-known controls, and strips unsupported Responses request hints. Stateful history
-or content parts that would be corrupted are rejected explicitly.
+supported format/reasoning/tool controls, and strips only unsupported request
+hints. Opaque state or content parts that would be corrupted are rejected.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -28,6 +29,7 @@ def _fail(message: str, *, param: str | None = None) -> None:
 
 _TOOL_NAME_BAD = re.compile(r"[^a-zA-Z0-9_-]")
 _TOOL_NAME_MAX = 64
+_CUSTOM_RAW_KEY = "__parrot_raw_input"
 
 @dataclass(frozen=True)
 class ToolWireIdentity:
@@ -40,6 +42,7 @@ class NamespaceToolMap:
     """Per-request reversible Responses identity to Anthropic flat-name plan."""
     by_flat_name: dict[str, ToolWireIdentity] = field(default_factory=dict)
     by_identity: dict[ToolWireIdentity, str] = field(default_factory=dict)
+    raw_custom_flats: set[str] = field(default_factory=set)
 
     def reserve_direct(self, kind: str, name: str) -> None:
         identity = ToolWireIdentity(kind, None, name)
@@ -94,7 +97,8 @@ def _flatten_response_tools(tools: Any, plan: NamespaceToolMap) -> list[dict[str
         if typ in (None, "function"):
             flattened.append(copy.deepcopy(tool)); continue
         if typ == "custom":
-            _fail("Responses freeform custom tool declarations cannot be represented by Anthropic JSON-schema tools", param="tools")
+            plan.raw_custom_flats.add(str(tool["name"]))
+            flattened.append(_wrap_custom_tool(tool)); continue
         if typ != "namespace":
             continue
         namespace, children = str(tool.get("name") or ""), tool.get("tools")
@@ -111,13 +115,25 @@ def _flatten_response_tools(tools: Any, plan: NamespaceToolMap) -> list[dict[str
             if identity in seen or identity in plan.by_identity:
                 _fail(f"duplicate Responses namespace tool {namespace}.{child_name}", param="tools")
             seen.add(identity)
-            if kind == "custom":
-                _fail("Responses namespace freeform custom tool declarations cannot be represented by Anthropic JSON-schema tools", param="tools")
-            if kind != "function":
+            if kind not in ("function", "custom"):
                 _fail("Responses namespace children must be function or custom tools", param="tools")
-            flat = copy.deepcopy(child); flat["type"] = "function"; flat["name"] = plan.flat_name(kind, namespace, child_name)
+            flat = _wrap_custom_tool(child) if kind == "custom" else copy.deepcopy(child)
+            flat["type"] = "function"; flat["name"] = plan.flat_name(kind, namespace, child_name)
+            if kind == "custom":
+                plan.raw_custom_flats.add(flat["name"])
             flattened.append(flat)
     return flattened
+
+def _wrap_custom_tool(tool: dict) -> dict:
+    fmt = tool.get("format")
+    if fmt is not None and (not isinstance(fmt, dict) or fmt.get("type") != "text"):
+        _fail("custom tool grammar cannot be enforced by Anthropic JSON-schema tools", param="tools")
+    return {"type": "function", "name": tool.get("name"),
+            "description": str(tool.get("description") or "") + " Return the tool's raw text in __parrot_raw_input.",
+            "strict": True,
+            "parameters": {"type": "object", "properties": {_CUSTOM_RAW_KEY: {"type": "string"}},
+                           "required": [_CUSTOM_RAW_KEY], "additionalProperties": False}}
+
 
 def _map_namespaced_history(items: list, plan: NamespaceToolMap) -> list:
     out: list[Any] = []
@@ -133,14 +149,106 @@ def _map_namespaced_history(items: list, plan: NamespaceToolMap) -> list:
         normalized.pop("namespace", None); out.append(normalized)
     return out
 
-def _guard_namespaced_tool_choice(choice: Any) -> None:
+def _map_tool_choice(choice: Any, plan: NamespaceToolMap) -> Any:
     if not isinstance(choice, dict):
+        return choice
+    def selected_name(item: dict) -> str:
+        namespace = item.get("namespace")
+        kind = item.get("type") or "function"
+        name = item.get("name")
+        if kind not in ("function", "custom") or not isinstance(name, str) or not name:
+            _fail("tool_choice must select a named function or custom tool", param="tool_choice")
+        if namespace is not None:
+            identity = ToolWireIdentity(kind, namespace, name)
+            if identity not in plan.by_identity:
+                _fail("namespaced tool_choice does not match a declared tool", param="tool_choice")
+            return plan.by_identity[identity]
+        identity = ToolWireIdentity(kind, None, name)
+        if identity not in plan.by_identity:
+            _fail("tool_choice does not match any declared function tool", param="tool_choice")
+        return plan.by_identity[identity]
+    if choice.get("type") in ("function", "custom"):
+        return {"type": "function", "name": selected_name(choice)}
+    if choice.get("type") != "allowed_tools":
+        return choice
+    selected = choice.get("tools")
+    if not isinstance(selected, list) or not selected:
+        _fail("allowed_tools must select at least one declared tool", param="tool_choice")
+    names = []
+    for item in selected:
+        if not isinstance(item, dict) or item.get("type") == "namespace":
+            _fail("namespaced Responses allowed_tools must identify individual tools", param="tool_choice")
+        names.append(selected_name(item))
+    return {"type": "allowed_tools", "mode": choice.get("mode", "auto"),
+            "tools": [{"type": "function", "name": name} for name in names]}
+
+
+def _map_output_controls(body: dict, payload: dict, *, target_model: str | None = None) -> None:
+    text = body.get("text")
+    fmt = text.get("format") if isinstance(text, dict) else None
+    if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
+        if not isinstance(fmt.get("schema"), dict):
+            _fail("text.format.json_schema requires a schema object", param="text.format")
+        payload["output_config"] = {"format": {"type": "json_schema", "schema": fmt["schema"]}}
+    reasoning = body.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    if effort is None:
         return
-    if choice.get("namespace"):
-        _fail("namespaced Responses tool_choice is not supported on Anthropic bridge", param="tool_choice")
-    selected = choice.get("tools") if choice.get("type") == "allowed_tools" else None
-    if isinstance(selected, list) and any(isinstance(x, dict) and (x.get("type") == "namespace" or x.get("namespace")) for x in selected):
-        _fail("namespaced Responses allowed_tools selection is not supported on Anthropic bridge", param="tool_choice")
+    if effort not in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+        _fail("unsupported reasoning.effort for Anthropic bridge", param="reasoning.effort")
+    from ...transform.cc_model_profile import canonical_model, model_profile
+    model = canonical_model(target_model or body.get("model"))
+    profile = model_profile(model)
+    # Claude 3.7 Sonnet supports manual thinking; older 3.x/Haiku 3 models
+    # don't. A family-wide 'claude-3' match sent invalid thinking upstream.
+    legacy = model == "claude-3-7-sonnet" or (profile is not None and profile.thinking == "enabled")
+    if model.startswith("claude-3-") and not legacy:
+        return
+    if effort == "none":
+        payload["thinking"] = {"type": "disabled"}
+        return
+    modern = bool(re.search(r"claude-(?:opus|sonnet)-4-(?:6|[7-9])(?:\b|[-_])", model)
+                  or re.search(r"claude-(?:opus|sonnet|fable|mythos)-[5-9](?:\b|[-_])", model))
+    if legacy:
+        # Manual thinking is the supported alternative before Claude 4.6.
+        # A legal budget is at least 1024 and strictly below max_tokens.
+        limit = payload.get("max_tokens", 4096)
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 1024:
+            depth = {"minimal": 1024, "low": 1024, "medium": 2048,
+                     "high": 4096, "xhigh": 8192, "max": 8192}[effort]
+            payload["thinking"] = {"type": "enabled", "budget_tokens": min(depth, limit - 1)}
+        return
+    # The shared 4.6 adaptive mode does not imply shared effort levels.
+    # Sonnet 4.6 must not inherit Opus 4.6's max fallback for xhigh.
+    if model == "claude-sonnet-4-6" and effort in ("xhigh", "max"):
+        claude_effort = "high"
+    elif effort == "xhigh":
+        claude_effort = "max" if model == "claude-opus-4-6" else (
+            "xhigh" if model.startswith(("claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-mythos-5")) else "high"
+        )
+    else:
+        claude_effort = "low" if effort == "minimal" else effort
+    payload.setdefault("output_config", {})["effort"] = claude_effort
+    if modern:
+        payload["thinking"] = {"type": "adaptive"}
+
+def _reconcile_thinking_controls(payload: dict) -> None:
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") not in ("enabled", "adaptive"):
+        return
+    # Claude manual thinking disallows temperature changes and forced tool use.
+    # Forced tool selection is a harder constraint than a qualitative reasoning
+    # budget, so keep the tool requirement and fall back to no explicit thinking.
+    choice = payload.get("tool_choice") or {}
+    if isinstance(choice, dict) and choice.get("type") in ("tool", "any"):
+        payload.pop("thinking", None)
+        if thinking.get("type") == "enabled" and isinstance(payload.get("output_config"), dict):
+            payload["output_config"].pop("effort", None)
+        return
+    payload.pop("temperature", None)
+    top_p = payload.get("top_p")
+    if isinstance(top_p, (int, float)) and top_p < 0.95:
+        payload.pop("top_p", None)
 
 def restore_output_item(item: dict, plan: NamespaceToolMap | None) -> dict:
     if plan is None or not isinstance(item, dict) or item.get("type") not in ("function_call", "custom_tool_call"):
@@ -153,20 +261,27 @@ def restore_output_item(item: dict, plan: NamespaceToolMap | None) -> dict:
     else: out.pop("namespace", None)
     if identity.kind == "custom":
         out["type"] = "custom_tool_call"
-        if "arguments" in out: out["input"] = out.pop("arguments")
+        if "arguments" in out:
+            args = out.pop("arguments")
+            decoded = common.parse_json_object(args)
+            if isinstance(decoded, dict) and isinstance(decoded.get(_CUSTOM_RAW_KEY), str):
+                out["input"] = decoded[_CUSTOM_RAW_KEY]
+            elif str(item.get("name") or "") in plan.raw_custom_flats:
+                raise ValueError("Claude custom tool input was not a raw-text wrapper")
+            else:
+                out["input"] = args
     else: out["type"] = "function_call"
     return out
 
 def _custom_tool_label(body: dict) -> str | None:
-    # Custom tool declarations are capabilities and can be stripped.  Historical
+    # Text custom declarations are wrapped as JSON-schema tools. Historical
     # custom_tool_call items are conversation/tool state and must not be dropped.
     for item in _current_input_items_for_guard(body):
         if not isinstance(item, dict):
             continue
         typ = item.get("type")
-        if typ == "custom_tool_call":
-            if common.parse_json_object(item.get("input")) is None:
-                return "custom_tool_call.input"
+        if typ == "custom_tool_call" and not isinstance(item.get("input"), (str, dict)):
+            return "custom_tool_call.input"
         if typ == "custom_tool_call_output":
             try:
                 _guard_function_call_output_content(item.get("output"))
@@ -210,8 +325,6 @@ def _stateful_input_item_label(body: dict) -> str | None:
         if not isinstance(item, dict):
             continue
         typ = item.get("type")
-        if typ == "reasoning" and isinstance(item.get("encrypted_content"), str) and item.get("encrypted_content"):
-            return "reasoning.encrypted_content"
         if typ in {
             "file_search_call", "computer_call",
             "image_generation_call", "code_interpreter_call",
@@ -285,15 +398,11 @@ def _guard_function_call_output_content(output: Any) -> None:
 def guard_request(body: dict, *, store_enabled: bool = True) -> None:
     if not isinstance(body, dict):
         _fail("request body must be a JSON object")
-    # Request control hints such as background, reasoning/text.format/cache
-    # fields, and unsupported service_tier values are stripped/fallback by the
-    # bridge output allowlist. They do not change conversation content/tool
-    # semantics for this target.
-    # include-only reasoning.encrypted_content is a response projection hint.  The
-    # Anthropic bridge cannot produce it, but when there is no actual encrypted
-    # reasoning history in input, dropping the hint is safer than rejecting an
-    # otherwise stateless request.  Real encrypted reasoning history is still
-    # rejected by _stateful_input_item_label below.
+    # Supported reasoning/text.format controls are translated below; unsupported
+    # projection/cache hints fall back through the bridge output allowlist.
+    # include-only reasoning.encrypted_content is a projection hint: Claude
+    # cannot produce or replay OpenAI ciphertext. Strip opaque reasoning history
+    # before the intermediate Chat conversion rather than rejecting visible turns.
     # `conversation` is different: it names server-side state that this bridge
     # cannot load or replay, so align direct translator calls with the real
     # Responses ingress guard and reject non-null values instead of pretending
@@ -427,12 +536,39 @@ def _function_call_output_attachment_replacements(input_items: list) -> list[tup
     return replacements
 
 
-def _normalize_custom_tool_history(input_items: list) -> list:
+def _degrade_reasoning_history(items: list) -> list:
+    """Carry readable summaries as explicitly labelled text, never ciphertext.
+
+    Claude cannot replay OpenAI encrypted reasoning. A summary is readable
+    context, not a signed thinking block; drop opaque-only items entirely.
+    This runs on expanded local Store history as well as current input.
+    """
+    out: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            out.append(item)
+            continue
+        if not common.reasoning_passthrough_enabled():
+            continue
+        readable: list[str] = []
+        for part in item.get("summary") or []:
+            if isinstance(part, dict) and part.get("type") == "summary_text" and isinstance(part.get("text"), str) and part["text"]:
+                readable.append(part["text"])
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "reasoning_text" and isinstance(part.get("text"), str) and part["text"]:
+                readable.append(part["text"])
+        if readable:
+            out.append({"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "[Previous assistant reasoning summary]\n" + "\n\n".join(readable)}
+            ]})
+    return out
+
+
+def _normalize_custom_tool_history(input_items: list, plan: NamespaceToolMap) -> list:
     """Map safe Responses custom tool history to function-call history.
 
-    Anthropic Messages has `tool_use.input` as an object.  A custom tool call
-    with an object (or JSON object string) can be represented without losing
-    data; arbitrary raw strings cannot, so they remain guarded.
+    Anthropic tool_use.input is an object. Wrap freeform text in one string
+    property; keep object-shaped historical inputs unchanged.
     """
     out: list[Any] = []
     for item in input_items:
@@ -441,12 +577,15 @@ def _normalize_custom_tool_history(input_items: list) -> list:
             continue
         typ = item.get("type")
         if typ == "custom_tool_call":
-            input_obj = common.parse_json_object(item.get("input"))
+            raw = item.get("input")
+            if isinstance(raw, str) and str(item.get("name") or "") in plan.raw_custom_flats:
+                input_obj = {_CUSTOM_RAW_KEY: raw}
+            else:
+                input_obj = common.parse_json_object(raw)
+                if input_obj is None and isinstance(raw, str):
+                    input_obj = {_CUSTOM_RAW_KEY: raw}
             if input_obj is None:
-                _fail(
-                    "Responses custom_tool_call.input must be a JSON object to convert to Anthropic tool_use",
-                    param="input",
-                )
+                _fail("custom_tool_call.input must be text or JSON object", param="input")
             normalized = copy.deepcopy(item)
             normalized["type"] = "function_call"
             normalized["arguments"] = json.dumps(input_obj, ensure_ascii=False, separators=(",", ":"))
@@ -515,6 +654,7 @@ def _preserve_deferred_tool_loading(chat_payload: dict, response_tools: Any) -> 
 def translate_request(
     body: dict, *, api_key_name: str = "", store_enabled: bool = True,
     namespace_tool_map: NamespaceToolMap | None = None,
+    target_model: str | None = None,
 ) -> dict:
     guard_request(body, store_enabled=store_enabled)
     bridge_body = dict(body)
@@ -530,12 +670,14 @@ def translate_request(
     if isinstance(bridge_body.get("tools"), list):
         bridge_body["tools"] = flattened_tools
     choice = bridge_body.get("tool_choice")
-    _guard_namespaced_tool_choice(choice)
-    if isinstance(choice, dict) and choice.get("type") not in (None, "function", "allowed_tools"):
+    if isinstance(choice, dict) and choice.get("type") not in (None, "function", "custom", "allowed_tools"):
         bridge_body.pop("tool_choice", None)
+    else:
+        bridge_body["tool_choice"] = _map_tool_choice(choice, plan)
     input_items = responses_to_chat.resolve_input_items(bridge_body, api_key_name=api_key_name)
+    input_items = _degrade_reasoning_history(input_items)
     input_items = _map_namespaced_history(input_items, plan)
-    input_items = _normalize_custom_tool_history(input_items)
+    input_items = _normalize_custom_tool_history(input_items, plan)
     bridge_body["_parrot_preserve_native_search"] = True
     chat_payload = responses_to_chat.translate_request_from_input_items(bridge_body, input_items)
     _preserve_deferred_tool_loading(chat_payload, flattened_tools)
@@ -555,6 +697,9 @@ def translate_request(
     if isinstance(choice, dict) and local_web_tools.is_openai_web_search_tool_type(choice.get("type")):
         payload["tool_choice"] = {"type": "tool", "name": "web_search"}
     cache_hints.apply_openai_cache_to_anthropic_payload(body, payload)
+    # Native controls are generated here, not passed through from Chat input.
+    _map_output_controls(body, payload, target_model=target_model)
+    _reconcile_thinking_controls(payload)
     return common.filter_anthropic_bridge_payload(payload)
 
 
@@ -571,16 +716,45 @@ def translate_response(
     from ... import search_hosted_codec
     hosted = search_hosted_codec.anthropic_to_responses(message.get("content") or [])
     chat_obj = chat_to_anthropic.translate_response(message, model=model)
-    # The Chat bridge deliberately omits Anthropic thinking. Restore only the
-    # readable text for Responses' existing summary bridge (including its drop
-    # policy); signatures/redacted blocks are not OpenAI encrypted_content.
-    thinking = "".join(
-        block["thinking"] for block in message.get("content") or []
-        if isinstance(block, dict) and block.get("type") == "thinking"
-        and isinstance(block.get("thinking"), str)
-    )
-    if thinking:
-        chat_obj["choices"][0]["message"]["reasoning_content"] = thinking
+    # Preserve each readable thinking block at its original position. Native
+    # signatures/redacted blocks are not OpenAI encrypted_content; the existing
+    # drop policy still applies to readable summaries.
+    keep_reasoning = common.reasoning_passthrough_enabled()
+    def ordered_output(items: list[dict]) -> list[dict]:
+        # Chat flattens all text ahead of its tool_calls. Reapply the original
+        # Anthropic block positions before writing the resulting response/store.
+        calls = iter(item for item in items if item.get("type") in ("function_call", "custom_tool_call"))
+        hosted_by_id = {str(item.get("id")): item for item in hosted}
+        ordered: list[dict] = []
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    ordered.append({
+                        "type": "message", "id": f"msg_{uuid.uuid4().hex[:24]}",
+                        "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": text, "annotations": []}],
+                    })
+            elif kind == "thinking" and keep_reasoning:
+                text = block.get("thinking")
+                if isinstance(text, str) and text:
+                    ordered.append({
+                        "type": "reasoning", "id": f"rs_{uuid.uuid4().hex[:24]}",
+                        "summary": [{"type": "summary_text", "text": text}],
+                    })
+            elif kind == "tool_use":
+                call = next(calls, None)
+                if call is not None:
+                    ordered.append(call)
+            elif kind == "server_tool_use" and block.get("name") == "web_search":
+                item = hosted_by_id.pop(str(block.get("id")), None)
+                if item is not None:
+                    ordered.append(item)
+        return ordered
+
     return responses_to_chat.translate_response(
         chat_obj,
         model=model,
@@ -588,7 +762,7 @@ def translate_response(
         api_key_name=api_key_name,
         channel_key=channel_key,
         current_input_items=current_input_items,
-        output_prefix=hosted,
+        output_ordering=ordered_output,
         output_item_transform=(
             (lambda item: restore_output_item(item, namespace_tool_map))
             if namespace_tool_map is not None else None

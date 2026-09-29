@@ -633,6 +633,29 @@ def _apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> di
     return apply_non_stream_response_translator(obj, translator_ctx)
 
 
+def _translate_non_stream_response_or_error(
+    obj: dict, translator_ctx: Optional[dict], *, full_response_text: str,
+    **attempt_fields,
+) -> tuple[Optional[dict], Optional[AttemptResult]]:
+    """Validate/translate before any successful response is persisted or exposed.
+
+    Invalid model-generated arguments are an upstream response error, not a bad
+    client request or an input-context failure. Keep the original wire evidence
+    for normal attempt/failover error settlement, including observed billing.
+    """
+    from .openai.transform.tool_arguments import ToolArgumentsError
+
+    try:
+        return _apply_non_stream_response_translator(obj, translator_ctx or {}), None
+    except ToolArgumentsError as exc:
+        return None, AttemptResult(
+            outcome="upstream_error_json", http_status=502,
+            error_code="invalid_tool_arguments", error_detail=exc.message,
+            full_response_text=full_response_text, translator_ctx=translator_ctx,
+            **attempt_fields,
+        )
+
+
 def _sse_error_for_ingress(
     ingress: str,
     anth_err_type: str,
@@ -3211,9 +3234,7 @@ class _WsResponsesTracker:
         self.stream_error_message: Optional[str] = None
         self.stream_error_code: Optional[str] = None
         self._frames: list[str] = []
-        self._items: dict[int, dict] = {}
-        self._fc_args: dict[int, str] = {}
-        self._msg_text: dict[tuple[int, int], str] = {}
+        self._output_builder = upstream.ResponsesSSEAssistantBuilder()
         self._response_obj: Optional[dict] = None
 
     def feed_text(self, text: str) -> None:
@@ -3240,6 +3261,7 @@ class _WsResponsesTracker:
             _maybe_record_codex_rate_limits_event(self.channel, evt)
             return
         self._frames.append(text)
+        self._output_builder.feed((f"event: {typ}\ndata: " + json.dumps(evt, ensure_ascii=False) + "\n\n").encode("utf-8"))
         response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
         usage_present = "usage" in evt or (
             isinstance(response_obj, dict) and "usage" in response_obj
@@ -3278,14 +3300,9 @@ class _WsResponsesTracker:
                 self.request_failed = True
                 self.stream_error_code, self.stream_error_message = request_failure
         elif typ == "response.incomplete":
-            if protocol_errors.is_responses_max_output_incomplete(evt):
-                self.response_failed = True
-                self.stream_error_code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
-                self.stream_error_message = protocol_errors.responses_max_output_context_error_message(
-                    protocol_errors.responses_incomplete_reason(evt)
-                )
-            else:
-                self.response_completed = True
+            # Transport completed; the response snapshot below retains status
+            # incomplete. This is not grounds for context compaction/failover.
+            self.response_completed = True
         elif typ == "response.completed":
             self.response_completed = True
 
@@ -3293,52 +3310,11 @@ class _WsResponsesTracker:
             resp = response_obj
             if isinstance(resp, dict):
                 self._response_obj = resp
-                if isinstance(resp.get("output"), list):
-                    for idx, item in enumerate(resp.get("output") or []):
-                        if isinstance(item, dict):
-                            self._items[idx] = dict(item)
-        if typ == "response.output_item.added":
-            idx = _safe_int(evt.get("output_index"), 0)
-            item = evt.get("item")
-            if isinstance(item, dict):
-                self._items[idx] = dict(item)
-        elif typ == "response.output_item.done":
-            idx = _safe_int(evt.get("output_index"), 0)
-            item = evt.get("item")
-            if isinstance(item, dict):
-                self._items[idx] = dict(item)
-        elif typ == "response.output_text.delta":
-            idx = _safe_int(evt.get("output_index"), 0)
-            cidx = _safe_int(evt.get("content_index"), 0)
-            delta = evt.get("delta")
-            if isinstance(delta, str) and delta:
-                self._msg_text[(idx, cidx)] = self._msg_text.get((idx, cidx), "") + delta
-        elif typ == "response.function_call_arguments.delta":
-            idx = _safe_int(evt.get("output_index"), 0)
-            delta = evt.get("delta")
-            if isinstance(delta, str) and delta:
-                self._fc_args[idx] = self._fc_args.get(idx, "") + delta
 
     def get_output_items(self) -> list[dict]:
-        out: list[dict] = []
-        for idx in sorted(self._items.keys()):
-            item = dict(self._items[idx])
-            if item.get("type") == "message":
-                content = list(item.get("content") or [])
-                merged = {ci: text for (oi, ci), text in self._msg_text.items() if oi == idx}
-                for ci in sorted(merged.keys()):
-                    if ci < len(content) and isinstance(content[ci], dict):
-                        if not content[ci].get("text"):
-                            content[ci]["text"] = merged[ci]
-                    else:
-                        content.append({"type": "output_text", "text": merged[ci], "annotations": []})
-                item["content"] = content
-            elif item.get("type") == "function_call":
-                args = self._fc_args.get(idx)
-                if args and not item.get("arguments"):
-                    item["arguments"] = args
-            out.append(item)
-        return out
+        # WS and SSE share item/call identity merging; compact terminal arrays
+        # must never be interpreted as the stream's sparse output_index map.
+        return self._output_builder.get_output_items()
 
     def to_full_json(self, *, fallback_model: str) -> dict:
         base = dict(self._response_obj or {})
@@ -3520,6 +3496,7 @@ async def _try_openai_oauth_responses_ws_channel(
         )
         route_state = {"dispatched": False}
         tracker = _WsResponsesTracker(ch)
+        tracker.preserve_incomplete = (translator_ctx or {}).get("response_translator") == "anthropic_to_responses"
         try:
             async def _record_route_attempt() -> None:
                 nonlocal proxy_attempt_id
@@ -4118,6 +4095,13 @@ async def _consume_oauth_responses_ws_non_stream(
         except Exception:
             pass
     usage = upstream.extract_usage_responses_json(obj)
+    out_obj, translation_error = _translate_non_stream_response_or_error(
+        obj, translator_ctx,
+        full_response_text=_identity_log_text(tracker.get_full_response(), identity_state),
+        usage=usage,
+    )
+    if translation_error is not None:
+        return await finalize_terminal_error(translation_error)
     timing_snapshot = await _persist_ws_route_round(
         proxy_attempt_id, timing, proxy_bytes,
         outcome="success", terminal=True,
@@ -4134,7 +4118,6 @@ async def _consume_oauth_responses_ws_non_stream(
         first_byte_ms=first_byte_ms,
         total_ms=total_ms,
     )
-    out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
     compaction_owner.persist_observed_safe(
         ch, body, obj, path="oauth_upstream_ws_non_stream",
     )
@@ -5010,6 +4993,15 @@ async def _consume_non_stream(
     # assistant_msg 仅给亲和 fingerprint_write 用，且目前 fingerprint_write 只支持
     # anthropic 家族；openai 的亲和由 MS-7 补上。这里保持 anthropic 形状即可。
     assistant_msg = prepared.assistant_msg
+    out_obj, translation_error = _translate_non_stream_response_or_error(
+        obj, translator_ctx, full_response_text=raw.decode("utf-8", errors="replace"),
+        usage=usage, connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+        total_ms=round_total_ms, proxy_name=proxy_name,
+        proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+        proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
+    )
+    if translation_error is not None:
+        return timing.apply_to(translation_error) if timing is not None else translation_error
 
     finalize_policy.apply_success_health_effects(
         finalize_policy.success_plan(),
@@ -5050,7 +5042,6 @@ async def _consume_non_stream(
     # 跨变体：把上游 JSON 反向成 ingress 期望的格式；同协议 translator_ctx=None 即原样
     _maybe_cache_deepseek_reasoning(ch, resolved_model, obj)
     _maybe_cache_codex_reasoning_replay(translator_ctx, obj)
-    out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
     if ingress_protocol == "responses" and getattr(ch, "protocol", "") == "openai-responses":
         _maybe_save_native_responses_store(
             obj,
@@ -5153,6 +5144,15 @@ async def _consume_stream_as_non_stream(
     round_total_ms = prepared.total_ms
     request_elapsed_ms = _elapsed_ms(start_monotonic)
     response_body_text = prepared.response_body_text
+    out_obj, translation_error = _translate_non_stream_response_or_error(
+        obj, translator_ctx, full_response_text=response_body_text,
+        usage=usage, connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+        total_ms=round_total_ms, proxy_name=proxy_name,
+        proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+        proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
+    )
+    if translation_error is not None:
+        return timing.apply_to(translation_error) if timing is not None else translation_error
 
     finalize_policy.apply_success_health_effects(
         finalize_policy.success_plan(),
@@ -5191,7 +5191,6 @@ async def _consume_stream_as_non_stream(
     # 6) 走跨变体 translator（如果 ingress 是 chat，上游 responses JSON 要翻译成 chat.completion JSON）
     _maybe_cache_deepseek_reasoning(ch, resolved_model, obj)
     _maybe_cache_codex_reasoning_replay(translator_ctx, obj)
-    out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
     if ingress_protocol == "responses" and getattr(ch, "protocol", "") == "openai-responses":
         _maybe_save_native_responses_store(
             obj,

@@ -129,7 +129,7 @@ def test_translate_request_preserves_user_documents():
         {"type": "text", "text": "read"},
         {"type": "text", "text": "Document context: customer contract"},
         {"type": "file", "file": {
-            "file_data": "JVBERi0xLjQ=",
+            "file_data": "data:application/pdf;base64,JVBERi0xLjQ=",
             "filename": "brief.pdf",
         }},
     ]}]
@@ -296,11 +296,10 @@ def test_translate_request_guards_unmappable_reasoning_controls():
     assert glm["reasoning_effort"] == "max"
 
 
-def test_translate_request_allows_stream_but_guards_stateful_thinking_and_non_user_images():
+def test_translate_request_allows_stream_and_omits_foreign_thinking_but_guards_non_user_images():
     streamed = anthropic_to_chat.translate_request({"stream": True, "messages": []})
     assert streamed["stream"] is True
-    with pytest.raises(GuardError):
-        anthropic_to_chat.translate_request({"messages": [{"role": "assistant", "content": [{"type": "redacted_thinking", "data": "opaque"}]}]})
+    assert anthropic_to_chat.translate_request({"messages": [{"role": "assistant", "content": [{"type": "redacted_thinking", "data": "opaque"}]}]})["messages"] == []
     with pytest.raises(GuardError):
         anthropic_to_chat.translate_request({"messages": [{"role": "assistant", "content": [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}]}]})
     with pytest.raises(GuardError):
@@ -309,19 +308,19 @@ def test_translate_request_allows_stream_but_guards_stateful_thinking_and_non_us
         anthropic_to_chat.translate_request({"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}}]}]})
     with pytest.raises(GuardError):
         anthropic_to_chat.translate_request({"messages": [{"role": "user", "content": [{"type": "document", "citations": {"enabled": True}, "source": {"type": "base64", "media_type": "application/pdf", "data": "AAAA"}}]}]})
-    with pytest.raises(GuardError):
-        anthropic_to_chat.translate_request({"messages": [{"role": "user", "content": [{
-            "type": "tool_result",
-            "tool_use_id": "toolu_1",
-            "content": [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}],
-        }]}]})
+    attached = anthropic_to_chat.translate_request({"messages": [{"role": "user", "content": [{
+        "type": "tool_result", "tool_use_id": "toolu_1",
+        "content": [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}],
+    }]}]})
+    assert [m["role"] for m in attached["messages"]] == ["tool", "user"]
+    assert attached["messages"][1]["content"][-1]["type"] == "image_url"
     errored_tool = anthropic_to_chat.translate_request({"messages": [{"role": "user", "content": [{
         "type": "tool_result",
         "tool_use_id": "toolu_1",
         "content": "failed",
         "is_error": True,
     }]}]})
-    assert errored_tool["messages"] == [{"role": "tool", "tool_call_id": "toolu_1", "content": "failed"}]
+    assert errored_tool["messages"] == [{"role": "tool", "tool_call_id": "toolu_1", "content": "[Tool execution failed]\nfailed"}]
     # The native Chat protocol has no server search/fetch declaration. Managed
     # compilation is tested at the execution boundary, not faked by translation.
     for typ, name in (("web_search_20250305", "web_search"), ("web_fetch_20250910", "web_fetch")):
@@ -475,8 +474,7 @@ def test_matrix_allows_safe_anthropic_to_openai_chat_and_guards_unsafe_cases():
         "tool_use_id": "toolu_1",
         "content": [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}],
     }]}]}
-    with pytest.raises(ProtocolGuardError):
-        DEFAULT_MATRIX.plan("anthropic", "openai-chat", features=extract_request_features("anthropic", tool_result_image))
+    assert DEFAULT_MATRIX.plan("anthropic", "openai-chat", features=extract_request_features("anthropic", tool_result_image)).required_transforms == ["anthropic_to_chat"]
 
     tool_result_error = {"messages": [{"role": "user", "content": [{
         "type": "tool_result",

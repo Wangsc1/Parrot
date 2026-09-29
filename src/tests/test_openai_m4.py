@@ -343,13 +343,10 @@ def test_r2c_incomplete_length(m):
     ]
     frames = _run_translator(tr, events)
     assert frames[-1] == b"data: [DONE]\n\n"
-    error_frames = [f for f in frames if b'"error"' in f]
-    assert error_frames
-    err = json.loads(error_frames[-1].decode("utf-8").split("data: ", 1)[1])
-    assert err["error"]["type"] == "invalid_request_error"
-    assert err["error"]["code"] == "context_length_exceeded"
-    assert "max_output_tokens" in err["error"]["message"]
-    print("  [PASS] r2c: response.incomplete max_output_tokens → context_length_exceeded error")
+    assert not any(b'"error"' in f for f in frames)
+    payloads = [json.loads(f.decode("utf-8").split("data: ", 1)[1]) for f in frames[:-1]]
+    assert [c["finish_reason"] for p in payloads for c in p.get("choices", []) if c.get("finish_reason")] == ["length"]
+    print("  [PASS] r2c: output exhaustion preserves length, not input context error")
 
 
 def test_r2c_reasoning(m):

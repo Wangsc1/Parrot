@@ -123,7 +123,7 @@ def _incomplete_stream_error_info(data: dict) -> tuple[str, str]:
     """Readable error info for OpenAI Responses response.incomplete events."""
     if protocol_errors.is_responses_max_output_incomplete(data):
         return (
-            protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+            "response_incomplete",
             protocol_errors.responses_max_output_context_error_message(
                 protocol_errors.responses_incomplete_reason(data)
             ),
@@ -212,12 +212,8 @@ class SSEUsageTracker:
             return
         self._chunks.append(chunk_bytes)
         self._buf += chunk_bytes
-        while b"\n" in self._buf:
-            line_bytes, self._buf = self._buf.split(b"\n", 1)
-            line = line_bytes.decode("utf-8", errors="replace").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
+        self._buf, data_events = _iter_sse_data_lines(self._buf)
+        for data in data_events:
             if not data or data == "[DONE]":
                 continue
             try:
@@ -267,12 +263,8 @@ class SSEAssistantBuilder:
         if not chunk:
             return
         self._buf += chunk
-        while b"\n" in self._buf:
-            line_bytes, self._buf = self._buf.split(b"\n", 1)
-            line = line_bytes.decode("utf-8", errors="replace").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
+        self._buf, data_events = _iter_sse_data_lines(self._buf)
+        for data in data_events:
             if not data or data == "[DONE]":
                 continue
             try:
@@ -356,19 +348,16 @@ class SSEAssistantBuilder:
 
 
 def _iter_sse_data_lines(buf: bytes):
-    """把字节流中的完整行切出来，返回 (剩余 buf, data 行列表)。
-
-    OpenAI Chat 与 Responses 都用 `\\n\\n` 分隔 event，但同一 event 内部可能有
-    多行（`event:`、`id:`、`data:`、`:`）。此函数只解析 `data:` 行，别的行
-    调用方自己解析。返回的字符串已去掉 `data:` 前缀和首尾空白。
-    """
-    lines: list[str] = []
-    while b"\n" in buf:
-        line_bytes, buf = buf.split(b"\n", 1)
-        line = line_bytes.decode("utf-8", errors="replace").strip()
-        if line.startswith("data:"):
-            lines.append(line[5:].strip())
-    return buf, lines
+    """Return complete event data, joining multiple data fields per SSE spec."""
+    buf, blocks = _split_sse_events_bytes(buf)
+    events = []
+    for block in blocks:
+        lines = [line[5:].removeprefix(" ")
+                 for line in block.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+                 if line.startswith("data:")]
+        if lines:
+            events.append("\n".join(lines))
+    return buf, events
 
 
 def _iter_sse_events(buf: bytes):
@@ -388,14 +377,14 @@ def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
     data_obj 解析失败或是 "[DONE]" 返回 None（调用方按 event_name 判断）。
     """
     event_name: Optional[str] = None
-    data_str: Optional[str] = None
-    for line in block.split("\n"):
-        line = line.strip()
+    data_lines: list[str] = []
+    for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if line.startswith("event:"):
             event_name = line[6:].strip() or None
         elif line.startswith("data:"):
-            data_str = line[5:].strip()
-    if data_str is None or data_str == "[DONE]":
+            data_lines.append(line[5:].removeprefix(" "))
+    data_str = "\n".join(data_lines)
+    if not data_lines or data_str == "[DONE]":
         return event_name, None
     try:
         return event_name, json.loads(data_str)
@@ -412,11 +401,9 @@ def parse_sse_event_bytes(block: bytes) -> tuple[Optional[str], Optional[dict]]:
     return _parse_event_block(block.decode("utf-8", errors="replace"))
 
 
-def is_stream_error_event(event_name: Optional[str], data: Optional[dict]) -> bool:
+def is_stream_error_event(event_name: Optional[str], data: Optional[dict], *, preserve_incomplete: bool = False) -> bool:
     if not isinstance(data, dict):
         return False
-    if protocol_errors.is_responses_max_output_incomplete(data, event_name):
-        return True
     if event_name == "error" or data.get("type") == "error":
         return True
     if event_name == "response.failed":
@@ -774,13 +761,8 @@ class ResponsesSSEUsageTracker:
                 self.stream_error_code, self.stream_error_message = _format_stream_error_info(data)
             elif event_name == "response.incomplete":
                 self.saw_stream_end = True
-                if protocol_errors.is_responses_max_output_incomplete(data, event_name):
-                    # Downstream clients commonly miss the Responses-specific
-                    # terminal incomplete event.  Normalize the explicit
-                    # max_output_tokens reason into a context-length style error
-                    # so existing retry/compact paths can recognize it.
-                    self.saw_stream_error = True
-                    self.stream_error_code, self.stream_error_message = _incomplete_stream_error_info(data)
+                # A real incomplete terminal is not a transport/provider error.
+                # Cross-protocol translators retain its truncation reason.
             elif event_name == "response.completed":
                 self.saw_stream_end = True
             if event_name in ("response.completed", "response.failed", "response.incomplete"):
@@ -952,13 +934,8 @@ class ResponsesSSEAssistantBuilder:
                     self._response_obj = copy.deepcopy(response)
                     if event_name == "response.completed":
                         self._completed_response_obj = copy.deepcopy(response)
-                    # The terminal response can be the only place an upstream
-                    # exposes output items, so keep it as a source as well.
-                    if event_name in ("response.completed", "response.incomplete"):
-                        output = response.get("output")
-                        if isinstance(output, list):
-                            for output_index, item in enumerate(output):
-                                self._record_item(output_index, item)
+                    # Keep terminal arrays separate: array positions need not
+                    # equal the original stream indexes. Merge by identity below.
 
             if event_name in ("response.output_item.added", "response.output_item.done"):
                 self._record_item(self._index(data.get("output_index")), data.get("item"))
@@ -991,20 +968,57 @@ class ResponsesSSEAssistantBuilder:
     def _base_items_by_index(self) -> dict[int, dict]:
         """Start from response.completed output, then fill only missing snapshots."""
         out: dict[int, dict] = {}
+        for stream_index, source in sorted(self._items.items()):
+            item = self._resolved_output_item(stream_index, source, prefer_buffer=True)
+            canonical = next((index for index, known in out.items()
+                              if known.get("type") == item.get("type") and any(
+                                  item.get(key) and item.get(key) == known.get(key)
+                                  for key in ("id", "call_id"))), stream_index)
+            # A relay can repeat the same finalized item at another index. Its
+            # values may be newer, but its first observed position is stable.
+            out[canonical] = (self._merge_item_snapshots(item, out[canonical])
+                              if canonical in out else item)
         response = self._completed_response_obj or self._response_obj
+        stream_indexes = set(out)
+        claimed_anonymous: set[int] = set()
         if isinstance(response, dict) and isinstance(response.get("output"), list):
-            for output_index, item in enumerate(response["output"]):
-                if isinstance(item, dict):
-                    out[output_index] = copy.deepcopy(item)
-        for output_index, item in self._items.items():
-            existing = out.get(output_index)
-            out[output_index] = (
-                self._merge_item_snapshots(existing, item)
-                if isinstance(existing, dict) else copy.deepcopy(item)
-            )
+            for terminal_index, item in enumerate(response["output"]):
+                if not isinstance(item, dict):
+                    continue
+                matches = [index for index, known in out.items()
+                           if known.get("type") == item.get("type") and any(
+                               item.get(key) and item.get(key) == known.get(key)
+                               for key in ("id", "call_id"))]
+                if not matches and item.get("type") == "message" and not any(item.get(k) for k in ("id", "call_id")):
+                    # Anonymous compatibility snapshots can only be matched by
+                    # equal resolved content, one-to-one. Do not dedupe separate
+                    # anonymous messages merely because their text is equal.
+                    def normalized_message(value):
+                        normalized = copy.deepcopy(value)
+                        for part in normalized.get("content") or []:
+                            if isinstance(part, dict) and part.get("annotations") == []:
+                                part.pop("annotations")
+                        return normalized
+                    target = normalized_message(item)
+                    matches = [index for index, known in out.items()
+                               if index in stream_indexes and index not in claimed_anonymous
+                               and not any(known.get(k) for k in ("id", "call_id"))
+                               and normalized_message(known) == target]
+                    if matches:
+                        claimed_anonymous.add(matches[0])
+                index = matches[0] if matches else terminal_index
+                if not matches and index in out:
+                    known = out[index]
+                    conflict = known.get("type") != item.get("type") or any(
+                        known.get(key) and item.get(key) and known[key] != item[key]
+                        for key in ("id", "call_id"))
+                    if conflict:
+                        index = max(out, default=-1) + 1
+                existing = out.get(index)
+                out[index] = self._merge_item_snapshots(item, existing) if isinstance(existing, dict) else copy.deepcopy(item)
         return out
 
-    def _apply_message_buffers(self, output_index: int, item: dict) -> None:
+    def _apply_message_buffers(self, output_index: int, item: dict, *, prefer_buffer: bool = False) -> None:
         content = item.get("content")
         if not isinstance(content, list):
             content = []
@@ -1025,20 +1039,20 @@ class ResponsesSSEAssistantBuilder:
                     part = {}
                     content[content_index] = part
                 part.setdefault("type", part_type)
-                part[value_key] = self._merge_preferred_text(part.get(value_key), value)
+                part[value_key] = self._merge_preferred_text(value, part.get(value_key)) if prefer_buffer else self._merge_preferred_text(part.get(value_key), value)
                 if part_type == "output_text":
                     part.setdefault("annotations", [])
         item["content"] = content
 
-    def _resolved_output_item(self, output_index: int, source_item: dict) -> dict:
+    def _resolved_output_item(self, output_index: int, source_item: dict, *, prefer_buffer: bool = False) -> dict:
         item = copy.deepcopy(source_item)
         item_type = item.get("type")
         if item_type == "message":
-            self._apply_message_buffers(output_index, item)
+            self._apply_message_buffers(output_index, item, prefer_buffer=prefer_buffer)
         elif item_type == "function_call":
-            item["arguments"] = self._merge_preferred_text(
-                item.get("arguments"), self._fc_args.get(output_index, ""),
-            )
+            buffered = self._fc_args.get(output_index, "")
+            item["arguments"] = (self._merge_preferred_text(buffered, item.get("arguments"))
+                                 if prefer_buffer else self._merge_preferred_text(item.get("arguments"), buffered))
         return item
 
     def get_output_item(self, output_index: int) -> dict | None:

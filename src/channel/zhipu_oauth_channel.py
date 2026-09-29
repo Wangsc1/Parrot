@@ -52,7 +52,7 @@ class ZhipuOAuthChannel(ApiChannel):
             key_name = str(source.get("_api_key_name") or "")
             tool_map = responses_to_anthropic.NamespaceToolMap()
             items = responses_to_anthropic.resolve_current_input_items(source)
-            payload = responses_to_anthropic.translate_request(source, api_key_name=key_name, store_enabled=store.is_enabled(), namespace_tool_map=tool_map)
+            payload = responses_to_anthropic.translate_request(source, api_key_name=key_name, store_enabled=store.is_enabled(), namespace_tool_map=tool_map, target_model=resolved_model)
             ctx = {"ingress": "responses", "upstream_protocol": "anthropic", "response_translator": "responses_to_anthropic",
                    "model_for_response": resolved_model, "previous_response_id": source.get("previous_response_id"),
                    "api_key_name": key_name, "channel_key": self.key, "current_input_items": items,

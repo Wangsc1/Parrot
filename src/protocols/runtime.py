@@ -113,6 +113,11 @@ def json_error_for_ingress(
 def make_stream_translator(translator_ctx: Optional[dict]):
     """Instantiate the response stream translator described by translator_ctx."""
     translator = _make_stream_translator(translator_ctx)
+    if translator is not None and (translator_ctx or {}).get("response_translator") in ("anthropic_to_chat", "anthropic_to_responses"):
+        from ..openai.transform.anthropic_compat import StopSequenceStream, stop_sequences
+        body = translator_ctx.get("request_body") or {}
+        if stop_sequences(body):
+            translator = StopSequenceStream(translator, body)
     if translator is not None and (translator_ctx or {}).get("managed_search_chat_tools"):
         from ..search_tool_stream import ChatToolNames
         return ChatToolNames(translator)
@@ -144,7 +149,7 @@ def _make_stream_translator(translator_ctx: Optional[dict]):
         )
     if name == "anthropic_to_chat":
         from ..openai.transform.stream_chat_to_anthropic import StreamTranslator as _C2A
-        return _C2A(model=model, model_override=translator_ctx.get("response_model_override"))
+        return _C2A(model=model, model_override=translator_ctx.get("response_model_override"), request_body=translator_ctx.get("request_body"))
     if name == "anthropic_to_responses":
         from ..openai.transform.stream_responses_to_anthropic import StreamTranslator as _R2A
         return _R2A(
@@ -196,7 +201,8 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
         )
     if name == "anthropic_to_chat":
         from ..openai.transform.anthropic_to_chat import translate_response as _t3
-        return _t3(obj, model=model)
+        from ..openai.transform.anthropic_compat import apply_stop_sequences
+        return apply_stop_sequences(_t3(obj, model=model), translator_ctx.get("request_body"))
     if name == "chat_to_anthropic":
         from ..openai.transform.chat_to_anthropic import translate_response as _t4
         return _t4(obj, model=model)
@@ -356,16 +362,11 @@ async def prepare_non_stream_response(
     toolkit = toolkit_for_channel(channel)
 
     if toolkit["is_upstream_error_json"](obj):
-        if protocol_errors.is_responses_max_output_incomplete(obj):
-            error_detail = protocol_errors.responses_max_output_context_error_message(
-                protocol_errors.responses_incomplete_reason(obj)
-            )
+        code, msg = protocol_errors.extract_error_info(obj, fallback="upstream error")
+        if protocol_errors.is_context_length_code_or_message(code, msg):
+            error_detail = protocol_errors.context_length_error_message_for_claude_code(msg)
         else:
-            code, msg = protocol_errors.extract_error_info(obj, fallback="upstream error")
-            if protocol_errors.is_context_length_code_or_message(code, msg):
-                error_detail = protocol_errors.context_length_error_message_for_claude_code(msg)
-            else:
-                error_detail = json.dumps(obj.get("error", obj), ensure_ascii=False)[:2000]
+            error_detail = json.dumps(obj.get("error", obj), ensure_ascii=False)[:2000]
         return PreparedNonStreamResponse(
             obj=obj,
             restored=restored,
@@ -937,7 +938,7 @@ def responses_ws_error_detail(data: str | bytes) -> tuple[Optional[int], str]:
         return None, str(obj)[:2000]
 
     if protocol_errors.is_responses_max_output_incomplete(obj):
-        return 400, protocol_errors.responses_max_output_context_error_message(
+        return None, protocol_errors.responses_max_output_context_error_message(
             protocol_errors.responses_incomplete_reason(obj)
         )
 

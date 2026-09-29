@@ -66,10 +66,8 @@ def responses_request_failure_info(payload: Any) -> tuple[str, str] | None:
 def responses_incomplete_reason(payload: Any) -> str | None:
     """Return ``response.incomplete`` reason from a Responses payload/event.
 
-    OpenAI Responses may report output-budget exhaustion as a terminal
-    ``response.incomplete`` event instead of a normal error.  Many downstream
-    clients do not understand that terminal event, so Parrot normalizes the
-    unambiguous ``max_output_tokens`` case into a context-length style error.
+    Output-budget exhaustion is an incomplete completion, not evidence that
+    the input exceeded the context window. Preserve that distinction.
     """
     if not isinstance(payload, dict):
         return None
@@ -189,12 +187,10 @@ def context_length_error_message_for_claude_code(
 
 
 def responses_max_output_context_error_message(reason: str | None = None) -> str:
+    # Compatibility name retained for internal callers; never fabricate an
+    # input-context error from an explicit output-budget terminal.
     reason = str(reason or "max_output_tokens")
-    detail = (
-        f"{CONTEXT_LENGTH_EXCEEDED_CODE}: upstream Responses ended incomplete "
-        f"because incomplete_details.reason={reason}; reduce input context or reserved output tokens."
-    )
-    return context_length_error_message_for_claude_code(detail)
+    return f"response incomplete: output budget exhausted ({reason})"
 
 
 def _format_error_info(code: Any, message: Any, fallback: str) -> tuple[str | None, str]:
@@ -496,7 +492,7 @@ def extract_error_info(payload: Any, fallback: str = "upstream stream error") ->
     """
     if is_responses_max_output_incomplete(payload):
         return (
-            CONTEXT_LENGTH_EXCEEDED_CODE,
+            "response_incomplete",
             responses_max_output_context_error_message(responses_incomplete_reason(payload)),
         )
 

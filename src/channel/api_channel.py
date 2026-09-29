@@ -153,7 +153,7 @@ class ApiChannel(Channel):
             namespace_tool_map = responses_to_anthropic.NamespaceToolMap()
             requested_body = responses_to_anthropic.translate_request(
                 requested_body, api_key_name=api_key_name, store_enabled=_store.is_enabled(),
-                namespace_tool_map=namespace_tool_map,
+                namespace_tool_map=namespace_tool_map, target_model=resolved_model,
             )
             translator_ctx = {
                 "ingress": "responses",
@@ -281,14 +281,15 @@ class ApiChannel(Channel):
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/messages"),
             headers=headers,
             body=signed,
-            dynamic_tool_map=dynamic_map,
+            dynamic_tool_map=(cc_mimicry.ToolNameRestoreMap(dynamic_map)
+                              if self.cc_mimicry and payload.get("stream") else dynamic_map),
             translator_ctx=translator_ctx,
             dispatch_metadata=build_dispatch_metadata(payload, "anthropic", headers),
         )
 
     async def restore_response(self, chunk: bytes,
                                dynamic_map: Optional[dict] = None) -> bytes:
-        if dynamic_map:
+        if self.cc_mimicry or dynamic_map is not None:
             return cc_mimicry._restore_tool_names_in_chunk(chunk, dynamic_map)
         return chunk
 

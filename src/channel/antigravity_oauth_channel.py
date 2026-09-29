@@ -14,7 +14,7 @@ from typing import Optional
 from .. import cache_hints, config, media_config, oauth_manager
 from ..oauth import antigravity as ag_provider
 from ..oauth_ids import account_key as _account_key
-from ..openai.transform import anthropic_to_responses, chat_to_responses, guard
+from ..openai.transform import anthropic_to_responses, chat_to_responses, guard, responses_to_chat
 from ..providers import antigravity_codec, remote_image, registry as provider_registry
 from .base import Channel, ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 from .oauth_helpers import request_api_key_name as _request_api_key_name
@@ -170,14 +170,23 @@ class AntigravityOAuthChannel(Channel):
         if ingress_protocol in ("chat", "responses"):
             requested_body = await remote_image.inline_remote_images(requested_body)
         translator_ctx: Optional[dict]
+        namespace_tool_map = None
+        local_store_context = None
         if ingress_protocol == "responses":
-            if str(requested_body.get("previous_response_id") or "").strip():
-                raise ValueError(
-                    "previous_response_id is not supported on Antigravity OAuth; "
-                    "resend the conversation input instead."
-                )
+            prepared, namespace_tool_map = antigravity_codec.prepare_responses_request(
+                requested_body, api_key_name=_request_api_key_name(requested_body),
+            )
+            # Locally expanded history may contain images from another route;
+            # apply the same provider image conversion as to current input.
+            prepared = await remote_image.inline_remote_images(prepared)
+            local_store_context = {
+                "api_key_name": _request_api_key_name(requested_body),
+                "channel_key": self.key,
+                "parent_id": requested_body.get("previous_response_id"),
+                "current_input_items": responses_to_chat.resolve_current_input_items(requested_body),
+            }
             payload = provider_registry.filter_request_payload(
-                self, requested_body, protocol="openai-responses",
+                self, prepared, protocol="openai-responses",
             )
             translator_ctx = {
                 "ingress": "responses",
@@ -235,7 +244,9 @@ class AntigravityOAuthChannel(Channel):
         )
         translator_ctx["antigravity_stream"] = antigravity_codec.GeminiStreamToResponses(
             model=resolved_model,
-            request_body=payload,
+            request_body=requested_body if ingress_protocol == "responses" else payload,
+            namespace_tool_map=namespace_tool_map,
+            local_store_context=local_store_context,
         )
         translator_ctx["antigravity_stream_requested"] = stream
 

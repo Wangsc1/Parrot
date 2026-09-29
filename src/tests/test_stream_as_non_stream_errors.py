@@ -43,7 +43,7 @@ def _event(name: str, data: dict) -> bytes:
     ).encode("utf-8")
 
 
-async def test_stream_only_nonstream_incomplete_max_output_is_context_error():
+async def test_stream_only_nonstream_output_limit_preserves_incomplete():
     chunks = [
         _event("response.created", {
             "type": "response.created",
@@ -80,20 +80,11 @@ async def test_stream_only_nonstream_incomplete_max_output_is_context_error():
     )
 
     assert ctx.closed is True
-    assert result.error is not None
-    assert result.error.outcome == "upstream_error_json"
-    assert result.error.error_detail.startswith("Prompt is too long:")
-    assert "context_length_exceeded" in result.error.error_detail
-    assert "max_output_tokens" in result.error.error_detail
-    # Billing evidence survives the terminal error path instead of being
-    # discarded before retry/failover settlement.
-    assert "response.incomplete" in (result.error.full_response_text or "")
-    assert result.error.usage["input_tokens"] == 271409
-    assert result.error.usage["output_tokens"] == 137
-
-    normalized = request_invalid_result_if_needed(result.error)
-    assert normalized.outcome == "request_invalid"
-    assert normalized.http_status == 400
+    assert result.error is None
+    assert result.obj["status"] == "incomplete"
+    assert result.obj["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert result.usage["input_tokens"] == 271409
+    assert result.usage["output_tokens"] == 137
 
 
 async def test_stream_only_nonstream_context_length_failed_is_not_success():
@@ -155,7 +146,7 @@ async def test_stream_only_nonstream_context_length_failed_is_not_success():
     assert normalized.http_status == 400
 
 
-def test_responses_to_anthropic_incomplete_max_output_emits_context_error():
+def test_responses_to_anthropic_incomplete_max_output_preserves_truncation():
     tr = StreamTranslator(model="gpt-5.5")
     chunk = _event("response.incomplete", {
         "type": "response.incomplete",
@@ -166,13 +157,28 @@ def test_responses_to_anthropic_incomplete_max_output_emits_context_error():
         },
     })
 
-    out = b"".join(tr.feed(chunk)).decode("utf-8")
+    out = b"".join([*tr.feed(chunk), *tr.close()]).decode("utf-8")
 
-    assert "event: error" in out
-    assert '"type":"invalid_request_error"' in out
-    assert '"code":"context_length_exceeded"' in out
-    assert "Prompt is too long" in out
-    assert "max_output_tokens" in out
+    assert "event: error" not in out
+    assert '"stop_reason":"max_tokens"' in out
+    assert "event: message_stop" in out
+    assert "context_length_exceeded" not in out
+
+
+async def test_stream_only_nonstream_anthropic_preserves_partial_output_on_budget_end():
+    from src.protocols.runtime import apply_non_stream_response_translator
+    response = {"id": "resp_limit", "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": [{"type": "message", "id": "msg_a", "role": "assistant", "content": [{"type": "output_text", "text": "partial answer"}]}], "usage": {"input_tokens": 10, "output_tokens": 4}}
+    chunks = [_event("response.incomplete", {"type": "response.incomplete", "response": response})]
+    ctx = _Ctx()
+    resp = httpx.Response(200, stream=_ChunkedByteStream(chunks), headers={"content-type": "text/event-stream"})
+    started = time.time()
+    translator_ctx = {"response_translator": "anthropic_to_responses", "model_for_response": "gpt-5"}
+    result = await aggregate_stream_as_non_stream_response(ctx, resp, _Channel(), "gpt-5", dynamic_map=None, connect_ms=1, start_time=started, deadline_ts=started + 30, total_timeout=30, first_byte_timeout=5, idle_timeout=5, translator_ctx=translator_ctx)
+    assert result.error is None
+    out = apply_non_stream_response_translator(result.obj, translator_ctx)
+    assert out["stop_reason"] == "max_tokens"
+    assert out["content"] == [{"type": "text", "text": "partial answer"}]
+    assert out["usage"]["output_tokens"] == 4
 
 
 def test_responses_to_anthropic_response_failed_adds_invalid_request_type():

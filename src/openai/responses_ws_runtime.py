@@ -336,6 +336,8 @@ def merge_responses_ws_headers(
 def request_body_from_ws_create(obj: dict) -> dict:
     body = dict(obj)
     body.pop("type", None)
+    # Lane routing belongs to the WS transport, never to HTTP Responses bodies.
+    body.pop("stream_id", None)
     body.pop("generate", None)
     body.pop("client_metadata", None)
     return body
@@ -386,6 +388,10 @@ def map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel=None) -> 
         )
     if typ:
         out["type"] = typ
+    # Preserve this WS-only envelope field outside provider payload whitelists.
+    # Ingress can also consume it locally when isolating lanes on old upstreams.
+    if "stream_id" in obj:
+        out["stream_id"] = obj["stream_id"]
     return out
 
 

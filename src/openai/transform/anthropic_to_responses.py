@@ -14,7 +14,7 @@ import time
 import uuid
 from typing import Any
 
-from . import common
+from . import common, anthropic_compat
 from .guard import GuardError
 from ... import local_web_tools, search_hosted_codec
 from ...protocols.usage import legacy_usage_from_openai_responses_json
@@ -74,9 +74,9 @@ def guard_request(
             if typ in ("text", "image", "document", "tool_use"):
                 continue
             if typ in ("thinking", "redacted_thinking"):
-                if allow_thinking_history:
-                    continue
-                _fail("thinking/redacted_thinking cannot be safely converted to Responses yet", param="messages")
+                # Foreign signed thinking is not portable; preserve the actual
+                # conversation/tool history without forwarding its opaque state.
+                continue
             _fail(f"unsupported Anthropic content block for Responses bridge: {typ!r}", param="messages")
 
     for tool in body.get("tools") or []:
@@ -237,7 +237,9 @@ def _document_to_responses_parts(block: dict[str, Any]) -> list[dict[str, Any]]:
         data = source.get("data")
         if not isinstance(data, str) or not data:
             _fail("base64 document source is missing data", param="messages")
-        file_part["file_data"] = data
+        media_type = str(source.get("media_type") or "application/pdf")
+        file_part["file_data"] = data if data.startswith("data:") else f"data:{media_type};base64,{data}"
+        file_part["filename"] = "document.pdf" if media_type == "application/pdf" else "document"
     elif st == "url":
         url = source.get("url")
         if not isinstance(url, str) or not url:
@@ -260,6 +262,10 @@ def _flush_message(items: list[dict[str, Any]], role: str, parts: list[dict[str,
 
 
 def _tool_result_output(block: dict[str, Any]) -> str | list[dict[str, Any]]:
+    return anthropic_compat.mark_tool_error(_tool_result_content(block), block)
+
+
+def _tool_result_content(block: dict[str, Any]) -> str | list[dict[str, Any]]:
     _guard_tool_result_content(block)
     content = block.get("content")
     if content is None:
@@ -394,7 +400,7 @@ def _messages_to_input_items(
                 })
             elif typ in ("thinking", "redacted_thinking"):
                 if not allow_thinking_history:
-                    _fail("thinking/redacted_thinking cannot be safely converted to Responses yet", param="messages")
+                    continue
                 if role != "assistant":
                     _fail("thinking content is only supported in assistant messages on Responses bridge", param="messages")
                 _flush_message(items, role, parts)
@@ -454,6 +460,7 @@ def _tools_to_responses(tools: Any) -> list[dict[str, Any]]:
             "type": "function",
             "name": str(tool.get("name") or ""),
             "parameters": tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else {"type": "object"},
+            "strict": tool.get("strict") if isinstance(tool.get("strict"), bool) else False,
         }
         if tool.get("description") is not None:
             item["description"] = str(tool.get("description") or "")
@@ -511,6 +518,9 @@ def translate_request(
         payload["max_output_tokens"] = body.get("max_output_tokens")
     elif body.get("max_tokens") is not None:
         payload["max_output_tokens"] = body.get("max_tokens")
+    fmt = anthropic_compat.output_format(body)
+    if fmt is not None:
+        payload["text"] = {"format": fmt}
     if body.get("temperature") is not None:
         payload["temperature"] = body.get("temperature")
     if body.get("top_p") is not None:
@@ -555,21 +565,11 @@ def _parse_arguments(
     tool_name: str | None = None,
     optional_empty_string_fields_by_tool: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return common.normalize_tool_input_optional_empty_strings(
-            tool_name, raw, optional_empty_string_fields_by_tool
-        )
-    if not isinstance(raw, str) or not raw:
-        return {}
-    try:
-        value = json.loads(raw)
-    except Exception:
-        return {"_raw": raw}
-    if isinstance(value, dict):
-        return common.normalize_tool_input_optional_empty_strings(
-            tool_name, value, optional_empty_string_fields_by_tool
-        )
-    return {"_value": value}
+    from .tool_arguments import parse_tool_arguments
+    value = parse_tool_arguments(raw, tool_name=tool_name or "")
+    return common.normalize_tool_input_optional_empty_strings(
+        tool_name, value, optional_empty_string_fields_by_tool
+    )
 
 
 def _gather_output_text(output: list[Any]) -> list[str]:
@@ -597,7 +597,9 @@ def _response_stop_reason(resp: dict, *, has_tool_use: bool) -> str:
         reason = (resp.get("incomplete_details") or {}).get("reason")
         if reason in ("max_output_tokens", "max_tokens"):
             return "max_tokens"
-        return "end_turn"
+        if reason == "content_filter":
+            return "refusal"
+        return "pause_turn"
     if status in ("failed", "cancelled"):
         return "end_turn"
     return "tool_use" if has_tool_use else "end_turn"
@@ -624,23 +626,17 @@ def translate_response(
     )
     content: list[dict[str, Any]] = []
 
-    # The legacy bridge intentionally keeps its historical text aggregation and
-    # reasoning omission.  Antigravity opts into the ordered reasoning bridge
-    # below because Cloud Code signatures must survive Anthropic tool replay.
-    text = resp.get("output_text")
-    if not allow_reasoning_bridge:
-        if isinstance(text, str) and text:
-            content.append({"type": "text", "text": text})
-        else:
-            gathered = _gather_output_text(output)
-            if gathered:
-                content.append({"type": "text", "text": "".join(gathered)})
+    # Reasoning bridge controls only reasoning blocks; all other blocks must
+    # follow output[] order, irrespective of response.output_text aggregation.
+    # Retain the legacy output_text-only fallback for compatible minimal JSON.
+    if not output and isinstance(resp.get("output_text"), str) and resp["output_text"]:
+        content.append({"type": "text", "text": resp["output_text"]})
 
     seen_signatures: set[str] = set()
     for item in output:
         if not isinstance(item, dict):
             continue
-        if allow_reasoning_bridge and item.get("type") == "message":
+        if item.get("type") == "message":
             parts = item.get("content") if isinstance(item.get("content"), list) else []
             for part in parts:
                 if isinstance(part, dict) and part.get("type") in ("output_text", "refusal"):
@@ -681,7 +677,7 @@ def translate_response(
                 seen_signatures.add(signature)
 
     has_tool_use = any(block.get("type") == "tool_use" for block in content)
-    return {
+    return anthropic_compat.apply_stop_sequences({
         "id": str(resp.get("id") or _gen_id("msg_")),
         "type": "message",
         "role": "assistant",
@@ -690,4 +686,4 @@ def translate_response(
         "stop_reason": _response_stop_reason(resp, has_tool_use=has_tool_use),
         "stop_sequence": None,
         "usage": _anthropic_usage_from_responses(resp),
-    }
+    }, request_body)

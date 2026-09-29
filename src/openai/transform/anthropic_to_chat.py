@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from . import common
+from . import common, anthropic_compat
 from .guard import GuardError
 from ... import local_web_tools
 from ...protocols.usage import legacy_usage_from_openai_chat_json
@@ -54,7 +54,10 @@ def _tool_result_unsupported_label(block: dict[str, Any]) -> str | None:
         return None
     if isinstance(content, list):
         for item in content:
-            if isinstance(item, dict) and item.get("type") in ("text", "tool_reference"):
+            if isinstance(item, dict) and item.get("type") in ("text", "tool_reference", "image"):
+                continue
+            if isinstance(item, dict) and item.get("type") == "document":
+                _document_to_chat_parts(item)
                 continue
             if isinstance(item, dict):
                 return f"tool_result:{item.get('type') or 'object'}"
@@ -104,7 +107,7 @@ def guard_request(body: dict, *, target_model: str | None = None) -> None:
             if typ == "document" and msg.get("role") != "user":
                 _fail("document content is only supported in user messages when routing Anthropic to OpenAI Chat", param="messages")
             if typ in ("thinking", "redacted_thinking"):
-                _fail("thinking/redacted_thinking cannot be safely converted to OpenAI Chat yet", param="messages")
+                continue
             if typ == "tool_result":
                 _guard_tool_result_content(block)
             if typ == "tool_use":
@@ -130,6 +133,10 @@ def _convert_system(system: Any) -> list[dict[str, Any]]:
 
 
 def _tool_result_text(block: dict[str, Any]) -> str:
+    return anthropic_compat.mark_tool_error(_tool_result_plain_text(block), block)
+
+
+def _tool_result_plain_text(block: dict[str, Any]) -> str:
     _guard_tool_result_content(block)
     content = block.get("content")
     if isinstance(content, str):
@@ -200,7 +207,9 @@ def _document_to_chat_parts(block: dict[str, Any]) -> list[dict[str, Any]]:
         data = source.get("data")
         if not isinstance(data, str) or not data:
             _fail("base64 document source is missing data", param="messages")
-        file_obj["file_data"] = data
+        media_type = str(source.get("media_type") or "application/pdf")
+        file_obj["file_data"] = data if data.startswith("data:") else f"data:{media_type};base64,{data}"
+        file_obj["filename"] = "document.pdf" if media_type == "application/pdf" else "document"
     elif st == "url":
         _fail("url document sources cannot be converted to OpenAI Chat file input without file retrieval", param="messages")
     elif st == "file":
@@ -234,6 +243,7 @@ def _convert_messages(messages: Any) -> list[dict[str, Any]]:
                 out.append({"role": role, "content": text})
         elif role == "user":
             content_parts: list[dict[str, Any]] = []
+            attachment_parts: list[dict[str, Any]] = []
             def flush_content() -> None:
                 if content_parts:
                     out.append({"role": "user", "content": _chat_user_content(content_parts)})
@@ -255,8 +265,22 @@ def _convert_messages(messages: Any) -> list[dict[str, Any]]:
                         "tool_call_id": str(block.get("tool_use_id") or ""),
                         "content": _tool_result_text(block),
                     })
+                    # Chat tool messages cannot carry images/files. Keep every
+                    # tool result adjacent to its call, then attach the original
+                    # bytes in a user message identified by the tool call ID.
+                    result_parts = block.get("content")
+                    for part in result_parts if isinstance(result_parts, list) else []:
+                        if not isinstance(part, dict) or part.get("type") not in ("image", "document"):
+                            continue
+                        attachment_parts.append({"type": "text", "text": f"Attachment from tool result {block.get('tool_use_id', '')}:"})
+                        if part.get("type") == "image":
+                            attachment_parts.append(_image_to_chat_part(part))
+                        else:
+                            attachment_parts.extend(_document_to_chat_parts(part))
                 else:
                     _fail(f"unsupported user block for Chat bridge: {typ!r}", param="messages")
+            if attachment_parts:
+                content_parts[:0] = attachment_parts
             flush_content()
         elif role == "assistant":
             text_parts: list[str] = []
@@ -267,6 +291,8 @@ def _convert_messages(messages: Any) -> list[dict[str, Any]]:
                     text = str(block.get("text") or "")
                     if text:
                         text_parts.append(text)
+                elif typ in ("thinking", "redacted_thinking"):
+                    continue
                 elif typ == "tool_use":
                     tool_input = _tool_use_input(block)
                     tool_calls.append({
@@ -282,7 +308,8 @@ def _convert_messages(messages: Any) -> list[dict[str, Any]]:
             item: dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts) if text_parts else None}
             if tool_calls:
                 item["tool_calls"] = tool_calls
-            out.append(item)
+            if text_parts or tool_calls:
+                out.append(item)
         else:
             _fail(f"unsupported Anthropic message role for Chat bridge: {role!r}", param="messages")
     return out
@@ -332,6 +359,7 @@ def _convert_tools(tools: Any) -> list[dict[str, Any]]:
                 "name": str(tool.get("name") or ""),
                 "description": str(tool.get("description") or ""),
                 "parameters": tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else {"type": "object"},
+                "strict": tool.get("strict") if isinstance(tool.get("strict"), bool) else False,
             },
         })
     return out
@@ -363,10 +391,18 @@ def translate_request(body: dict, *, target_model: str | None = None) -> dict:
         "messages": _convert_system(body.get("system")) + _convert_messages(body.get("messages") or []),
         "stream": bool(body.get("stream")),
     }
+    # Only OpenAI model families use the newer completion budget. Other
+    # compatible Chat providers retain their existing max_tokens contract.
+    name = str(target_model or "").lower()
+    completion_budget = (name.startswith("gpt-") and common.supports_reasoning_effort(name)) or (name.startswith("o") and len(name) > 1 and name[1].isdigit())
+    budget_field = "max_completion_tokens" if completion_budget else "max_tokens"
     if body.get("max_output_tokens") is not None:
-        payload["max_tokens"] = body.get("max_output_tokens")
+        payload[budget_field] = body.get("max_output_tokens")
     elif body.get("max_tokens") is not None:
-        payload["max_tokens"] = body.get("max_tokens")
+        payload[budget_field] = body.get("max_tokens")
+    fmt = anthropic_compat.output_format(body, chat=True)
+    if fmt is not None:
+        payload["response_format"] = fmt
     if body.get("stop_sequences"):
         stop = body.get("stop_sequences")
         payload["stop"] = stop if isinstance(stop, list) else [stop]
@@ -394,16 +430,9 @@ def translate_request(body: dict, *, target_model: str | None = None) -> dict:
     return payload
 
 
-def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return raw
-    if not isinstance(raw, str) or not raw:
-        return {}
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        return {"_raw": raw}
-    return obj if isinstance(obj, dict) else {"_value": obj}
+def _parse_tool_arguments(raw: Any, *, tool_name: str = "") -> dict[str, Any]:
+    from .tool_arguments import parse_tool_arguments
+    return parse_tool_arguments(raw, tool_name=tool_name)
 
 
 def _stop_reason(finish_reason: str | None) -> str:
@@ -411,6 +440,8 @@ def _stop_reason(finish_reason: str | None) -> str:
         return "tool_use"
     if finish_reason == "length":
         return "max_tokens"
+    if finish_reason == "content_filter":
+        return "refusal"
     return "end_turn"
 
 
@@ -433,7 +464,7 @@ def translate_response(obj: dict, *, model: str = "") -> dict:
             "type": "tool_use",
             "id": str(tc.get("id") or ""),
             "name": str(fn.get("name") or ""),
-            "input": _parse_tool_arguments(fn.get("arguments")),
+            "input": _parse_tool_arguments(fn.get("arguments"), tool_name=str(fn.get("name") or "")),
         })
     legacy_usage = legacy_usage_from_openai_chat_json(obj)
     usage = {

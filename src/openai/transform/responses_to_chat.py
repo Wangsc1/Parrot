@@ -134,6 +134,10 @@ def translate_request_from_input_items(body: dict, input_items: list) -> dict:
     text_cfg = body.get("text") or {}
     fmt = text_cfg.get("format") if isinstance(text_cfg, dict) else None
     if fmt:
+        if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
+            fmt = {"type": "json_schema", "json_schema": {
+                k: v for k, v in fmt.items() if k != "type"
+            }}
         payload["response_format"] = fmt
 
     reasoning = body.get("reasoning") or {}
@@ -325,7 +329,7 @@ def _input_items_to_messages(items: list, *, native_search=False) -> list:
         nonlocal pending_assistant
         if pending_assistant is not None:
             if bridge:
-                pending_assistant.setdefault("reasoning_content", _pop_reasoning())
+                pending_assistant.setdefault("reasoning_content", "")
             messages.append(pending_assistant)
             pending_assistant = None
 
@@ -409,6 +413,9 @@ def _input_items_to_messages(items: list, *, native_search=False) -> list:
         elif t == "function_call":
             if pending_assistant is None:
                 pending_assistant = {"role": "assistant", "content": None, "tool_calls": []}
+            if bridge and pending_reasoning:
+                previous = pending_assistant.get("reasoning_content") or ""
+                pending_assistant["reasoning_content"] = "\n\n".join(filter(None, (previous, _pop_reasoning())))
             pending_assistant.setdefault("tool_calls", []).append({
                 "id": item.get("call_id") or _gen_id("call_"),
                 "type": "function",
@@ -436,6 +443,9 @@ def _input_items_to_messages(items: list, *, native_search=False) -> list:
             # → chat assistant.tool_calls type=custom
             if pending_assistant is None:
                 pending_assistant = {"role": "assistant", "content": None, "tool_calls": []}
+            if bridge and pending_reasoning:
+                previous = pending_assistant.get("reasoning_content") or ""
+                pending_assistant["reasoning_content"] = "\n\n".join(filter(None, (previous, _pop_reasoning())))
             pending_assistant.setdefault("tool_calls", []).append({
                 "id": item.get("call_id") or _gen_id("call_"),
                 "type": "custom",
@@ -619,7 +629,8 @@ def translate_response(chat: dict, *, model: str,
                        channel_key: Optional[str] = None,
                        current_input_items: Optional[list] = None,
                        output_item_transform=None,
-                       output_prefix: Optional[list[dict]] = None) -> dict:
+                       output_prefix: Optional[list[dict]] = None,
+                       output_ordering=None) -> dict:
     """Chat 非流式 JSON → Responses 非流式 JSON。
 
     当 `current_input_items` 非 None 且 `api_key_name` 非空时，把本次响应
@@ -711,6 +722,8 @@ def translate_response(chat: dict, *, model: str,
 
     status, incomplete = _finish_reason_to_status(finish_reason, bool(msg.get("tool_calls")))
 
+    if output_ordering is not None:
+        output_items = output_ordering(output_items)
     if output_item_transform is not None:
         output_items = [output_item_transform(item) for item in output_items]
 

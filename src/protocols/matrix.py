@@ -138,6 +138,8 @@ class ChannelCapabilities:
     native_state: frozenset[str] = frozenset()
     supports_images: bool = True
     raw: dict[str, Any] | None = None
+    # Implemented by the provider bridge, not upstream server-side state.
+    translated_state: frozenset[str] = frozenset()
 
 
 def canonical_ingress_protocol(ingress_protocol: str) -> str:
@@ -405,7 +407,16 @@ def _anthropic_tool_result_unsupported_label(block: dict[str, Any]) -> str | Non
         return None
     if isinstance(content, list):
         for item in content:
-            if isinstance(item, dict) and item.get("type") in ("text", "tool_reference"):
+            if isinstance(item, dict) and item.get("type") in ("text", "tool_reference", "image"):
+                if item.get("type") == "image":
+                    label = _anthropic_image_unsupported_label(item)
+                    if label:
+                        return f"tool_result:{label}"
+                continue
+            if isinstance(item, dict) and item.get("type") == "document":
+                label = _anthropic_document_unsupported_label(item, allow_url=False)
+                if label:
+                    return f"tool_result:{label}"
                 continue
             if isinstance(item, dict):
                 return f"tool_result:{item.get('type') or 'object'}"
@@ -550,13 +561,19 @@ def _resolve_anthropic_reasoning_effort(body: dict[str, Any]) -> str | None:
 
 
 def _anthropic_top_level_reasoning_is_mappable(body: dict[str, Any]) -> bool:
-    has_reasoning_control = body.get("thinking") is not None or body.get("output_config") is not None
-    return bool(has_reasoning_control and _resolve_anthropic_reasoning_effort(body))
+    output_config = body.get("output_config")
+    has_effort = isinstance(output_config, dict) and output_config.get("effort") is not None
+    thinking = body.get("thinking")
+    if not has_effort and (thinking is None or (isinstance(thinking, dict) and thinking.get("type") == "disabled")):
+        return True
+    return bool(_resolve_anthropic_reasoning_effort(body))
 
 
 def _anthropic_thinking_is_disabled(body: dict[str, Any]) -> bool:
     thinking = body.get("thinking")
-    return isinstance(thinking, dict) and str(thinking.get("type") or "").strip().lower() == "disabled" and body.get("output_config") is None
+    output_config = body.get("output_config")
+    has_effort = isinstance(output_config, dict) and output_config.get("effort") is not None
+    return isinstance(thinking, dict) and str(thinking.get("type") or "").strip().lower() == "disabled" and not has_effort
 
 
 def _anthropic_context_management_is_ignorable(value: Any) -> bool:
@@ -844,13 +861,18 @@ def extract_request_features(ingress_protocol: str, body: dict | None) -> Reques
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
                     has_tool_results = True
+                    result_parts = b.get("content")
+                    if isinstance(result_parts, list):
+                        has_images = has_images or any(isinstance(p, dict) and p.get("type") == "image" for p in result_parts)
+                        has_files = has_files or any(isinstance(p, dict) and p.get("type") == "document" for p in result_parts)
                     unsupported_tool_result_label = unsupported_tool_result_label or _anthropic_tool_result_unsupported_label(b)
                     anthropic_tool_result_responses_unsupported_label = (
                         anthropic_tool_result_responses_unsupported_label
                         or _anthropic_tool_result_responses_unsupported_label(b)
                     )
-            if any(isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking") for b in blocks):
-                has_reasoning = True
+            # Foreign signed thinking is omitted by OpenAI bridges while the
+            # visible conversation and tool history remain intact. Do not veto
+            # a model switch solely because that old provider state exists.
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "image":
                     has_images = True
@@ -1091,6 +1113,20 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
     if bool(getattr(channel, "upstream_stream_only", False)):
         transports.discard("http-json")
     native_state: set[str] = set()
+    if protocol == "openai-responses" and ch_type == "oauth" and provider == "antigravity":
+        # Cloud Code is Gemini HTTP, not a Codex state/WS backend. The channel
+        # expands tenant-checked local history/references and reversibly flattens
+        # ordinary namespace functions. encrypted_content carries this provider's
+        # own thought signatures; it does not promise foreign ciphertext replay.
+        return ChannelCapabilities(
+            protocol=protocol,
+            transports=frozenset(transports),
+            native_state=frozenset({"thought_signature_replay", "session_id"}),
+            translated_state=frozenset({
+                "previous_response_id", "item_reference", "namespace",
+                "encrypted_reasoning_replay", "prompt_cache_key",
+            }),
+        )
     if protocol == "openai-chat":
         if not is_cursor:
             native_state.update({"multi_candidate", "file_id", "audio"})
@@ -1192,16 +1228,18 @@ def _responses_native_unsupported_label(
     capabilities: ChannelCapabilities | None,
 ) -> str | None:
     native = capabilities.native_state if capabilities is not None else frozenset()
+    translated = capabilities.translated_state if capabilities is not None else frozenset()
+    available = native | translated
     if f.has_hosted_tools:
         hosted_tool_labels = f.hosted_tool_labels or ((f.hosted_tool_label,) if f.hosted_tool_label else ())
         for hosted_tool_label in hosted_tool_labels:
-            if not _responses_hosted_tool_supported(hosted_tool_label, native):
+            if not _responses_hosted_tool_supported(hosted_tool_label, available):
                 return hosted_tool_label
         if not hosted_tool_labels:
             return "hosted_tools"
     if f.has_custom_tools and "custom_tool_history" not in native:
         return f.custom_tool_label or "custom_tool_history"
-    if f.has_encrypted_reasoning and "encrypted_reasoning_replay" not in native:
+    if f.has_encrypted_reasoning and "encrypted_reasoning_replay" not in available:
         return "reasoning.encrypted_content"
     if f.has_audio and "audio" not in native:
         return "audio"
@@ -1210,6 +1248,8 @@ def _responses_native_unsupported_label(
     if f.stateful_file_reference_label and "file_id" not in native:
         return f.stateful_file_reference_label
     if f.has_stateful_input_items:
+        # Locally resolvable references are absent from these labels. A remaining
+        # item_reference needs real server-side state, not translated_state.
         labels = f.stateful_input_item_labels or (
             (f.stateful_input_item_label,) if f.stateful_input_item_label else ()
         )
@@ -1379,8 +1419,8 @@ class ProtocolMatrix:
                         "OpenAI Responses→Anthropic instructions are not safely convertible"
                         + _label_suffix(f.responses_instructions_unsupported_label)
                     )
-                if f.has_encrypted_reasoning:
-                    raise ProtocolGuardError("OpenAI Responses→Anthropic include reasoning.encrypted_content / encrypted reasoning replay is not enabled yet")
+                # Foreign encrypted reasoning is skipped by the converter;
+                # visible messages and tool history still form a valid request.
                 stateful_labels = f.stateful_input_item_labels or (
                     (f.stateful_input_item_label,) if f.stateful_input_item_label else ()
                 )
@@ -1417,11 +1457,8 @@ class ProtocolMatrix:
                         "OpenAI Responses→Anthropic file/document input is not safely convertible"
                         + _label_suffix(file_label)
                     )
-                if f.has_custom_tools:
-                    raise ProtocolGuardError(
-                        "OpenAI Responses→Anthropic custom tools/calls are not enabled yet"
-                        + _label_suffix(f.custom_tool_label)
-                    )
+                # Text custom tools have a reversible JSON wrapper. The
+                # converter validates grammar/invalid history at its boundary.
                 return RoutePlan(
                     ingress_protocol=ingress,
                     upstream_protocol=upstream,

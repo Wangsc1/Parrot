@@ -27,6 +27,7 @@ from typing import Any, Iterator, Optional
 
 from ...protocols import errors as protocol_errors
 from ...protocols.sse import split_sse_events
+from ._stream_response_text_order import TextOutputOrder
 
 
 def _gen_id(prefix: str) -> str:
@@ -59,6 +60,7 @@ class R2CState:
     # 与文本同理：refusal.done 可能是拒绝文本唯一的载体。
     chat_refusal_by_part: dict[tuple[int, int], str] = field(default_factory=dict)
     fc_args_by_tc_index: dict[int, str] = field(default_factory=dict)
+    message_output_index_by_id: dict[str, int] = field(default_factory=dict)
     # 02-bug-findings #35: 累积 annotation.added 事件
     annotations: list = field(default_factory=list)
     # 累积
@@ -77,14 +79,14 @@ class R2CState:
 def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
     """把一个 `event:/data:` 块解析成 (event_name, payload_dict)。"""
     event_name: Optional[str] = None
-    data_str: Optional[str] = None
-    for line in block.split("\n"):
-        line = line.strip()
+    data_lines: list[str] = []
+    for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if line.startswith("event:"):
             event_name = line[6:].strip() or None
         elif line.startswith("data:"):
-            data_str = line[5:].strip()
-    if data_str is None or data_str == "[DONE]":
+            data_lines.append(line[5:].lstrip(" "))
+    data_str = "\n".join(data_lines)
+    if not data_lines or data_str.strip() == "[DONE]":
         return event_name, None
     try:
         return event_name, json.loads(data_str)
@@ -153,6 +155,7 @@ class StreamTranslator:
             include_usage=include_usage,
         )
         self._buf = b""
+        self._text_order = TextOutputOrder()
 
     # --- 公开接口 ---
 
@@ -225,6 +228,10 @@ class StreamTranslator:
         # 也避免在 close() 之后通过 feed() 注入新 chunk（terminal_emitted 仅由 close 设）
         if self.state.terminal_status is not None:
             return
+        for ready_name, ready_data in self._text_order.feed(event_name or '', data or {}):
+            yield from self._dispatch_event(ready_name, ready_data)
+
+    def _dispatch_event(self, event_name: str, data: dict) -> Iterator[bytes]:
         # responses 事件在 MS-4 首版只处理关键子集；未识别的 event 静默丢弃
         if event_name == "response.output_item.added":
             yield from self._on_output_item_added(data or {})
@@ -276,6 +283,8 @@ class StreamTranslator:
         # 下游 chat 流应每个 message 一个 role chunk 来分段；
         # 否则所有 text 会被合并到同一个 message 里、丢段落。
         if item_type == "message":
+            if isinstance(item.get("id"), str) and isinstance(data.get("output_index"), int):
+                self.state.message_output_index_by_id[item["id"]] = data["output_index"]
             # 第二次及以后看到 message item.added，强制再发 role chunk 让下游开新段
             if self.state.role_sent:
                 # 重置标志让 _ensure_role_sent 再发一次 role chunk
@@ -353,6 +362,8 @@ class StreamTranslator:
             return
         if item_type != "message":
             return
+        if isinstance(item.get("id"), str) and isinstance(data.get("output_index"), int):
+            self.state.message_output_index_by_id[item["id"]] = data["output_index"]
         content = item.get("content")
         if not isinstance(content, list):
             return
@@ -583,6 +594,10 @@ class StreamTranslator:
             if not isinstance(item, dict):
                 continue
             item_type = item.get("type")
+            if item_type == "message":
+                output_index = self.state.message_output_index_by_id.get(str(item.get("id") or ""), snapshot_index)
+                yield from self._on_output_item_done({"output_index": output_index, "item": item})
+                continue
             if item_type not in ("function_call", "custom_tool_call"):
                 continue
             # Detailed events and the terminal output array may use
@@ -623,34 +638,18 @@ class StreamTranslator:
         incomplete = resp.get("incomplete_details") or {}
         reason = incomplete.get("reason") if isinstance(incomplete, dict) else None
         if protocol_errors.is_responses_max_output_incomplete(data, "response.incomplete"):
-            msg = protocol_errors.responses_max_output_context_error_message(reason)
-            self.state.terminal_status = "error"
-            self.state.terminal_error = {
-                "message": msg,
-                "detail": {
-                    "type": "invalid_request_error",
-                    "code": protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
-                    "param": None,
-                },
-            }
-            self.state.terminal_emitted = True
-            yield _mk_error_chunk(
-                self.state,
-                message=msg,
-                err_type="invalid_request_error",
-                code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
-                param=None,
-            )
-            yield _DONE
+            self.state.finish_reason = "length"
+            if not self.state.role_sent:
+                yield from self._ensure_role_sent()
         elif reason == "content_filter":
             self.state.finish_reason = "content_filter"
             if not self.state.role_sent:
                 yield from self._ensure_role_sent()
         else:
-            self.state.finish_reason = "stop"
+            # Chat has no generic incomplete state. Length is the conservative
+            # non-success terminal rather than claiming stop/tool completion.
+            self.state.finish_reason = "length"
             if not self.state.role_sent:
-                # A non-error incomplete terminal event may legitimately carry
-                # no content.  It still represents a normal Chat stream result.
                 yield from self._ensure_role_sent()
 
     def get_downstream_chat_assistant(self) -> dict:

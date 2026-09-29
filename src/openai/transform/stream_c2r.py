@@ -28,6 +28,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
+from ...protocols.sse import split_sse_events
+
 
 def _gen_id(prefix: str) -> str:
     return f"{prefix}{uuid.uuid4().hex[:24]}"
@@ -159,9 +161,8 @@ class StreamTranslator:
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         if not chunk:
             return
-        self._buf += chunk
-        while b"\n\n" in self._buf:
-            block_bytes, self._buf = self._buf.split(b"\n\n", 1)
+        self._buf, blocks = split_sse_events(self._buf + chunk)
+        for block_bytes in blocks:
             block = block_bytes.decode("utf-8", errors="replace")
             if not block.strip():
                 continue
@@ -197,14 +198,10 @@ class StreamTranslator:
     # --- 解析 ---
 
     def _handle_block(self, block: str) -> Iterator[bytes]:
-        # chat SSE 块只可能有一行 `data: {json}` 或 `data: [DONE]`
-        data_str: Optional[str] = None
-        for line in block.split("\n"):
-            line = line.strip()
-            if line.startswith("data:"):
-                data_str = line[5:].strip()
-        if data_str is None:
+        data_lines = [line[5:].lstrip(" ") for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.startswith("data:")]
+        if not data_lines:
             return
+        data_str = "\n".join(data_lines).strip()
         if data_str == "[DONE]":
             return  # 收尾由 close() 做
         try:
@@ -434,11 +431,7 @@ class StreamTranslator:
                 "part": _refusal_part(item.refusal_buf, item.refusal_logprobs),
             })
         # output_item.done
-        final_content: list[dict] = []
-        if item.content_part_opened:
-            final_content.append(_output_text_part(item.text_buf, item.text_logprobs))
-        if item.refusal_part_opened:
-            final_content.append(_refusal_part(item.refusal_buf, item.refusal_logprobs))
+        final_content = _message_content_parts(item)
         completed_item = {
             "type": "message", "id": item.item_id, "role": "assistant",
             "status": "completed", "content": final_content,
@@ -710,11 +703,9 @@ class StreamTranslator:
         )
         output_items = self._collect_output_items()
         output_text = "".join(
-            (it.get("content") or [])[0].get("text", "")
-            for it in output_items
-            if it.get("type") == "message"
-            and it.get("content")
-            and (it["content"][0].get("type") == "output_text")
+            part.get("text", "")
+            for it in output_items if it.get("type") == "message"
+            for part in (it.get("content") or []) if part.get("type") == "output_text"
         )
         response = {
             "id": self.state.resp_id,
@@ -777,11 +768,7 @@ class StreamTranslator:
         items: list[tuple[int, dict]] = list(self.state.closed_items)
         if self.state.message_item is not None:
             mi = self.state.message_item
-            final_content: list[dict] = []
-            if mi.content_part_opened:
-                final_content.append(_output_text_part(mi.text_buf, mi.text_logprobs))
-            if mi.refusal_part_opened:
-                final_content.append(_refusal_part(mi.refusal_buf, mi.refusal_logprobs))
+            final_content = _message_content_parts(mi)
             items.append((mi.output_index, {
                 "type": "message", "id": mi.item_id, "role": "assistant",
                 "status": "completed", "content": final_content,
@@ -920,6 +907,15 @@ def _chat_choice_logprobs_part(choice: dict[str, Any], key: str) -> list[dict[st
     if not isinstance(logprobs, dict):
         return []
     return _clean_logprobs(logprobs.get(key))
+
+
+def _message_content_parts(item: _MessageItem) -> list[dict[str, Any]]:
+    parts: list[tuple[int, dict[str, Any]]] = []
+    if item.content_part_opened:
+        parts.append((item.text_content_index, _output_text_part(item.text_buf, item.text_logprobs)))
+    if item.refusal_part_opened:
+        parts.append((item.refusal_content_index, _refusal_part(item.refusal_buf, item.refusal_logprobs)))
+    return [part for _, part in sorted(parts, key=lambda pair: pair[0])]
 
 
 def _output_text_part(text: str, logprobs: list[dict[str, Any]] | None = None) -> dict[str, Any]:

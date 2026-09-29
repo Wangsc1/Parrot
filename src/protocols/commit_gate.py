@@ -52,7 +52,7 @@ class SseCommitGate:
         for block in events:
             event_name, data = upstream.parse_sse_event_bytes(block)
             event_bytes = block + b"\n\n"
-            if upstream.is_stream_error_event(event_name, data):
+            if upstream.is_stream_error_event(event_name, data, preserve_incomplete=bool(getattr(self.stream_translator, "preserves_incomplete", False))):
                 if downstream_started:
                     # A single network chunk can contain multiple complete SSE
                     # events.  If an earlier event in this same feed already

@@ -231,6 +231,7 @@ class OpenAIApiChannel(Channel):
 
     def _apply_compatibility(
         self, payload: dict, resolved_model: str, *, requested_model: str | None = None,
+        anthropic_source: bool = False,
     ) -> None:
         """在已解析具体上游模型后按权威能力修改最终 OpenAI 字段。"""
         if self.omit_temperature:
@@ -253,6 +254,8 @@ class OpenAIApiChannel(Channel):
             efforts,
             protocol=self.protocol,
         )
+        if anthropic_source:
+            self._apply_anthropic_model_compat(payload, resolved_model, efforts=efforts)
 
     async def build_upstream_request(
         self, requested_body: dict, resolved_model: str,
@@ -291,6 +294,41 @@ class OpenAIApiChannel(Channel):
 
     # ─── 跨家族翻译 ────────────────────────────────────────────
 
+    def _apply_anthropic_model_compat(self, payload: dict, resolved_model: str, *, efforts=None) -> None:
+        """Adapt generated fields, without changing native OpenAI passthrough."""
+        name = str(resolved_model or "").lower()
+        is_o = name.startswith("o") and len(name) > 1 and name[1].isdigit()
+        is_gpt_reasoning = name.startswith("gpt-") and common.supports_reasoning_effort(name)
+        if not (is_o or is_gpt_reasoning):
+            if name.startswith(("gpt-4", "gpt-3.5")):
+                payload.pop("reasoning", None)
+                payload.pop("reasoning_effort", None)
+            return
+        reasoning = payload.get("reasoning") or {}
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+        effort = payload.get("reasoning_effort", effort)
+        # Only authoritative advertised levels justify adapting effort. Unknown
+        # metadata stays unknown; do not invent a per-model capability table.
+        order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        supported = [e for e in (efforts or []) if e in order]
+        if effort in order and supported and effort not in supported:
+            lower = [e for e in supported if order.index(e) <= order.index(effort)]
+            effort = max(lower, key=order.index) if lower else min(supported, key=order.index)
+            if "reasoning_effort" in payload:
+                payload["reasoning_effort"] = effort
+            elif isinstance(payload.get("reasoning"), dict):
+                payload["reasoning"] = {**payload["reasoning"], "effort": effort}
+        # GPT-5 initial releases/o-series reason by default. Later GPT models
+        # may support sampling with effort=none; don't strip it in that mode.
+        default_reasoning = is_o or name in ("gpt-5", "gpt-5-mini", "gpt-5-nano") or name.startswith("gpt-5-2025-")
+        if effort not in (None, "none") or (effort is None and default_reasoning):
+            for key in ("temperature", "top_p"):
+                payload.pop(key, None)
+        # Reasoning models have model-dependent stop support. The Anthropic
+        # response adapter enforces the caller's stop sequences locally.
+        payload.pop("stop", None)
+
+
     def _build_anthropic_to_chat(self, body: dict, resolved_model: str) -> UpstreamRequest:
         """anthropic ingress → openai-chat 上游（Phase 8 first path, non-stream）。"""
         payload = anthropic_to_chat.translate_request(body, target_model=resolved_model)
@@ -303,10 +341,12 @@ class OpenAIApiChannel(Channel):
             api_key_name=body.get("_parrot_api_key_name"),
             client_ip=body.get("_parrot_client_ip"),
         )
+        if isinstance(payload.get("stop"), list) and len(payload["stop"]) > 4:
+            payload.pop("stop")
         self._apply_bigmodel_anthropic_bridge_compat(body, payload, resolved_model)
         self._apply_deepseek_anthropic_bridge_compat(body, payload, resolved_model)
         self._apply_compatibility(
-            payload, resolved_model, requested_model=body.get("model"),
+            payload, resolved_model, requested_model=body.get("model"), anthropic_source=True,
         )
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
@@ -319,6 +359,7 @@ class OpenAIApiChannel(Channel):
                 "upstream_protocol": "openai-chat",
                 "response_translator": "anthropic_to_chat",
                 "model_for_response": resolved_model,
+                "request_body": body,
             },
         )
 
@@ -336,7 +377,7 @@ class OpenAIApiChannel(Channel):
         )
         self._apply_deepseek_anthropic_responses_compat(body, payload, resolved_model)
         self._apply_compatibility(
-            payload, resolved_model, requested_model=body.get("model"),
+            payload, resolved_model, requested_model=body.get("model"), anthropic_source=True,
         )
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),

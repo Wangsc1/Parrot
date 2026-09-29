@@ -71,7 +71,7 @@ class OAuthChannel(Channel):
             namespace_tool_map = responses_to_anthropic.NamespaceToolMap()
             requested_body = responses_to_anthropic.translate_request(
                 requested_body, api_key_name=api_key_name, store_enabled=_store.is_enabled(),
-                namespace_tool_map=namespace_tool_map,
+                namespace_tool_map=namespace_tool_map, target_model=resolved_model,
             )
             translator_ctx = {
                 "ingress": "responses",
@@ -124,7 +124,8 @@ class OAuthChannel(Channel):
             url=f"{cc_mimicry.ANTHROPIC_API_BASE}/v1/messages?beta=true",
             headers=headers,
             body=signed,
-            dynamic_tool_map=dynamic_map,
+            dynamic_tool_map=(cc_mimicry.ToolNameRestoreMap(dynamic_map)
+                              if payload.get("stream") else dynamic_map),
             translator_ctx=translator_ctx,
             dispatch_metadata=build_dispatch_metadata(payload, "anthropic", headers),
         )

@@ -46,7 +46,7 @@ def guard_request(body: dict, *, allow_file_url_documents: bool = False) -> None
     # tool_choice later and ignore the legacy hint. Unsupported or duplicate
     # request controls should not block the core message payload.
     # Response metadata / sampling hints with no Anthropic bridge field are
-    # ignored: response_format/logprobs/top_logprobs, modalities/audio output
+    # ignored: logprobs/top_logprobs, modalities/audio output
     # hints, penalties, seed, prediction, verbosity, logit_bias, store,
     # prompt-cache hints, unsupported service_tier values, etc.
     n = body.get("n")
@@ -279,16 +279,8 @@ def _parse_tool_args(
     tool_name: str | None = None,
     optional_empty_string_fields_by_tool: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return common.normalize_tool_input_optional_empty_strings(tool_name, raw, optional_empty_string_fields_by_tool)
-    if not isinstance(raw, str) or not raw:
-        return {}
-    try:
-        value = json.loads(raw)
-    except Exception:
-        _fail("assistant tool_call function.arguments must be valid JSON object for Chat→Anthropic bridge", param="messages")
-    if not isinstance(value, dict):
-        _fail("assistant tool_call function.arguments must decode to a JSON object for Chat→Anthropic bridge", param="messages")
+    from .tool_arguments import parse_tool_arguments
+    value = parse_tool_arguments(raw, tool_name=tool_name or "", request=True)
     return common.normalize_tool_input_optional_empty_strings(tool_name, value, optional_empty_string_fields_by_tool)
 
 
@@ -389,6 +381,13 @@ def _convert_messages(
             content = [{"type": "text", "text": ""}]
         append_turn(role, content)
 
+    # A compaction summary may precede tool outputs in the same merged user
+    # turn. Anthropic requires every tool_result before any text/media. Stable
+    # sorting preserves both groups' internal order and never crosses turns.
+    for message in out:
+        if message["role"] == "user":
+            message["content"].sort(key=lambda block: block.get("type") != "tool_result")
+
     if not out and system:
         out.append({"role": "user", "content": [{"type": "text", "text": ""}]})
     return out, system, id_map
@@ -409,6 +408,8 @@ def _convert_tools(tools: Any) -> list[dict[str, Any]]:
         }
         if fn.get("description") is not None:
             anth_tool["description"] = str(fn.get("description") or "")
+        if isinstance(fn.get("strict"), bool):
+            anth_tool["strict"] = fn["strict"]
         if isinstance(tool.get("defer_loading"), bool):
             anth_tool["defer_loading"] = tool["defer_loading"]
         out.append(anth_tool)
@@ -546,6 +547,17 @@ def translate_request(body: dict, *, allow_file_url_documents: bool = False) -> 
         stop = body.get("stop")
         payload["stop_sequences"] = stop if isinstance(stop, list) else [stop]
 
+    fmt = body.get("response_format")
+    if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
+        schema = fmt.get("json_schema")
+        if not isinstance(schema, dict) or not isinstance(schema.get("schema"), dict):
+            _fail("response_format.json_schema requires a schema object", param="response_format")
+        # Anthropic enforces the schema natively; OpenAI name/description/strict
+        # are envelope metadata, not fields accepted by output_config.format.
+        payload["output_config"] = {"format": {"type": "json_schema", "schema": schema["schema"]}}
+    elif isinstance(fmt, dict) and fmt.get("type") == "json_object":
+        payload["output_config"] = {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+
     _, service_tier = common.map_openai_service_tier_to_anthropic(body.get("service_tier"))
     if service_tier:
         payload["service_tier"] = service_tier
@@ -600,10 +612,10 @@ def translate_request(body: dict, *, allow_file_url_documents: bool = False) -> 
 
 
 def _stop_reason_to_finish_reason(stop_reason: str | None, *, has_tool_calls: bool = False) -> str:
+    if stop_reason in ("max_tokens", "model_context_window_exceeded"):
+        return "length"
     if stop_reason == "tool_use" or has_tool_calls:
         return "tool_calls"
-    if stop_reason == "max_tokens":
-        return "length"
     if stop_reason == "stop_sequence":
         return "stop"
     return "stop"

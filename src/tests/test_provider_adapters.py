@@ -123,7 +123,7 @@ def test_legacy_transform_filters_share_provider_allowlists():
         "thinking": {"type": "enabled"},
         "context_management": {"edits": []},
     })
-    assert bridge == {"model": "claude", "messages": []}
+    assert bridge == {"model": "claude", "messages": [], "thinking": {"type": "enabled"}}
 
 
 def test_cc_v258_bridge_filter_preserves_cc_fields_as_provider_capability():
@@ -161,7 +161,7 @@ def test_cc_v258_bridge_filter_preserves_cc_fields_as_provider_capability():
         protocol="anthropic",
         bridge=True,
     )
-    assert standard_filtered == {"model": "claude", "messages": [], "system": "ok"}
+    assert standard_filtered == {"model": "claude", "messages": [], "system": "ok", "thinking": {"type": "enabled"}}
 
 
 def test_anthropic_native_filter_keeps_official_fields_and_drops_foreign_hints():

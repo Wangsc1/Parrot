@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 from .client import CursorClient
 from .errors import CursorError
+from .openai_messages import terminal_tool_messages
 
 _ACCOUNT_HEADER = "X-Parrot-Cursor-Account"
 _SESSION_HEADER = "X-Parrot-Cursor-Session"
@@ -116,8 +117,8 @@ class CursorBridgeRuntime:
         messages = body.get("messages") if isinstance(body.get("messages"), list) else []
         tool_ids = [
             str(message.get("tool_call_id") or "")
-            for message in messages
-            if isinstance(message, dict) and message.get("role") == "tool" and message.get("tool_call_id")
+            for message in terminal_tool_messages(messages)
+            if message.get("tool_call_id")
         ]
         with self._lock:
             matches = {

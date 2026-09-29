@@ -459,6 +459,8 @@ _ANTHROPIC_SERVER_TOOL_TYPE_PREFIXES = (
     "bash_",
     "memory_",
     "advisor_",
+    "code_execution_",
+    "tool_search_",
 )
 
 
@@ -472,16 +474,13 @@ def _is_anthropic_server_tool(tool):
     Anthropic validates `tools[]` as a tagged union, so an unknown top-level
     `type` triggers: Input tag 'namespace' ... does not match any expected.
 
-    Keep known Anthropic server-tool variants intact; sanitize ordinary client
-    tools to Claude Code's outbound shape.
+    Keep Anthropic tagged variants intact, including future native types. Only
+    known foreign function/namespace wrappers are normalized as client tools.
     """
     if not isinstance(tool, dict):
         return False
     t = tool.get("type")
-    return isinstance(t, str) and (
-        t in {"web_search", "web_search_20250305"}
-        or any(t.startswith(prefix) for prefix in _ANTHROPIC_SERVER_TOOL_TYPE_PREFIXES)
-    )
+    return isinstance(t, str) and bool(t) and t not in {"function", "namespace"}
 
 
 def _normalize_anthropic_tool(tool, *, preserve_cache_control=False):
@@ -489,8 +488,8 @@ def _normalize_anthropic_tool(tool, *, preserve_cache_control=False):
 
     Mirrors Claude Code's toolToAPISchema choke point: standard custom tools are
     serialized with only name/description/input_schema plus approved optional
-    beta/cache fields. Unknown top-level `type` tags are stripped unless the
-    tool is a known Anthropic server-tool variant.
+    beta/cache fields. Native tagged tool variants retain their complete shape;
+    only known foreign wrapper tags are removed.
     """
     if not isinstance(tool, dict):
         return tool
@@ -682,10 +681,13 @@ def _restore_tool_names_in_obj(obj, dynamic_map=None):
     if not isinstance(obj, dict):
         return obj
 
-    out = {k: _restore_tool_names_in_obj(v, dynamic_map) for k, v in obj.items()}
-    if out.get("type") in ("tool_use", "server_tool_use") and "name" in out:
-        out["name"] = _restore_tool_name_value(out.get("name"), dynamic_map)
-    return out
+    if obj.get("type") in ("tool_use", "server_tool_use"):
+        # Tool input is user data, not another protocol tree.
+        out = dict(obj)
+        if "name" in out:
+            out["name"] = _restore_tool_name_value(out["name"], dynamic_map)
+        return out
+    return {k: _restore_tool_names_in_obj(v, dynamic_map) for k, v in obj.items()}
 
 
 def _restore_tool_names_in_name_fields_bytes(data, dynamic_map=None):
@@ -714,36 +716,54 @@ def _restore_tool_names_in_json_bytes(data, dynamic_map=None):
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def _restore_tool_names_in_sse_chunk(chunk_bytes, dynamic_map=None):
+def _restore_tool_names_in_sse_event(event, dynamic_map=None):
+    lines = re.split(rb"\r\n|\r|\n", event)
+    data_indices = [i for i, line in enumerate(lines) if line == b"data" or line.startswith(b"data:")]
+    if not data_indices:
+        return event
+    values = []
+    for i in data_indices:
+        value = lines[i][5:]
+        values.append(value[1:] if value.startswith(b" ") else value)
     try:
-        text = chunk_bytes.decode("utf-8")
-    except Exception:
-        return chunk_bytes
+        obj = json.loads(b"\n".join(values))
+    except (ValueError, UnicodeError):
+        # Never regex-rewrite invalid/incomplete JSON or ordinary text.
+        return event
+    restored = _restore_tool_names_in_obj(obj, dynamic_map)
+    if restored == obj:
+        return event
+    lines[data_indices[0]] = b"data: " + json.dumps(restored, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return b"\n".join(line for i, line in enumerate(lines) if i == data_indices[0] or i not in data_indices)
 
-    out = []
-    changed = False
-    for line in text.splitlines(keepends=True):
-        line_body = line.rstrip("\r\n")
-        newline = line[len(line_body):]
-        if not line_body.startswith("data:"):
-            out.append(line)
-            continue
-        data = line_body[5:].strip()
-        if not data or data == "[DONE]":
-            out.append(line)
-            continue
-        restored = _restore_tool_names_in_json_bytes(data.encode("utf-8"), dynamic_map)
-        if restored != data.encode("utf-8"):
-            changed = True
-            out.append("data: " + restored.decode("utf-8") + newline)
-        else:
-            out.append(line)
-    if not changed:
-        return chunk_bytes
-    return "".join(out).encode("utf-8")
+
+def _restore_tool_names_in_sse_chunk(chunk_bytes, dynamic_map=None):
+    from ..protocols.sse import split_sse_events
+    tail, events = split_sse_events(chunk_bytes)
+    return b"".join(_restore_tool_names_in_sse_event(event, dynamic_map) + b"\n\n" for event in events) + tail
+
+
+class ToolNameRestoreMap(dict):
+    """Per-UpstreamRequest mapping + SSE buffer, never shared by a Channel.
+
+    Buffer raw bytes to a complete event before JSON decoding/name restoration;
+    a TCP split (including inside UTF-8 or a data field) is not an event boundary.
+    Incomplete EOF stays incomplete for the transport's terminal/error handling.
+    """
+
+    def __init__(self, mapping=None):
+        super().__init__(mapping or {})
+        self._pending = b""
+
+    def feed(self, chunk):
+        from ..protocols.sse import split_sse_events
+        self._pending, events = split_sse_events(self._pending + chunk)
+        return b"".join(_restore_tool_names_in_sse_event(event, self) + b"\n\n" for event in events)
 
 
 def _restore_tool_names_in_chunk(chunk_bytes, dynamic_map=None):
+    if isinstance(dynamic_map, ToolNameRestoreMap):
+        return dynamic_map.feed(chunk_bytes)
     # SSE：只处理 data 行里的 JSON，不碰 event 行 / 正文里的普通文本。
     if b"data:" in chunk_bytes:
         return _restore_tool_names_in_sse_chunk(chunk_bytes, dynamic_map)
@@ -857,7 +877,7 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key", s
     dynamic_tool_map = None
     if body.get("tools"):
         raw_tools = body["tools"]
-        tool_names = [t.get("name") for t in raw_tools if isinstance(t, dict) and t.get("name")]
+        tool_names = [t.get("name") for t in raw_tools if isinstance(t, dict) and t.get("name") and not _is_anthropic_server_tool(t)]
         dynamic_tool_map = _build_dynamic_tool_map(tool_names)
         if dynamic_tool_map:
             print(f"  [tool] dynamic mapping {len(dynamic_tool_map)} tools")
@@ -872,7 +892,7 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key", s
             preserve_cache_control=explicit_cache_control,
         )
         for tool in tools:
-            if isinstance(tool, dict) and "name" in tool:
+            if isinstance(tool, dict) and "name" in tool and not _is_anthropic_server_tool(tool):
                 tool["name"] = _sanitize_tool_name(tool["name"], dynamic_tool_map)
         payload["tools"] = tools
 

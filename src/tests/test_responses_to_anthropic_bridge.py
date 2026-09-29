@@ -362,13 +362,14 @@ def test_translate_request_namespace_generated_name_avoids_real_direct_collision
     assert first["messages"][0]["content"][0]["name"] == mapped
 
 
-def test_translate_request_rejects_freeform_custom_tool_declaration():
-    with pytest.raises(GuardError, match="freeform custom tool declarations"):
-        responses_to_anthropic.translate_request({
-            "model": "resp-model",
-            "input": "run",
-            "tools": [{"type": "custom", "name": "shell", "format": {"type": "text"}}],
-        })
+def test_translate_request_wraps_text_custom_tool_declaration():
+    out = responses_to_anthropic.translate_request({
+        "model": "resp-model",
+        "input": "run",
+        "tools": [{"type": "custom", "name": "shell", "format": {"type": "text"}}],
+    })
+    assert out["tools"][0]["strict"] is True
+    assert out["tools"][0]["input_schema"]["required"] == ["__parrot_raw_input"]
 
 
 def test_translate_request_preserves_responses_image_input():
@@ -597,12 +598,12 @@ def test_translate_request_strips_responses_only_controls():
         "model": "m",
         "background": False,
         "reasoning": {"effort": "high"},
-        "text": {"format": {"type": "json_schema"}},
+        "text": {"format": {"type": "json_schema", "name": "Answer", "schema": {"type": "object"}}},
         "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
     })
 
     assert out["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
-    assert "thinking" not in out
+    assert out["output_config"] == {"format": {"type": "json_schema", "schema": {"type": "object"}}, "effort": "high"}
 
 
 def test_translate_request_uses_anthropic_output_whitelist_for_responses_controls():
@@ -615,7 +616,7 @@ def test_translate_request_uses_anthropic_output_whitelist_for_responses_control
         "top_p": 0.9,
         "background": False,
         "reasoning": {"effort": "high"},
-        "text": {"format": {"type": "json_schema"}},
+        "text": {"format": {"type": "json_schema", "name": "Answer", "schema": {"type": "object"}}},
         "prompt_cache_key": "cache-key",
         "prompt_cache_retention": "24h",
         "service_tier": "flex",
@@ -657,12 +658,16 @@ def test_translate_request_guards_responses_content_that_would_be_lost():
         responses_to_anthropic.translate_request({"model": "m", "input": [{"type": "item_reference", "id": "item_1"}]})
     with pytest.raises(GuardError):
         responses_to_anthropic.translate_request({"model": "m", "input": [{"type": "custom_tool_call", "call_id": "c1"}]})
-    with pytest.raises(GuardError):
-        responses_to_anthropic.translate_request({"model": "m", "input": [{"type": "custom_tool_call", "call_id": "c1", "name": "shell", "input": "raw text"}]})
+    raw_custom = responses_to_anthropic.translate_request({"model": "m", "input": [{"type": "custom_tool_call", "call_id": "c1", "name": "shell", "input": "raw text"}]})
+    assert raw_custom["messages"][0]["content"][0]["input"] == {"__parrot_raw_input": "raw text"}
     with pytest.raises(GuardError):
         responses_to_anthropic.translate_request({"model": "m", "conversation": "conv_1", "input": "hi"})
-    with pytest.raises(GuardError):
-        responses_to_anthropic.translate_request({"model": "m", "input": [{"type": "reasoning", "encrypted_content": "gAAAA"}, {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]})
+    opaque_history = responses_to_anthropic.translate_request({"model": "m", "input": [
+        {"type": "reasoning", "encrypted_content": "gAAAA"},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]})
+    assert opaque_history["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    assert "gAAAA" not in json.dumps(opaque_history)
     include_only = responses_to_anthropic.translate_request({
         "model": "m",
         "input": "hi",
@@ -796,11 +801,10 @@ def test_matrix_allows_safe_responses_to_anthropic_and_guards_unsafe_cases():
         features=extract_request_features("responses", {"input": "hi", "include": ["reasoning.encrypted_content"]}),
     ).required_transforms == ["responses_to_anthropic"]
 
-    with pytest.raises(ProtocolGuardError):
-        DEFAULT_MATRIX.plan(
-            "responses", "anthropic",
-            features=extract_request_features("responses", {"input": [{"type": "reasoning", "encrypted_content": "gAAAA"}]}),
-        )
+    encrypted_history = {"input": [{"type": "reasoning", "encrypted_content": "gAAAA"}]}
+    assert DEFAULT_MATRIX.plan(
+        "responses", "anthropic", features=extract_request_features("responses", encrypted_history),
+    ).required_transforms == ["responses_to_anthropic"]
 
     assistant_image = {"input": [{"type": "message", "role": "assistant", "content": [{"type": "input_image", "image_url": "https://example.com/a.png"}]}]}
     with pytest.raises(ProtocolGuardError):
@@ -820,9 +824,12 @@ def test_matrix_allows_safe_responses_to_anthropic_and_guards_unsafe_cases():
     with pytest.raises(ProtocolGuardError):
         DEFAULT_MATRIX.plan("responses", "openai-chat", features=extract_request_features("responses", tool_output_file_url))
 
-    custom = {"input": [{"type": "custom_tool_call", "call_id": "c1"}]}
-    with pytest.raises(ProtocolGuardError):
-        DEFAULT_MATRIX.plan("responses", "anthropic", features=extract_request_features("responses", custom))
+    custom = {"input": "run", "tools": [{"type": "custom", "name": "shell", "format": {"type": "text"}}]}
+    assert DEFAULT_MATRIX.plan(
+        "responses", "anthropic", features=extract_request_features("responses", custom),
+    ).required_transforms == ["responses_to_anthropic"]
+    with pytest.raises(GuardError):
+        responses_to_anthropic.translate_request({"model": "m", "input": [{"type": "custom_tool_call", "call_id": "c1"}]})
 
 
 def test_anthropic_api_channel_builds_responses_to_anthropic_request():
@@ -964,6 +971,8 @@ def test_namespace_stream_restores_only_schema_authorized_locations():
     chunks += list(tr.feed(
         b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
     ))
+    chunks += list(tr.feed(b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}\n\n'
+                           b'event: message_stop\ndata: {"type":"message_stop"}\n\n'))
     chunks += list(tr.close())
     events = _sse_objects(chunks)
     added = next(x for x in events if x["type"] == "response.output_item.added")["item"]
@@ -995,15 +1004,18 @@ def test_namespace_non_stream_store_receives_restored_outward_pair(monkeypatch):
     assert saved["output_items"][0]["namespace"] == "db"
 
 
-def test_namespace_custom_declaration_and_namespaced_selector_are_guarded():
-    with pytest.raises(GuardError, match="namespace freeform custom"):
-        responses_to_anthropic.translate_request({
-            "model": "m", "input": "go", "tools": [{
-                "type": "namespace", "name": "shells", "tools": [{
-                    "type": "custom", "name": "shell", "format": {"type": "text"},
-                }],
+def test_namespace_text_custom_declaration_wraps_input():
+    out = responses_to_anthropic.translate_request({
+        "model": "m", "input": "go", "tools": [{
+            "type": "namespace", "name": "shells", "tools": [{
+                "type": "custom", "name": "shell", "format": {"type": "text"},
             }],
-        })
+        }],
+        "tool_choice": {"type": "custom", "namespace": "shells", "name": "shell"},
+    })
+    assert out["tools"][0]["name"] == "shells__shell"
+    assert out["tools"][0]["strict"] is True
+    assert out["tool_choice"] == {"type": "tool", "name": "shells__shell"}
 
 
 def test_api_channel_namespace_context_drives_runtime_non_stream_restore():
@@ -1051,7 +1063,7 @@ def test_oauth_channel_carries_same_request_namespace_plan(monkeypatch):
     assert any(x.namespace == "db" and x.child_name == "lookup" for x in plan.by_flat_name.values())
 
 
-def test_namespaced_custom_json_history_is_reversible_but_declaration_remains_guarded():
+def test_namespaced_custom_json_history_is_reversible_without_current_declaration():
     plan = responses_to_anthropic.NamespaceToolMap()
     wire = responses_to_anthropic.translate_request({
         "model": "m", "input": [{

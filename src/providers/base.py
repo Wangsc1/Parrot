@@ -69,6 +69,10 @@ class ProviderAdapter:
         """
         return await ctx.channel.restore_response(chunk, dynamic_map=ctx.dynamic_map)
 
+    async def finish_response_bytes(self, ctx: ProviderAttemptContext) -> bytes:
+        """Flush provider-owned buffering at HTTP EOF; unchanged providers no-op."""
+        return b""
+
 
 class AnthropicStandardAdapter(ProviderAdapter):
     name = "anthropic-standard"
@@ -135,3 +139,9 @@ class AntigravityOAuthAdapter(ProviderAdapter):
         if isinstance(translator_ctx, dict):
             converter = translator_ctx.get("antigravity_stream")
         return antigravity_codec.restore_antigravity_bytes(chunk, converter=converter)
+
+    async def finish_response_bytes(self, ctx: ProviderAttemptContext) -> bytes:
+        converter = (ctx.translator_ctx or {}).get("antigravity_stream")
+        if converter is None or converter.closed:
+            return b""
+        return antigravity_codec.restore_antigravity_bytes(b"", converter=converter, flush=True)

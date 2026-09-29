@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
 from ...protocols.usage import legacy_usage_from_openai_chat_json
+from ...protocols.sse import split_sse_events
 
 
 def _gen_id(prefix: str) -> str:
@@ -26,13 +27,13 @@ def _emit(event: str, data: dict) -> bytes:
 
 
 def _parse_chat_block(block: str) -> Optional[dict]:
-    data_str: Optional[str] = None
-    for line in block.split("\n"):
-        line = line.strip()
+    data_lines: list[str] = []
+    for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if line.startswith("data:"):
-            data_str = line[5:].strip()
-    if data_str is None:
+            data_lines.append(line[5:].lstrip(" "))
+    if not data_lines:
         return None
+    data_str = "\n".join(data_lines).strip()
     if data_str == "[DONE]":
         return {"_done": True}
     try:
@@ -43,10 +44,12 @@ def _parse_chat_block(block: str) -> Optional[dict]:
 
 
 def _stop_reason(finish_reason: str | None, *, saw_tool: bool) -> str:
-    if saw_tool or finish_reason in ("tool_calls", "function_call"):
-        return "tool_use"
     if finish_reason == "length":
         return "max_tokens"
+    if finish_reason == "content_filter":
+        return "refusal"
+    if saw_tool or finish_reason in ("tool_calls", "function_call"):
+        return "tool_use"
     return "end_turn"
 
 
@@ -67,6 +70,7 @@ class _ToolState:
     id: str = ""
     name: str = ""
     args: str = ""
+    args_emitted: int = 0
     started: bool = False
     stopped: bool = False
 
@@ -86,7 +90,7 @@ class _State:
     usage: Optional[dict] = None
     done_seen: bool = False
     terminal_emitted: bool = False
-    text_parts: list[str] = field(default_factory=list)
+    text_blocks: dict[int, list[str]] = field(default_factory=dict)
 
     def alloc_index(self) -> int:
         idx = self.next_block_index
@@ -98,8 +102,9 @@ class StreamTranslator:
     """OpenAI Chat SSE → Anthropic SSE."""
 
     def __init__(self, *, model: str, created_ts: Optional[int] = None,
-                 model_override: Optional[str] = None):
+                 model_override: Optional[str] = None, request_body: dict | None = None):
         self._model_override = model_override
+        self._tool_names = [t.get("name") for t in (request_body or {}).get("tools", []) if isinstance(t, dict) and t.get("name")]
         self.state = _State(
             message_id=_gen_id("msg_"),
             model=model_override or model,
@@ -110,9 +115,8 @@ class StreamTranslator:
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         if not chunk:
             return
-        self._buf += chunk
-        while b"\n\n" in self._buf:
-            block_bytes, self._buf = self._buf.split(b"\n\n", 1)
+        self._buf, blocks = split_sse_events(self._buf + chunk)
+        for block_bytes in blocks:
             block = block_bytes.decode("utf-8", errors="replace")
             if not block.strip():
                 continue
@@ -124,11 +128,13 @@ class StreamTranslator:
     def close(self) -> Iterator[bytes]:
         if self.state.terminal_emitted:
             return
-        self.state.terminal_emitted = True
         if not self.state.message_started:
             yield from self._emit_message_start()
         yield from self._stop_text_if_needed()
         yield from self._stop_all_tools()
+        if self.state.terminal_emitted:
+            return
+        self.state.terminal_emitted = True
         yield _emit("message_delta", {
             "type": "message_delta",
             "delta": {
@@ -215,7 +221,8 @@ class StreamTranslator:
             yield from self._emit_message_start()
         if self.state.text_started and not self.state.text_stopped:
             return
-        self.state.text_index = self.state.alloc_index() if self.state.text_index < 0 else self.state.text_index
+        self.state.text_index = self.state.alloc_index()
+        self.state.text_blocks[self.state.text_index] = []
         self.state.text_started = True
         self.state.text_stopped = False
         yield _emit("content_block_start", {
@@ -226,7 +233,7 @@ class StreamTranslator:
 
     def _emit_text_delta(self, text: str) -> Iterator[bytes]:
         yield from self._ensure_text_block()
-        self.state.text_parts.append(text)
+        self.state.text_blocks[self.state.text_index].append(text)
         yield _emit("content_block_delta", {
             "type": "content_block_delta",
             "index": self.state.text_index,
@@ -245,14 +252,20 @@ class StreamTranslator:
             self.state.tools[chat_index] = st
         return st
 
-    def _start_tool_if_ready(self, st: _ToolState) -> Iterator[bytes]:
+    def _start_tool_if_ready(self, st: _ToolState, *, final: bool = False) -> Iterator[bytes]:
         if st.started:
+            return
+        if not final and (not st.name or not st.id):
+            return
+        if not st.name and len(self._tool_names) == 1:
+            st.name = self._tool_names[0]
+        if not st.name:
+            yield _emit("error", {"type": "error", "error": {"type": "api_error", "message": "Upstream tool call ended without a tool name"}})
+            self.state.terminal_emitted = True
             return
         if not self.state.message_started:
             yield from self._emit_message_start()
-        # Anthropic tool_use requires a name.  If the stream never supplies one,
-        # use a conservative placeholder rather than emitting an invalid block.
-        name = st.name or "tool"
+        name = st.name
         st.id = st.id or _gen_id("call_")
         yield from self._stop_text_if_needed()
         st.started = True
@@ -268,7 +281,7 @@ class StreamTranslator:
         except Exception:
             idx = 0
         st = self._tool_state(idx)
-        if isinstance(tc.get("id"), str) and tc.get("id"):
+        if isinstance(tc.get("id"), str) and tc.get("id") and not st.started:
             st.id = tc["id"]
         fn = tc.get("function") or {}
         if isinstance(fn, dict):
@@ -277,30 +290,36 @@ class StreamTranslator:
                 st.name = name
             args = fn.get("arguments")
             if isinstance(args, str) and args:
-                if not st.started:
-                    yield from self._start_tool_if_ready(st)
                 st.args += args
-                yield _emit("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": st.block_index,
-                    "delta": {"type": "input_json_delta", "partial_json": args},
-                })
-        if not st.started and (st.name or st.id):
-            yield from self._start_tool_if_ready(st)
+        yield from self._start_tool_if_ready(st)
+        yield from self._flush_tool_args(st)
+
+    def _flush_tool_args(self, st: _ToolState) -> Iterator[bytes]:
+        if st.started and len(st.args) > st.args_emitted:
+            pending = st.args[st.args_emitted:]
+            st.args_emitted = len(st.args)
+            yield _emit("content_block_delta", {
+                "type": "content_block_delta", "index": st.block_index,
+                "delta": {"type": "input_json_delta", "partial_json": pending},
+            })
 
     def _stop_all_tools(self) -> Iterator[bytes]:
         for idx in sorted(self.state.tools.keys()):
             st = self.state.tools[idx]
             if not st.started:
-                yield from self._start_tool_if_ready(st)
+                yield from self._start_tool_if_ready(st, final=True)
+            if self.state.terminal_emitted:
+                return
+            yield from self._flush_tool_args(st)
             if st.started and not st.stopped:
                 st.stopped = True
                 yield _emit("content_block_stop", {"type": "content_block_stop", "index": st.block_index})
 
     def get_downstream_anthropic_assistant(self) -> dict:
-        blocks: list[dict[str, Any]] = []
-        if self.state.text_parts:
-            blocks.append({"type": "text", "text": "".join(self.state.text_parts)})
+        indexed: list[tuple[int, dict[str, Any]]] = [
+            (idx, {"type": "text", "text": "".join(parts)})
+            for idx, parts in self.state.text_blocks.items() if parts
+        ]
         for idx in sorted(self.state.tools.keys()):
             st = self.state.tools[idx]
             if st.started:
@@ -310,5 +329,5 @@ class StreamTranslator:
                     parsed = {"_raw": st.args}
                 if not isinstance(parsed, dict):
                     parsed = {"_value": parsed}
-                blocks.append({"type": "tool_use", "id": st.id, "name": st.name or "tool", "input": parsed})
-        return {"role": "assistant", "content": blocks}
+                indexed.append((st.block_index, {"type": "tool_use", "id": st.id, "name": st.name or "tool", "input": parsed}))
+        return {"role": "assistant", "content": [block for _, block in sorted(indexed, key=lambda pair: pair[0])]}

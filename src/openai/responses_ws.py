@@ -18,7 +18,9 @@ as much as possible while keeping the actual transport as a transparent WS relay
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import re
 import os
 import random
 import time
@@ -132,8 +134,8 @@ _WsProxyBytes = WsProxyBytes
 
 
 def _native_identity_carriers(obj: dict, websocket: WebSocket) -> dict[str, dict]:
-    """Retain only already-supported native lookup carriers, never turn-state."""
-    return {
+    """Retain native lookup carriers, with isolated logical sessions per lane."""
+    carriers = {
         "client_metadata": dict(obj.get("client_metadata") or {})
         if isinstance(obj.get("client_metadata"), dict) else {},
         "headers": {
@@ -144,6 +146,12 @@ def _native_identity_carriers(obj: dict, websocket: WebSocket) -> dict[str, dict
             }
         },
     }
+    if isinstance(websocket, _ResponsesWsLane) and websocket.stream_id is not None:
+        # OAuth serializes turns by logical thread. Named lanes must not share
+        # that lock/window just because the physical socket has one session-id.
+        # This internal lookup anchor is hashed; it is never projected raw.
+        carriers["client_metadata"]["session_id"] = websocket.identity_anchor
+    return carriers
 
 
 @dataclass
@@ -378,10 +386,8 @@ class _WsTracker:
         self.stream_error_message: Optional[str] = None
         self.stream_error_code: Optional[str] = None
         self.response_text_parts: list[str] = []
-        self._items: dict[int, dict] = {}
-        self._fc_args: dict[int, str] = {}
-        self._msg_text: dict[tuple[int, int], str] = {}
         self._frames: list[str] = []
+        self._output_builder = upstream.ResponsesSSEAssistantBuilder()
 
     def feed_text(self, text: str) -> None:
         if not text:
@@ -398,6 +404,7 @@ class _WsTracker:
             self.response_signals, model_reroute.extract_response_signals(evt),
         )
         typ = str(evt.get("type") or "")
+        self._output_builder.feed((f"event: {typ}\ndata: " + json.dumps(evt, ensure_ascii=False) + "\n\n").encode("utf-8"))
         response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
         usage_present = "usage" in evt or (
             isinstance(response_obj, dict) and "usage" in response_obj
@@ -437,24 +444,12 @@ class _WsTracker:
                 self.stream_error_code, request_message = request_failure
                 self.stream_error_message = request_message
         elif typ == "response.incomplete":
-            if (
-                self.normalize_max_output_incomplete
-                and protocol_errors.is_responses_max_output_incomplete(evt)
-            ):
-                self.response_failed = True
-                self.stream_error_code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
-                self.stream_error_message = protocol_errors.responses_max_output_context_error_message(
-                    protocol_errors.responses_incomplete_reason(evt)
-                )
-            elif not self.normalize_max_output_incomplete:
-                # Native Codex OAuth WS exposes every incomplete terminal event
-                # verbatim, but internally settles it as an unsuccessful,
-                # health-neutral request and never writes affinity/LastResponse.
-                self.response_incomplete = True
-                reason = protocol_errors.responses_incomplete_reason(evt)
-                self.stream_error_message = f"response incomplete: {reason or 'unknown reason'}"
-            else:
-                self.response_completed = True
+            # Output budget exhaustion and filtering are real incomplete results,
+            # not success and not an input context-length failure. Keep the old
+            # constructor keyword for callers, but never rewrite this evidence.
+            self.response_incomplete = True
+            reason = protocol_errors.responses_incomplete_reason(evt)
+            self.stream_error_message = f"response incomplete: {reason or 'unknown reason'}"
         elif typ == "response.completed":
             self.response_completed = True
 
@@ -462,54 +457,16 @@ class _WsTracker:
             resp = response_obj
             if isinstance(resp, dict) and isinstance(resp.get("id"), str):
                 self.response_id = resp.get("id")
-            if isinstance(resp, dict) and isinstance(resp.get("output"), list):
-                for idx, item in enumerate(resp.get("output") or []):
-                    if isinstance(item, dict):
-                        self._items[idx] = dict(item)
 
-        if typ == "response.output_item.added":
-            idx = _safe_int(evt.get("output_index"), 0)
-            item = evt.get("item")
-            if isinstance(item, dict):
-                self._items[idx] = dict(item)
-        elif typ == "response.output_item.done":
-            idx = _safe_int(evt.get("output_index"), 0)
-            item = evt.get("item")
-            if isinstance(item, dict):
-                self._items[idx] = dict(item)
-        elif typ == "response.output_text.delta":
-            idx = _safe_int(evt.get("output_index"), 0)
-            cidx = _safe_int(evt.get("content_index"), 0)
+        if typ == "response.output_text.delta":
             delta = evt.get("delta")
             if isinstance(delta, str) and delta:
-                self._msg_text[(idx, cidx)] = self._msg_text.get((idx, cidx), "") + delta
                 self.response_text_parts.append(delta)
-        elif typ == "response.function_call_arguments.delta":
-            idx = _safe_int(evt.get("output_index"), 0)
-            delta = evt.get("delta")
-            if isinstance(delta, str) and delta:
-                self._fc_args[idx] = self._fc_args.get(idx, "") + delta
 
     def get_output_items(self) -> list[dict]:
-        out: list[dict] = []
-        for idx in sorted(self._items.keys()):
-            item = dict(self._items[idx])
-            if item.get("type") == "message":
-                content = list(item.get("content") or [])
-                merged = {ci: text for (oi, ci), text in self._msg_text.items() if oi == idx}
-                for ci in sorted(merged.keys()):
-                    if ci < len(content) and isinstance(content[ci], dict):
-                        if not content[ci].get("text"):
-                            content[ci]["text"] = merged[ci]
-                    else:
-                        content.append({"type": "output_text", "text": merged[ci], "annotations": []})
-                item["content"] = content
-            elif item.get("type") == "function_call":
-                args = self._fc_args.get(idx)
-                if args and not item.get("arguments"):
-                    item["arguments"] = args
-            out.append(item)
-        return out
+        # Share identity deduplication and stable stream ordering with HTTP/SSE.
+        # Terminal snapshots supplement values, never reorder displayed items.
+        return self._output_builder.get_output_items()
 
     def get_full_response(self) -> str:
         return model_pricing.preserve_billing_evidence_tail(
@@ -522,8 +479,312 @@ class _WsTracker:
         )
 
 
+class _ResponsesWsLane:
+    """One ordered downstream lane, isolated from other upstream sessions.
+
+    The existing session runner remains the owner of routing, accounting,
+    transport cleanup and native continuation. Creates and controls have separate
+    queues so an active-turn reader can never consume the next queued create.
+    """
+
+    def __init__(self, connection, stream_id):
+        self.connection = connection
+        self.stream_id = stream_id
+        self.identity_anchor = str(uuid.uuid4())
+        self.headers = connection.websocket.headers
+        self.client = connection.websocket.client
+        self.scope = getattr(connection.websocket, "scope", {})
+        self.application_state = WebSocketState.CONNECTED
+        self.creates = asyncio.Queue()
+        self.controls = asyncio.Queue()
+        self.ready = asyncio.Event()
+        self.task = None
+        self.session_task = None
+        self.epoch = 0
+        self.owns_slot = False
+        self.terminal_sent = False
+        self.cancel_requested = False
+        self.tracker = _WsTracker()
+        self.history = None
+        self.parent_id = None
+        self.parent_owner = None
+        self.latest_response_id = None
+        self.active_response_id = None
+
+    async def accept(self):
+        self.application_state = WebSocketState.CONNECTED
+
+    def release_slot(self):
+        if self.owns_slot:
+            self.owns_slot = False
+            self.connection.slots.release()
+        self.active_response_id = None
+
+    async def receive_create(self):
+        self.release_slot()
+        frame = await self.creates.get()
+        if self.creates.empty():
+            self.ready.clear()
+        await self.connection.slots.acquire()
+        self.owns_slot = True
+        self.terminal_sent = False
+        self.tracker = _WsTracker()
+        frame = copy.deepcopy(frame)
+        # stream_id is consumed by this transport. Each upstream connection has
+        # only one implicit lane; older WS servers need no multiplexing support.
+        frame.pop("stream_id", None)
+        previous_id = frame.get("previous_response_id")
+        parent = self.connection.history.get(previous_id) if isinstance(previous_id, str) else None
+        self.parent_id = previous_id if isinstance(previous_id, str) else None
+        self.parent_owner = parent[0] if parent is not None else None
+        current = frame.get("input", [])
+        if isinstance(current, str):
+            current = [{"role": "user", "content": current}]
+        self.history = None
+        if parent is not None and isinstance(current, list):
+            owner, epoch, items = parent
+            self.history = copy.deepcopy(items) + copy.deepcopy(current)
+            if owner is not self or epoch != self.epoch:
+                # Cross-lane fork or an HTTP/reconnected session cannot reuse
+                # connection-local upstream state. Replay the *complete* input;
+                # request-level instructions are intentionally not inherited.
+                frame["input"] = copy.deepcopy(self.history)
+                frame.pop("previous_response_id", None)
+        elif not frame.get("previous_response_id"):
+            self.history = copy.deepcopy(current) if isinstance(current, list) else None
+        return {"type": "websocket.receive", "text": _dump_frame(frame)}
+
+    async def receive(self):
+        return await self.controls.get()
+
+    async def send_text(self, text):
+        obj = _loads_frame(text)
+        if isinstance(obj, dict):
+            obj = dict(obj)
+            obj.pop("stream_id", None)
+            if self.stream_id is not None:
+                obj["stream_id"] = self.stream_id
+            self.tracker.feed_text(_dump_frame(obj))
+            response = obj.get("response")
+            if isinstance(response, dict) and isinstance(response.get("id"), str):
+                self.active_response_id = response["id"]
+            typ = obj.get("type")
+            if typ in {"response.completed", "response.incomplete", "response.failed", "error"}:
+                self.terminal_sent = True
+            if typ in {"response.failed", "error"} and self.parent_owner is self:
+                # Failed same-lane continuation invalidates its local parent;
+                # a failed fork must leave the source lane's cache untouched.
+                self.connection.history.pop(self.parent_id, None)
+                if self.latest_response_id == self.parent_id:
+                    self.latest_response_id = None
+            if typ in {"response.completed", "response.incomplete"}:
+                rid = self.tracker.response_id
+                if rid and self.history is not None:
+                    if self.latest_response_id:
+                        self.connection.history.pop(self.latest_response_id, None)
+                    self.latest_response_id = rid
+                    self.connection.history[rid] = (
+                        self, self.epoch,
+                        self.history + self.tracker.get_output_items(),
+                    )
+            text = _dump_frame(obj)
+        async with self.connection.send_lock:
+            await self.connection.websocket.send_text(text)
+        self.connection.activity.set()
+
+    async def send_bytes(self, data):
+        await self.send_text(data.decode("utf-8"))
+
+    async def close(self, code=1000, reason=""):
+        if self.stream_id is None and set(self.connection.lanes) == {None}:
+            # Preserve legacy single-lane close codes (including HTTP bridges).
+            await self.connection.websocket.close(code=code, reason=reason)
+            self.application_state = WebSocketState.DISCONNECTED
+            self.controls.put_nowait({"type": "websocket.disconnect", "code": code})
+            self.connection.activity.set()
+            return
+        # A lane failure must not close other lanes. Surface pre-terminal close
+        # failures as request-scoped errors rather than silently losing a turn.
+        if code != 1000 and not self.terminal_sent:
+            await _send_request_invalid_error_frame(
+                self, reason or "websocket lane closed", code="websocket_lane_closed",
+                status=code - 4000 if 4400 <= code <= 4599 else 502,
+            )
+        self.application_state = WebSocketState.DISCONNECTED
+        self.controls.put_nowait({"type": "websocket.disconnect", "code": code})
+
+    async def run(self):
+        try:
+            while not self.connection.closed:
+                await self.ready.wait()
+                self.epoch += 1
+                self.application_state = WebSocketState.CONNECTED
+                self.controls = asyncio.Queue()
+                self.cancel_requested = False
+                self.session_task = asyncio.create_task(_handle_responses_ws_lane(self))
+                try:
+                    await self.session_task
+                    if self.cancel_requested and not self.terminal_sent and not self.connection.closed:
+                        await _send_request_invalid_error_frame(
+                            self, "Response cancelled by client.", code="response_cancelled",
+                        )
+                except asyncio.CancelledError:
+                    if not self.cancel_requested or self.connection.closed:
+                        raise
+                    await _send_request_invalid_error_frame(
+                        self, "Response cancelled by client.", code="response_cancelled",
+                    )
+                except Exception:
+                    traceback.print_exc()
+                    await _send_terminal_error_frame(self, "Internal websocket lane error.", 500)
+                finally:
+                    self.release_slot()
+                    self.session_task = None
+                    self.connection.activity.set()
+        finally:
+            self.release_slot()
+
+
+class _ResponsesWsConnection:
+    """Single reader, bounded active responses, per-lane FIFO and local cache."""
+
+    def __init__(self, websocket, *, auth_context=None):
+        self.websocket = websocket
+        self.auth_context = auth_context
+        self.lanes = {}
+        self.history = {}
+        self.slots = asyncio.Semaphore(16)
+        self.send_lock = asyncio.Lock()
+        self.activity = asyncio.Event()
+        self.closed = False
+
+    async def dispatch(self, raw):
+        try:
+            frame = _loads_frame(raw)
+        except Exception:
+            frame = None
+        if not isinstance(frame, dict):
+            if not self.lanes:
+                await _close_downstream(self.websocket, 4400, "first websocket frame must be a JSON object")
+            else:
+                await _send_request_invalid_error_frame(
+                    _ResponsesWsLane(self, None), "websocket frame must be a JSON object",
+                )
+            return
+        if not self.lanes and frame.get("type") != "response.create" and "stream_id" not in frame:
+            await _close_downstream(self.websocket, 4400, "first websocket frame must be response.create")
+            return
+        sid = frame.get("stream_id")
+        if "stream_id" in frame and (
+            not isinstance(sid, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", sid) is None
+        ):
+            await _send_request_invalid_error_frame(
+                _ResponsesWsLane(self, None), "Invalid stream_id: expected 1–256 letters, numbers, '_', '-' or '.'.",
+                code="invalid_stream_id", param="stream_id",
+            )
+            return
+        if frame.get("type") == "response.create":
+            if sid not in self.lanes:
+                if sid is not None and sum(key is not None for key in self.lanes) >= 32:
+                    target = _ResponsesWsLane(self, sid)
+                    await _send_request_invalid_error_frame(
+                        target, "This connection has reached 32 named streams; reuse a stream_id.",
+                        code="websocket_stream_limit_reached", param="stream_id",
+                    )
+                    return
+                lane = self.lanes[sid] = _ResponsesWsLane(self, sid)
+                lane.task = asyncio.create_task(lane.run())
+            lane = self.lanes[sid]
+            lane.creates.put_nowait(frame)
+            lane.ready.set()
+            return
+        rid = frame.get("response_id")
+        lane = self.lanes.get(sid)
+        if "stream_id" not in frame and rid:
+            matches = [value for value in self.lanes.values() if value.active_response_id == rid]
+            lane = matches[0] if len(matches) == 1 else None
+        if lane is None or (rid and lane.active_response_id != rid):
+            await _send_request_invalid_error_frame(
+                _ResponsesWsLane(self, sid), "No matching active response for this control frame.",
+                param="response_id" if rid else "stream_id",
+            )
+            return
+        if frame.get("type") == "response.cancel":
+            if lane.owns_slot and not lane.terminal_sent and lane.session_task is not None:
+                lane.cancel_requested = True
+                lane.session_task.cancel()
+            else:
+                await _send_request_invalid_error_frame(lane, "No response is in progress.", param="type")
+            return
+        frame.pop("stream_id", None)
+        lane.controls.put_nowait({"type": "websocket.receive", "text": _dump_frame(frame)})
+
+    async def run(self):
+        # Reads are connection-owned, never concurrent across lane workers.
+        # Re-arm at a turn boundary to apply the between-turn idle timeout.
+        reader = None
+        try:
+            while True:
+                if self.websocket.application_state == WebSocketState.DISCONNECTED:
+                    return
+                if reader is None:
+                    reader = asyncio.create_task(self.websocket.receive())
+                self.activity.clear()
+                activity = asyncio.create_task(self.activity.wait())
+                timeout = 30.0 if not self.lanes else float((config.get().get("timeouts") or {}).get("total", 600))
+                try:
+                    done, _ = await asyncio.wait(
+                        {reader, activity}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    activity.cancel()
+                    await asyncio.gather(activity, return_exceptions=True)
+                if not done:
+                    await _close_downstream(
+                        self.websocket, 1000 if self.lanes else 4400,
+                        "websocket session idle timeout" if self.lanes else "timeout waiting for first websocket frame",
+                    )
+                    return
+                # The receive may complete while the activity waiter is being
+                # joined. Never discard that frame when re-arming at a terminal.
+                if reader in done or reader.done():
+                    msg = reader.result()
+                    reader = None
+                    if msg.get("type") == "websocket.disconnect":
+                        return
+                    raw = msg.get("text") if msg.get("text") is not None else msg.get("bytes")
+                    if raw is not None:
+                        await self.dispatch(raw)
+                elif all(not lane.owns_slot or lane.terminal_sent for lane in self.lanes.values()):
+                    reader.cancel()
+                    await asyncio.gather(reader, return_exceptions=True)
+                    reader = None
+        except WebSocketDisconnect:
+            pass
+        finally:
+            self.closed = True
+            if reader is not None:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+            tasks = [lane.task for lane in self.lanes.values()]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.history.clear()
+
+
 async def handle_responses_ws(websocket: WebSocket) -> None:
-    """FastAPI WebSocket handler for /v1/responses."""
+    """Authenticate once, then multiplex named and implicit default lanes."""
+    _key, _models, err = auth.validate(websocket.headers)
+    if err:
+        await websocket.close(code=4401, reason=_trim_reason(err))
+        return
+    await websocket.accept()
+    await _ResponsesWsConnection(websocket, auth_context=(_key, _models, None)).run()
+
+
+async def _handle_responses_ws_lane(websocket: WebSocket) -> None:
+    """Run the existing routing/transport session for one isolated lane."""
 
     start_time = time.time()
     start_monotonic = time.monotonic()
@@ -531,7 +792,11 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     accepted = False
     client_ip = _websocket_client_ip(websocket)
 
-    key_name, allowed_models, err = auth.validate(websocket.headers)
+    key_name, allowed_models, err = (
+        websocket.connection.auth_context
+        if isinstance(websocket, _ResponsesWsLane) and websocket.connection.auth_context is not None
+        else auth.validate(websocket.headers)
+    )
     if err:
         await websocket.close(code=4401, reason=_trim_reason(err))
         return
@@ -543,7 +808,10 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     accepted = True
 
     try:
-        first_message = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+        first_message = (
+            await websocket.receive_create() if isinstance(websocket, _ResponsesWsLane)
+            else await asyncio.wait_for(websocket.receive(), timeout=30.0)
+        )
     except asyncio.TimeoutError:
         await websocket.close(code=4400, reason="timeout waiting for first websocket frame")
         return
@@ -1569,8 +1837,7 @@ async def _try_ws_channel(
                     getattr(getattr(upstream_ws, "response", None), "headers", None),
                     ch,
                 )
-                if (isinstance(ch, OpenAIOAuthChannel)
-                        and relay_result.error_code in WS_RESET_CODES
+                if (relay_result.error_code in WS_RESET_CODES
                         and not relay_result.dispatch_committed
                         and not relay_result.closed_after_accept):
                     full = None
@@ -2649,9 +2916,7 @@ async def _try_sse_channel(
     identity_snapshot = (upstream_req.translator_ctx or {}).get("codex_identity_snapshot")
     identity_map = (ProtocolIdentityMap.from_request(body, identity_snapshot)
                     if identity_snapshot is not None else ProtocolIdentityMap())
-    tracker = _WsTracker(normalize_max_output_incomplete=not (
-        keep_downstream_open and isinstance(ch, OpenAIOAuthChannel)
-    ))
+    tracker = _WsTracker()
     pending: list[str] = []
     committed = False
     dispatch_committed = False
@@ -2938,7 +3203,8 @@ async def _try_sse_channel(
 
                 if tracker.response_incomplete:
                     result.outcome = "response_incomplete"
-                    result.http_status = 400
+                    # The HTTP exchange succeeded; generation is incomplete.
+                    result.http_status = status
                     result.error_detail = "response incomplete: " + str(protocol_errors.responses_incomplete_reason(data) or "unknown reason")
                     if opened.timing is not None:
                         opened.timing.mark_io_complete()
@@ -3066,9 +3332,11 @@ async def _receive_next_response_create(
 
     while True:
         try:
-            msg = await asyncio.wait_for(
-                websocket.receive(),
-                timeout=max(0.001, float(session_idle_timeout)),
+            msg = (
+                await websocket.receive_create() if isinstance(websocket, _ResponsesWsLane)
+                else await asyncio.wait_for(
+                    websocket.receive(), timeout=max(0.001, float(session_idle_timeout)),
+                )
             )
         except asyncio.TimeoutError:
             await _close_downstream(
@@ -3194,12 +3462,7 @@ async def _relay_ws_session(
     allow_failover_before_visible: bool = True,
     identity_session: dict[str, Any] | None = None,
 ) -> _WsAttemptResult:
-    tracker = _WsTracker(
-        # Preserve the global HTTP/SSE and ordinary WS compatibility behavior.
-        # Only native Codex OAuth Responses WS transparently relays max-output
-        # incomplete without synthesizing context_length_exceeded.
-        normalize_max_output_incomplete=not isinstance(ch, OpenAIOAuthChannel),
-    )
+    tracker = _WsTracker()
     result = _WsAttemptResult(
         connected=True,
         outcome="connected",
@@ -3257,6 +3520,9 @@ async def _relay_ws_session(
 
     def sync_tracker_result() -> _WsAttemptResult:
         """Hydrate attempt facts before any immutable settlement can run."""
+        if tracker.response_incomplete:
+            # The WS upgrade/transport succeeded; only generation is incomplete.
+            result.http_status = 101
         result.response_completed = tracker.response_completed
         result.usage = dict(tracker.usage)
         result.usage_observed = tracker.usage_observed
@@ -3487,9 +3753,9 @@ async def _relay_ws_session(
             except Exception:
                 obj = None
             if isinstance(obj, dict) and obj.get("type") == "response.create":
-                # Responses WS is sequential, not multiplexed. Reject this
-                # frame while preserving the active response; a new create is
-                # accepted after its terminal event and gets a fresh ledger row.
+                # The connection mux queues creates outside this private
+                # single-lane relay. Defensive guard for direct internal callers:
+                # never mix a second turn into this tracker/upstream response.
                 detail = "a response is already in progress on this websocket"
                 await await_ws_owned(_send_request_invalid_error_frame(
                     websocket, detail, param="type",
@@ -4260,6 +4526,7 @@ async def _send_request_invalid_error_frame(
                 "type": "invalid_request_error",
                 "code": code,
                 "message": message,
+                **({"param": param} if param is not None else {}),
             },
             # Compatibility fields for older Parrot/OpenAI-compatible clients.
             "code": code,

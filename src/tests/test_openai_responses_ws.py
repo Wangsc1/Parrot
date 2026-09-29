@@ -2350,7 +2350,9 @@ async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch,
     )
 
     assert resp.status_code == 200
-    assert json.loads(resp.body)["output"][1]["content"][0]["text"] == "ok"
+    output = json.loads(resp.body)["output"]
+    assert [item["type"] for item in output] == ["message", "compaction"]
+    assert output[0]["content"][0]["text"] == "ok"
     for value in (body, json.loads(resp.body)):
         ref = m["responses_ws"].compaction_owner.complete_refs(value)[0]
         assert m["state_db"].compaction_owner_load(ref.compaction_id, ref.content_digest)
@@ -2876,7 +2878,7 @@ async def test_http_responses_oauth_ws_consumes_codex_rate_limits_event(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_responses_ws_pre_visible_context_error_preserves_explicit_zero_usage(
+async def test_responses_ws_pre_visible_incomplete_preserves_explicit_zero_usage(
     monkeypatch, m,
 ):
     cfg = _setup(m)
@@ -2905,26 +2907,19 @@ async def test_responses_ws_pre_visible_context_error_preserves_explicit_zero_us
 
     row = _last_request_log(m)
     assert row["status"] == "error"
-    assert row["http_status"] == 400
-    error_frame = next(
-        json.loads(text) for text in ws.sent_texts
-        if json.loads(text).get("type") == "error"
-    )
-    assert error_frame["status"] == 400
-    assert error_frame["error"] == {
-        "type": "invalid_request_error",
-        "code": "context_length_exceeded",
-        "message": error_frame["message"],
-    }
-    assert parse_wrapped_responses_ws_error(
-        json.dumps(error_frame)
-    )["status"] == 400
-    assert ws.close_calls[-1][0] == 4400
+    assert row["http_status"] == 101
+    events = [json.loads(text) for text in ws.sent_texts]
+    assert [event["type"] for event in events] == ["response.created", "response.incomplete"]
+    assert events[-1]["response"]["status"] == "incomplete"
+    assert events[-1]["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert events[-1]["response"]["usage"] == {"input_tokens": 0, "output_tokens": 0}
+    assert not ws.close_calls
     detail = m["log_db"].log_detail(row["request_id"])
     assert "response.incomplete" in (detail["detail"].get("response_body") or "")
+    assert "context_length_exceeded" not in (detail["detail"].get("response_body") or "")
     attempts = _attempt_usage(m, row["request_id"])
     assert len(attempts) == 1
-    assert attempts[0]["outcome"] == "request_invalid"
+    assert attempts[0]["outcome"] == "response_incomplete"
     assert attempts[0]["usage_observed"] == 1
     assert attempts[0]["input_tokens"] == attempts[0]["output_tokens"] == 0
 
@@ -3039,7 +3034,7 @@ async def test_responses_ws_large_terminal_frame_keeps_billing_evidence(
 
 
 @pytest.mark.asyncio
-async def test_responses_ws_rejects_overlapping_create_without_stopping_active_turn(
+async def test_responses_ws_queues_overlapping_create_without_stopping_active_turn(
     monkeypatch, m,
 ):
     _setup(m)
@@ -3048,7 +3043,15 @@ async def test_responses_ws_rejects_overlapping_create_without_stopping_active_t
         "type": "response.create", "model": "test-model",
         "input": "second", "stream": True,
     }
-    ws = FakeWebSocket(
+    class QueuedWebSocket(FakeWebSocket):
+        async def send_text(self, text):
+            await super().send_text(text)
+            event = json.loads(text)
+            if event.get("type") == "response.completed" and event["response"]["id"] == "turn-1":
+                # Keep the connection open for the already queued second turn.
+                self._terminal_seen = False
+
+    ws = QueuedWebSocket(
         {
             "type": "response.create", "model": "test-model",
             "input": "first", "stream": True,
@@ -3063,12 +3066,15 @@ async def test_responses_ws_rejects_overlapping_create_without_stopping_active_t
             self.sent: list[str] = []
             self.response = SimpleNamespace(headers={})
             self._recv_count = 0
+            self.completed_turns = 0
 
         async def send(self, data, text=None):
             del text
             if isinstance(data, bytes):
                 data = data.decode("utf-8")
+            assert len(self.sent) == self.completed_turns  # no same-lane overlap
             self.sent.append(data)
+            self._recv_count = 0
 
         async def recv(self):
             if self._recv_count == 0:
@@ -3080,10 +3086,11 @@ async def test_responses_ws_rejects_overlapping_create_without_stopping_active_t
                     "delta": "partial",
                 })
             await asyncio.sleep(0.01)
+            self.completed_turns += 1
             return json.dumps({
                 "type": "response.completed",
                 "response": {
-                    "id": "first-completes", "output": [],
+                    "id": f"turn-{self.completed_turns}", "output": [],
                     "usage": {"input_tokens": 1, "output_tokens": 1},
                 },
             })
@@ -3099,19 +3106,19 @@ async def test_responses_ws_rejects_overlapping_create_without_stopping_active_t
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
 
-    assert len(fake_upstream.sent) == 1
-    assert json.loads(fake_upstream.sent[0])["input"] == "first"
-    assert any(
-        json.loads(text).get("code") == "invalid_request_error"
-        for text in ws.sent_texts
-    )
+    assert [json.loads(frame)["input"] for frame in fake_upstream.sent] == ["first", "second"]
+    events = [json.loads(text) for text in ws.sent_texts]
+    assert not any(event["type"] == "error" for event in events)
+    assert [event["response"]["id"] for event in events if event["type"] == "response.completed"] == ["turn-1", "turn-2"]
     assert not ws.close_calls
-    row = _last_request_log(m)
-    assert row["status"] == "success"
-    assert len(_retry_chain(m, row["request_id"])) == 1
-    attempts = _attempt_usage(m, row["request_id"])
-    assert len(attempts) == 1
-    assert attempts[0]["outcome"] == "success"
+    rows = m["log_db"]._get_conn().execute("SELECT * FROM request_log ORDER BY id DESC LIMIT 2").fetchall()
+    assert len(rows) == 2 and rows[0]["request_id"] != rows[1]["request_id"]
+    for row in rows:
+        assert row["status"] == "success"
+        assert len(_retry_chain(m, row["request_id"])) == 1
+        attempts = _attempt_usage(m, row["request_id"])
+        assert len(attempts) == 1
+        assert attempts[0]["outcome"] == "success"
 
 
 @pytest.mark.asyncio
@@ -3334,7 +3341,7 @@ async def test_native_oauth_responses_ws_relays_incomplete_but_settles_as_failur
     assert all("context_length_exceeded" not in text for text in ws.sent_texts)
     row = _last_request_log(m)
     assert row["status"] == "error"
-    assert row["http_status"] == 400
+    assert row["http_status"] == 101
     assert row["usage_observed"] == 1
     attempts = _attempt_usage(m, row["request_id"])
     assert len(attempts) == 1
@@ -4183,7 +4190,7 @@ async def test_http_responses_oauth_ws_cancellation_preserves_partial_usage_and_
 
 
 @pytest.mark.asyncio
-async def test_http_responses_oauth_ws_pre_visible_context_error_keeps_zero_usage(
+async def test_http_responses_oauth_ws_pre_visible_incomplete_keeps_zero_usage(
     monkeypatch, m,
 ):
     cfg = _setup(m)
@@ -4214,9 +4221,14 @@ async def test_http_responses_oauth_ws_pre_visible_context_error_keeps_zero_usag
         m, ch, {"model": "test-model", "stream": False, "input": "hello"},
     )
 
-    assert resp.status_code == 400
+    assert resp.status_code == 200
+    payload = json.loads(resp.body)
+    assert payload["status"] == "incomplete"
+    assert payload["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert payload["usage"] == {"input_tokens": 0, "output_tokens": 0}
+    assert "error" not in payload
     detail = m["log_db"].log_detail(rid)
-    assert detail["log"]["status"] == "error"
+    assert detail["log"]["status"] == "success"  # HTTP transport completed, not generation.
     assert "response.incomplete" in (detail["detail"].get("response_body") or "")
     attempts = _attempt_usage(m, rid)
     assert len(attempts) == 1
