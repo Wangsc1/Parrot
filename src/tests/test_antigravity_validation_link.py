@@ -94,7 +94,7 @@ def test_extract_prefers_metadata_url_and_ignores_other_errors():
     assert extract_validation_url(_body("P1")) == BASE.format(plt="P1")
     assert extract_validation_url('HTTP 403: {"error": {"code": 403, "message": "forbidden"}}') is None
     assert extract_validation_url(None) is None
-    # Truncated / non-JSON body still yields the sign-in link by regex.
+    # A truncated JSON tail still permits extraction of a closed URL string.
     truncated = _body("P2")[:900]
     assert "VALIDATION_REQUIRED" in truncated
     assert extract_validation_url(truncated) == BASE.format(plt="P2")
@@ -305,3 +305,126 @@ def test_stdin_invocation_reads_only_synthetic_logs(tmp_path):
     assert result.returncode == 0, result.stderr
     rows = json.loads(result.stdout)
     assert len(rows) == 1 and rows[0]["email"] == EMAIL and "plt=NEW" in rows[0]["url"]
+
+
+@pytest.mark.parametrize("escape_json", [False, True])
+def test_extract_accepts_closed_url_but_rejects_truncated_url(escape_json):
+    url = BASE.format(plt="TOKEN%2BVALUE")
+    encoded = json.dumps(url)
+    if escape_json:
+        encoded = encoded.replace("/", r"\/").replace("&", r"\u0026")
+    prefix = '{"error":{"reason":"VALIDATION_REQUIRED","validation_url":'
+    # Truncate inside the token, at the URL's last character, and after the
+    # closing quote: only the last has evidence that the URL is complete.
+    token_cut = encoded.index("TOKEN") + 3
+    assert extract_validation_url(prefix + encoded[:token_cut]) is None
+    assert extract_validation_url(prefix + encoded[:-1]) is None
+    assert extract_validation_url(prefix + encoded) == url
+
+
+def test_extract_rejects_url_cut_by_actual_4000_character_log_limit():
+    text = _body("T" * 5000)
+    truncated = text[:4000]
+    assert "VALIDATION_REQUIRED" in truncated and truncated.endswith("T")
+    assert extract_validation_url(truncated) is None
+
+
+@pytest.mark.parametrize("wrapper", ['"{}"', "'{}'", "{}\n"])
+def test_extract_plain_text_requires_observed_url_end(wrapper):
+    url = BASE.format(plt="PLAIN")
+    assert extract_validation_url("VALIDATION_REQUIRED " + wrapper.format(url)) == url
+    assert extract_validation_url("VALIDATION_REQUIRED " + url) is None
+
+
+@pytest.mark.parametrize("metadata_url", ["", "   ", None, 123, [], "https://support.google.com/help"])
+def test_extract_skips_bad_metadata_and_finds_help_link(metadata_url):
+    url = BASE.format(plt="HELP")
+    details = [{"reason": "VALIDATION_REQUIRED", "metadata": {"validation_url": metadata_url},
+                "links": [None, 1, {"url": None}, {"url": url}]}]
+    assert extract_validation_url(json.dumps({"error": {"details": details}})) == url
+
+
+@pytest.mark.parametrize("links", [42, True, "invalid", {"url": "invalid"}])
+def test_extract_skips_non_array_links_and_checks_later_details(links):
+    details = [{"reason": "VALIDATION_REQUIRED", "metadata": [], "links": links}]
+    assert extract_validation_url(json.dumps({"error": {"details": details}})) is None
+    url = BASE.format(plt="LATER")
+    details += [None, {"metadata": {"validation_url": url}}]
+    assert extract_validation_url(json.dumps({"error": {"details": details}})) == url
+
+
+@pytest.mark.parametrize("query,fragment,expected_query", [
+    ("continue=https://example.com/done?authuser=inner&plt=%2b+%2F", "#authuser=fragment",
+     "continue=https://example.com/done?authuser=inner&plt=%2b+%2F&{auth}"),
+    ("continue=https%3A%2F%2Fexample.com%2F%3Fauthuser%3Dinner%26x%3D1&authuser=0", "#anchor?authuser=fragment",
+     "continue=https%3A%2F%2Fexample.com%2F%3Fauthuser%3Dinner%26x%3D1&{auth}"),
+    ("authuser=0&plt=P&authuser&x=%2b&auth%75ser=1", "#end", "{auth}&plt=P&x=%2b"),
+    ("plt=P", "#", "plt=P&{auth}"),
+    ("", "#part?authuser=inner", "{auth}"),
+])
+def test_authuser_changes_only_top_level_query(query, fragment, expected_query):
+    base = "https://accounts.google.com/signin/continue"
+    url = base + ("?" + query if query else "") + fragment
+    expected = base + "?" + expected_query.format(auth="authuser=user.a%2Bx%40example.com") + fragment
+    assert with_authuser(url, EMAIL) == expected
+    assert with_authuser(expected, EMAIL) == expected
+
+
+@pytest.mark.parametrize("reverse_dbs", [False, True])
+def test_repeated_url_uses_newest_occurrence_across_sources_and_months(tmp_path, capsys, reverse_dbs):
+    older = tmp_path / "2026-08.db"
+    newer = tmp_path / "2026-09.db"
+    second_project = f"oauth:antigravity:{EMAIL}:project-second"
+    _make_db(older, [(100.0, KEY, 403, _body("REUSED"))],
+             [(KEY, 100.0, "http_auth_error", _body("REUSED"))])
+    _make_db(newer,
+             [(400.0, second_project, 403, _body("REUSED")),
+              (200.0, KEY, 403, _body("OTHER-URL"))],
+             [(KEY, 300.0, "http_auth_error", _body("REUSED")),
+              (KEY, 250.0, "success", None)])
+    paths = [str(older), str(newer)]
+    hits, last_ok = collect(paths[::-1] if reverse_dbs else paths)
+    assert [(hit.at, hit.url) for hit in hits] == [
+        (400.0, BASE.format(plt="REUSED")), (200.0, BASE.format(plt="OTHER-URL"))]
+    assert hits[0].channel_key == second_project and hits[0].source == "request_log"
+    assert last_ok == {EMAIL: 250.0}
+    assert main(["--log-dir", str(tmp_path), "--json", "--months", "0"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert len(rows) == 1 and "plt=REUSED" in rows[0]["url"]
+    assert rows[0]["succeededAfter"] is False
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("has_older_url", [False, True])
+def test_truncated_records_warn_without_claiming_complete_latest_link(tmp_path, capsys, json_output, has_older_url):
+    rows = [(200.0, KEY, 403, _body("T" * 5000)[:4000])]
+    if has_older_url:
+        rows.append((100.0, KEY, 403, _body("OLD-COMPLETE")))
+    _make_db(tmp_path / "2026-09.db", rows, [])
+    args = ["--log-dir", str(tmp_path)] + (["--json"] if json_output else [])
+    assert main(args) == (0 if has_older_url else 1)
+    output = capsys.readouterr()
+    assert "缺少完整有效链接" in output.err and EMAIL in output.err
+    assert "不保证对应最新一次验证要求" in output.err
+    assert "发 1 次请求" not in output.out
+    assert "TTTT" not in output.out
+    if json_output:
+        result = json.loads(output.out)
+        assert len(result) == (1 if has_older_url else 0)
+    elif not has_older_url:
+        assert "有 VALIDATION_REQUIRED 记录" in output.out
+        assert "没有可完整提取的验证链接" in output.out
+
+
+def test_negative_months_rejected_before_database_access(tmp_path, monkeypatch, capsys):
+    with pytest.raises(ValueError, match="非负整数"):
+        monthly_dbs(str(tmp_path), -1)
+
+    def unexpected_scan(*_args):
+        pytest.fail("negative --months must not scan any database")
+
+    monkeypatch.setitem(main.__globals__, "monthly_dbs", unexpected_scan)
+    with pytest.raises(SystemExit) as exc:
+        main(["--log-dir", str(tmp_path), "--months", "-1"])
+    assert exc.value.code == 2
+    assert "非负整数" in capsys.readouterr().err

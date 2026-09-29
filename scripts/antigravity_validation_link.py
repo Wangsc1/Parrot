@@ -32,12 +32,12 @@ import re
 import sqlite3
 import sys
 from typing import Any, Iterable
-from urllib.parse import quote
+from urllib.parse import quote, unquote_plus, urlsplit
 
 CHANNEL_PREFIX = "oauth:antigravity:"
 _MONTH_DB = re.compile(r"^\d{4}-\d{2}\.db$")
 _SIGNIN_URL = re.compile(r"https://accounts\.google\.com/signin/continue[^\s\"'\\<>]+")
-_AUTHUSER = re.compile(r"([?&])authuser(?:=[^&#]*)?(?=[&#]|$)")
+_JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
 @dataclass(frozen=True)
@@ -66,8 +66,19 @@ def _decode_error_json(text: str) -> Any:
     return value
 
 
+def _is_validation_url(value: Any) -> bool:
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return (parsed.scheme == "https" and parsed.netloc == "accounts.google.com"
+            and parsed.path == "/signin/continue" and bool(parsed.query))
+
+
 def extract_validation_url(error_text: str | None) -> str | None:
-    """Return ``validation_url`` from a stored VALIDATION_REQUIRED error body."""
+    """Extract a complete URL, never guess the missing tail of a truncated value."""
     text = str(error_text or "")
     if "VALIDATION_REQUIRED" not in text.upper():
         return None
@@ -78,13 +89,32 @@ def extract_validation_url(error_text: str | None) -> str | None:
         if not isinstance(detail, dict):
             continue
         metadata = detail.get("metadata")
-        if isinstance(metadata, dict) and isinstance(metadata.get("validation_url"), str):
-            return metadata["validation_url"]
-        for link in detail.get("links") or []:
-            if isinstance(link, dict) and _SIGNIN_URL.match(str(link.get("url") or "")):
-                return str(link["url"])
-    match = _SIGNIN_URL.search(text)
-    return match.group(0) if match else None
+        candidate = metadata.get("validation_url") if isinstance(metadata, dict) else None
+        if _is_validation_url(candidate):
+            return candidate
+        links = detail.get("links")
+        for link in links if isinstance(links, list) else []:
+            candidate = link.get("url") if isinstance(link, dict) else None
+            if _is_validation_url(candidate):
+                return candidate
+    # A log may truncate the JSON after a complete URL string. Decode only
+    # closed strings, including JSON escapes; an unfinished URL is not usable.
+    for match in _JSON_STRING.finditer(text):
+        try:
+            candidate = json.loads(match.group(0))
+        except ValueError:
+            continue
+        if _is_validation_url(candidate):
+            return candidate
+    # Non-JSON text needs an observed terminator too. EOF alone cannot tell a
+    # complete URL from a token cut in half by the log's character limit.
+    for match in _SIGNIN_URL.finditer(text):
+        before = text[match.start() - 1:match.start()] if match.start() else ""
+        after = text[match.end():match.end() + 1]
+        bounded = (after == before if before in {"'", '"'} else bool(after and after.isspace()))
+        if bounded and _is_validation_url(match.group(0)):
+            return match.group(0)
+    return None
 
 
 def with_authuser(url: str, email: str) -> str:
@@ -92,9 +122,23 @@ def with_authuser(url: str, email: str) -> str:
     if not email:
         return url
     value = "authuser=" + quote(email, safe="")
-    if _AUTHUSER.search(url):
-        return _AUTHUSER.sub(lambda m: m.group(1) + value, url, count=1)
-    return url + ("&" if "?" in url else "?") + value
+    before_fragment, fragment_sep, fragment = url.partition("#")
+    base, _, query = before_fragment.partition("?")
+    fields = query.split("&") if query else []
+    updated = []
+    found = False
+    for field in fields:
+        if unquote_plus(field.partition("=")[0]) == "authuser":
+            if not found:
+                updated.append(value)
+                found = True
+        else:
+            updated.append(field)
+    if not found:
+        updated.append(value)
+    # Split raw delimiters instead of re-encoding query values: signed tokens,
+    # nested continue URLs and fragments must remain byte-identical.
+    return base + "?" + "&".join(updated) + fragment_sep + fragment
 
 
 def _connect_ro(path: str) -> sqlite3.Connection:
@@ -114,12 +158,15 @@ def _rows(conn: sqlite3.Connection, sql: str, params: Iterable[Any] = ()) -> lis
 
 
 def monthly_dbs(log_dir: str, months: int) -> list[str]:
+    if months < 0:
+        raise ValueError("--months 必须为非负整数（0 = 全部）")
     names = sorted(n for n in os.listdir(log_dir) if _MONTH_DB.match(n)) if os.path.isdir(log_dir) else []
     picked = names[-months:] if months > 0 else names
     return [os.path.join(log_dir, n) for n in picked]
 
 
-def collect(db_paths: list[str], email: str | None = None) -> tuple[list[ValidationHit], dict[str, float]]:
+def collect(db_paths: list[str], email: str | None = None, *,
+            unusable_accounts: set[str] | None = None) -> tuple[list[ValidationHit], dict[str, float]]:
     """Return VALIDATION_REQUIRED hits (newest first) and last success per email."""
     prefix = CHANNEL_PREFIX + (email + ":" if email else "")
     like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
@@ -137,11 +184,18 @@ def collect(db_paths: list[str], email: str | None = None) -> tuple[list[Validat
                 for key, at, text in _rows(conn, sql, (like,)):
                     url = extract_validation_url(text)
                     addr = email_from_channel_key(key)
-                    if not url or not addr or at is None:
+                    if not url:
+                        if addr and unusable_accounts is not None:
+                            unusable_accounts.add(addr)
+                        continue
+                    if not addr or at is None:
                         continue
                     hit = ValidationHit(addr, key, float(at), url, source)
-                    # The same failure is usually in both tables; keep one per URL.
-                    hits.setdefault((addr, url), hit)
+                    # A URL can appear in both tables and recur later. Keep its
+                    # newest occurrence, independent of DB/source/row order.
+                    previous = hits.get((addr, url))
+                    if previous is None or hit.at > previous.at:
+                        hits[(addr, url)] = hit
             ok_sql = ("SELECT channel_key, MAX(started_at) FROM retry_chain "
                       "WHERE channel_key LIKE ? ESCAPE '\\' AND outcome = 'success' GROUP BY channel_key")
             for key, at in _rows(conn, ok_sql, (like,)):
@@ -198,18 +252,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all", action="store_true", help="列出全部记录，而不是每个账号只给最新一条")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
     args = parser.parse_args(argv)
+    if args.months < 0:
+        parser.error("--months 必须为非负整数（0 = 全部）")
 
     log_dir = args.log_dir or os.path.join(args.data_dir or default_data_dir(), "logs")
     email = (args.email or "").strip() or None
+    unusable_accounts: set[str] = set()
     try:
         dbs = monthly_dbs(log_dir, args.months)
         if not dbs:
             print(f"没有找到日志库：{log_dir}/YYYY-MM.db（用 --data-dir 或 --log-dir 指定）", file=sys.stderr)
             return 2
-        hits, last_ok = collect(dbs, email)
+        hits, last_ok = collect(dbs, email, unusable_accounts=unusable_accounts)
     except (OSError, sqlite3.Error) as exc:
         print(f"读取日志失败（{log_dir}）：{exc}。请检查日志库及访问权限；这不表示没有验证记录。", file=sys.stderr)
         return 2
+    if unusable_accounts:
+        print("警告：以下账号的部分验证记录缺少完整有效链接（可能已截断）："
+              + ", ".join(sorted(unusable_accounts))
+              + "。仅展示可完整提取的链接，不保证对应最新一次验证要求；请核对记录时间。", file=sys.stderr)
     shown = hits if args.all else latest_per_account(hits)
     now = datetime.now(timezone.utc).timestamp()
 
@@ -228,8 +289,11 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
         return 0 if rows else 1
     if not rows:
-        print("最近的日志里没有 VALIDATION_REQUIRED 记录。" + (f"（账号 {email}）" if email else ""))
-        print("账号刚被要求验证但还没有请求落到它上面时，日志里不会有链接；给它发 1 次请求后再运行。")
+        if unusable_accounts:
+            print("日志中有 VALIDATION_REQUIRED 记录，但没有可完整提取的验证链接；请获取完整错误记录。")
+        else:
+            print("最近的日志里没有 VALIDATION_REQUIRED 记录。" + (f"（账号 {email}）" if email else ""))
+            print("账号刚被要求验证但还没有请求落到它上面时，日志里不会有链接；给它发 1 次请求后再运行。")
         return 1
     for row, hit in zip(rows, shown):
         print(f"账号: {row['email']}")
