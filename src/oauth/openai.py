@@ -963,8 +963,10 @@ def normalize_wham_usage(payload: dict) -> dict:
                 payload.get("rate_limit_reached_type") if isinstance(payload, dict) else None
             ),
             "credits": {
-                "has_credits": bool(credits.get("has_credits")),
-                "unlimited": bool(credits.get("unlimited")),
+                "has_credits": credits.get("has_credits")
+                if isinstance(credits.get("has_credits"), bool) else None,
+                "unlimited": credits.get("unlimited")
+                if isinstance(credits.get("unlimited"), bool) else None,
                 "balance": credits.get("balance"),
             },
             "rate_limits": rate_limits,

@@ -288,7 +288,8 @@ def test_tg_detail_renders_credits_and_named_limits(m, monkeypatch, source, mode
     assert sent
     text = sent["text"]
     credit_line = next(line for line in text.splitlines() if "Credits:" in line)
-    assert "不限量" in credit_line and "余额 9.5" in credit_line and "$" not in credit_line
+    # Unlimited is the primary display state; do not mix it with a finite balance.
+    assert "不限量" in credit_line and "余额" not in credit_line and "$" not in credit_line
     quota_line = next(line for line in text.splitlines() if "Reserve &lt;&amp;&gt;" in line)
     assert "1h" in quota_line and "重置:" in quota_line
     assert ("剩余 80%" if mode == "remaining" else "已用 20%") in quota_line

@@ -1330,6 +1330,44 @@ def forget_openai_probe(account_key_or_email: str) -> None:
         _OPENAI_PROBE_LAST.pop(key, None)
 
 
+def _record_openai_usage_failure(account_key: str, expected_state_key: str,
+                                 started_at: int) -> None:
+    try:
+        state_db.quota_record_openai_usage_failure(
+            account_key, started_at=started_at, expected_state_key=expected_state_key,
+        )
+    except Exception as exc:
+        # Display metadata must not replace the original refresh error.
+        print(f"[oauth] failed to record credits freshness: {type(exc).__name__}")
+
+
+async def _fetch_openai_usage(account_key: str, *, access_token: str | None = None) -> dict:
+    expected_state_key = account_state_key(get_account(account_key) or {})
+    started_at = state_db.now_ms()
+    try:
+        if access_token is None:
+            access_token = await ensure_valid_token(account_key)
+        acc = get_account(account_key) or {}
+        kwargs = _compatible_kwargs(
+            openai_provider.fetch_wham_usage,
+            account_id=_openai_workspace_id(acc) or None, account_key=account_key,
+        )
+        usage = await openai_provider.fetch_wham_usage(access_token, **kwargs)
+        codex = usage.get("openai") if isinstance(usage, dict) else None
+        credits = codex.get("credits") if isinstance(codex, dict) else None
+        if isinstance(credits, dict):
+            observed_at = state_db.now_ms()
+            usage = {**usage, "openai": {
+                **codex, "credits_observed_at": {
+                    key: observed_at for key, value in credits.items() if value is not None
+                },
+            }}
+        return usage
+    except Exception:
+        _record_openai_usage_failure(account_key, expected_state_key, started_at)
+        raise
+
+
 async def fetch_usage(account_key: str) -> dict:
     """统一 usage 拉取门面。按 provider 分派到具体实现：
 
@@ -1347,6 +1385,10 @@ async def fetch_usage(account_key: str) -> dict:
 
     if provider == "claude":
         return await _fetch_claude_usage(account_key)
+    if provider == "openai":
+        # WHAM carries credits alongside quota windows for login/manual/automatic
+        # refreshes; no extra inference or credits request is needed.
+        return await _fetch_openai_usage(account_key)
     access_token = await ensure_valid_token(account_key)
 
     if provider == "zhipu":
@@ -1376,13 +1418,7 @@ async def fetch_usage(account_key: str) -> dict:
     # 注意：这里只通过 ensure_valid_token 在 token 临期/过期时刷新；菜单里的
     # “刷新用量”不应无条件 force_refresh，否则 access_token 仍可调用时也可能
     # 因 refresh_token 被上游轮换/吊销而误报 401。
-    acc = get_account(account_key) or {}
-    account_id = _openai_workspace_id(acc) or None
-    kwargs = _compatible_kwargs(
-        openai_provider.fetch_wham_usage,
-        account_id=account_id, account_key=account_key,
-    )
-    return await openai_provider.fetch_wham_usage(access_token, **kwargs)
+    return await _fetch_openai_usage(account_key, access_token=access_token)
 
 
 async def fetch_openai_rate_limit_reset_credits(account_key: str) -> dict:
@@ -1524,11 +1560,18 @@ async def fetch_usage_snapshot(account_key: str, *,
     overwrite those rows with a summary-only ``/usage`` payload.
     """
     account_key = _resolve_existing_account_key_or_raise(account_key)
+    expected_state_key = account_state_key(get_account(account_key) or {})
+    started_at = state_db.now_ms()
     usage_coro = fetch_usage(account_key)
-    usage = (
-        await asyncio.wait_for(usage_coro, timeout=usage_timeout_s)
-        if usage_timeout_s is not None else await usage_coro
-    )
+    try:
+        usage = (
+            await asyncio.wait_for(usage_coro, timeout=usage_timeout_s)
+            if usage_timeout_s is not None else await usage_coro
+        )
+    except asyncio.TimeoutError:
+        if provider_of(account_key) == "openai":
+            _record_openai_usage_failure(account_key, expected_state_key, started_at)
+        raise
     usage = preserve_antigravity_cached_summary(account_key, usage)
     if provider_of(account_key) != "openai":
         return usage
@@ -2054,11 +2097,21 @@ def usage_from_quota_row(row: dict) -> dict:
     if not isinstance(credit_times, dict):
         credit_times = {}
     codex_credits = {key: value for key, value in active_credits.items() if value is not None}
+    active_credit_times = raw_openai.get("credits_observed_at")
+    if not isinstance(active_credit_times, dict):
+        active_credit_times = {}
+    credits_observed_at = {
+        key: active_credit_times.get(key, active_ms) for key in codex_credits
+    }
+    credits_sources = {key: "wham_usage" for key in codex_credits}
     for key, value in passive_credits.items():
         if value is not None and (
-            key not in codex_credits or credit_times.get(key, passive_ms) >= active_ms
+            key not in codex_credits
+            or credit_times.get(key, passive_ms) >= credits_observed_at[key]
         ):
             codex_credits[key] = value
+            credits_observed_at[key] = credit_times.get(key, passive_ms)
+            credits_sources[key] = "response"
     passive_reached = row.get("codex_rate_limit_reached_type")
     active_reached = raw_openai.get("rate_limit_reached_type")
     reached_ms = row.get("codex_rate_limit_reached_at")
@@ -2080,6 +2133,8 @@ def usage_from_quota_row(row: dict) -> dict:
                 if item.get("limit_id") not in (None, "", "codex")
             ],
             "credits": codex_credits,
+            "credits_observed_at": credits_observed_at,
+            "credits_sources": credits_sources,
             "rate_limit_reached_type": reached,
         },
         "seven_day_sonnet": _block(row.get("sonnet_util"), row.get("sonnet_reset")),

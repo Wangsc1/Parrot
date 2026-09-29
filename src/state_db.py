@@ -306,7 +306,7 @@ def provider_usage_save_error(account_id:str,adapter_id:str,error:str,retry_afte
     _mut("api_provider_usage_cache",op)
 def provider_usage_delete(account_id:str)->None:_mut("api_provider_usage_cache",lambda d:d.pop(account_id,None))
 
-_QUOTA_COLUMNS = ("account_key","email","fetched_at","last_passive_update_at","five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data","codex_primary_used_pct","codex_primary_reset_sec","codex_primary_reset_at","codex_primary_window_min","codex_secondary_used_pct","codex_secondary_reset_sec","codex_secondary_reset_at","codex_secondary_window_min","codex_primary_over_secondary_pct","codex_window_observations","codex_rate_limits","codex_credits_has_credits","codex_credits_unlimited","codex_credits_balance","codex_rate_limit_reached_type","codex_active_observed_at","codex_credits_observed_at","codex_rate_limit_reached_at")
+_QUOTA_COLUMNS = ("account_key","email","fetched_at","last_passive_update_at","five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data","codex_primary_used_pct","codex_primary_reset_sec","codex_primary_reset_at","codex_primary_window_min","codex_secondary_used_pct","codex_secondary_reset_sec","codex_secondary_reset_at","codex_secondary_window_min","codex_primary_over_secondary_pct","codex_window_observations","codex_rate_limits","codex_credits_has_credits","codex_credits_unlimited","codex_credits_balance","codex_rate_limit_reached_type","codex_active_observed_at","codex_credits_observed_at","codex_rate_limit_reached_at","codex_usage_failed_at")
 def _quota_defaults(row:dict[str,Any])->dict[str,Any]:return {column:row.get(column) for column in _QUOTA_COLUMNS}
 
 def _quota_display_email(account_key:str)->str:
@@ -357,8 +357,26 @@ def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected
         row.update(updates)
         if target.startswith("openai:") or row.get("codex_window_observations"):
             row["codex_active_observed_at"]=row["fetched_at"]
+        if target.startswith("openai:"):
+            row["codex_usage_failed_at"]=None
         d[target]=row
     _quota_write(account_key,op,expected_state_key=expected_state_key)
+
+
+def quota_record_openai_usage_failure(account_key:str, *, started_at:int,
+                                      expected_state_key:str)->None:
+    """Mark a failed usage read without replacing its last successful snapshot."""
+    def op(d,target):
+        row=d.get(target)
+        if not row or not target.startswith("openai:"):
+            return
+        # An older failed request cannot make a newer successful read stale.
+        if int(row.get("codex_active_observed_at") or 0)>started_at:
+            return
+        row["codex_usage_failed_at"]=max(int(row.get("codex_usage_failed_at") or 0),started_at)
+    _quota_write(account_key,op,expected_state_key=expected_state_key)
+
+
 def quota_invalidate_openai_reset_observations(account_key:str, *, before_ms:int,
                                                refreshed_windows:set[str],
                                                expected_state_key:str)->None:

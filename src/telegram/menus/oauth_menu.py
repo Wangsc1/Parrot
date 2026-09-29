@@ -36,7 +36,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -1848,6 +1848,50 @@ def _window_usage_detail(account_key: str, since_ts: float, indent: str,
     return indent + " · ".join(parts)
 
 
+def _format_openai_credits(row: dict | None, *, detail: bool = False) -> list[str]:
+    """Show useful credit facts only; never infer currency, quota or availability."""
+    if not row:
+        return []
+    codex = oauth_control.usage_from_quota_row(row).get("openai") or {}
+    credits = codex.get("credits") or {}
+    raw_balance = credits.get("balance")
+    balance = None
+    if raw_balance is not None and not isinstance(raw_balance, bool):
+        try:
+            parsed = Decimal(str(raw_balance).strip())
+            if parsed.is_finite() and parsed >= 0:
+                balance = parsed
+        except (InvalidOperation, ValueError):
+            pass
+
+    if credits.get("unlimited") is True:
+        value, observed_key = "不限量", "unlimited"
+    elif balance is not None and balance > 0:
+        amount = format(balance, ",f")
+        if "." in amount:
+            amount = amount.rstrip("0").rstrip(".")
+        value, observed_key = f"余额 {amount} credits", "balance"
+        if credits.get("has_credits") is False:
+            value += " · 上游标记不可用"
+    elif credits.get("has_credits") is True and balance is None:
+        value, observed_key = "可用 · 余额未返回", "has_credits"
+    else:
+        # Explicit zero/unavailable and unknown credits do not occupy a row.
+        return []
+
+    observed_at = int((codex.get("credits_observed_at") or {}).get(observed_key) or 0)
+    failed_at = int(row.get("codex_usage_failed_at") or 0)
+    stale = failed_at > 0 and failed_at >= observed_at
+    suffix = " · 刷新失败，旧数据" if stale else ""
+    lines = [f"🪙 Credits: <b>{ui.escape_html(value)}</b>{suffix}"]
+    if detail and observed_at:
+        observed = datetime.fromtimestamp(observed_at / 1000, tz=_BJT)
+        source = (codex.get("credits_sources") or {}).get(observed_key)
+        source_label = "官方用量接口" if source == "wham_usage" else "上游响应采样"
+        lines.append(f"<i>观测于 {observed:%m-%d %H:%M:%S} · {source_label}</i>")
+    return lines
+
+
 def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                           stats_loading: bool = False) -> str:
     """列表中每条 OAuth 账号的统一多行展示块。"""
@@ -1896,6 +1940,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         sub_exp = acc.get("subscription_expires_at") or ""
         if sub_exp:
             lines.append(f"📅 套餐到期: <code>{_fmt_time_full(sub_exp)}</code>")
+        lines.extend(_format_openai_credits(row))
     elif prov == "claude":
         cl_label = oauth_control.claude_plan_label(acc)
         if cl_label:
@@ -2099,7 +2144,7 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
             return "\n".join([pending, *zhipu_menu.extra_usage_lines(account_key, detail=True)])
         return "尚未获取用量（点「刷新用量/重置卡」试试）"
 
-    out = []
+    out = _format_openai_credits(row, detail=True) if provider == "openai" else []
     _now_ts = time.time()
     _detail_window_seconds = {
         "five_hour_util": 5 * 3600,
@@ -2135,17 +2180,6 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
         spend = codex.get("spend_control") or {}
         if spend.get("reached") is True:
             out.append("🔒 工作区消费上限已达到")
-        credits = codex.get("credits") or {}
-        credit_parts = []
-        if credits.get("unlimited") is True:
-            credit_parts.append("不限量")
-        if credits.get("balance") is not None:
-            credit_parts.append(f"余额 {ui.escape_html(str(credits['balance']))}")
-        if not credit_parts and credits.get("has_credits") is not None:
-            credit_parts.append("可用" if credits["has_credits"] else "不可用")
-        if credit_parts:
-            # Upstream credits have no declared currency unit.
-            out.append("💰 Credits: " + " · ".join(credit_parts))
         for family in codex.get("additional_rate_limits") or []:
             name = ui.escape_html(str(family.get("limit_name") or family.get("limit_id") or "额外额度"))
             for key in ("primary", "secondary"):
@@ -3908,6 +3942,11 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         ui.send(chat_id, _oauth_error_html(
             err, provider=provider, operation="fetch_usage",
         ))
+        if provider == "openai" and oauth_control.quota_snapshot(ak):
+            _edit_cached_detail(
+                chat_id, message_id, ak, page, filter_key,
+                prefix="⚠️ 用量刷新失败，保留上次数据\n\n", refresh_quota=False,
+            )
         return
     usage_result = refresh_result.get("usage")
     if not isinstance(usage_result, dict):
