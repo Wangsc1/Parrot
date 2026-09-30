@@ -337,12 +337,15 @@ def test_package_cycle_boundary_and_expiry_are_distinct_in_detail(tg):
     assert "资源包到期: 2030-09-30 23:59:59" in text
 
 
-def test_global_trial_requires_terms_then_confirmation_not_auto(tg):
+def test_global_trial_requires_terms_then_confirmation_not_auto(tg, monkeypatch):
     oldkey, _, ledger, output, _, _, _ = tg
     entry = dict(om.get_account(oldkey), realm="global", domain="www.workbuddy.ai")
     config.update(lambda c: c.update(oauthAccounts=[entry]))
     key = om.get_account_key(entry)
-    nav = (ui.register_code(key), 1, "all")
+    # Callback IDs may contain reward-like digits; they are not visible promises.
+    short = "9ccf2501"
+    monkeypatch.setitem(ui._code_to_name, short, key)
+    nav = (short, 1, "all")
     menu.handle_callback(42, 900, "cb", wb._cb("activity", nav))
     assert "申请试用额度" in output[-1][0] and "自动签到" not in output[-1][0]
     click(tg, "申请试用额度")
@@ -351,7 +354,12 @@ def test_global_trial_requires_terms_then_confirmation_not_auto(tg):
     assert ledger["calls"] == 0
     click(tg, "确认执行")
     assert ledger["calls"] == 1
-    assert "250" not in repr(output) and "14 天" not in repr(output)
+    visible = "\n".join(
+        text + "\n" + "\n".join(button["text"] for button in buttons(kb))
+        for text, kb in output
+    )
+    assert any(short in button["callback_data"] for _, kb in output for button in buttons(kb))
+    assert "250" not in visible and "14 天" not in visible
 
 
 def test_removed_import_callback_does_not_cancel_a_new_login(tg, monkeypatch):
