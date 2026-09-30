@@ -1,26 +1,20 @@
 name: Create GitHub Release
 
 # 自动发布仅由 docker-publish 在 quality 和镜像推送成功后调用。
-# 保留手动 dispatch 一次性补建（输入 tag 名），不再独立响应 tag push。
+# 恢复同样通过 docker-publish 的已验证产物入口，不独立 dispatch 或响应 tag push。
 #
 # 设计：
 # - Release body 优先使用 tag 自带的 annotation；若 tag 是 lightweight 则用
 #   该 tag 指向 commit 的 message。
 # - 同时附加 GitHub 内置的"Generate release notes"（自动归类 PR / commits）。
 # - prerelease 自动识别：tag 含 -rc / -alpha / -beta / -pre 时标 prerelease=true。
-# - 幂等：若同名 Release 已存在则跳过；不会覆盖手动创建的 Release。
+# - 幂等：若同名公开 Release 已存在则跳过；同名草稿明确报错，不擅自公开。
 
 on:
   workflow_call:
     inputs:
       tag:
         description: "已完成镜像发布的 tag"
-        required: true
-        type: string
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "要补建 Release 的 tag（如 v0.14.0）"
         required: true
         type: string
 
@@ -60,19 +54,17 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          # 优先用 annotated tag 自己的 message（git for-each-ref）
-          MSG="$(git tag -l --format='%(contents)' "$TAG" || true)"
-          # lightweight tag 时 contents 为空，回退到 commit message
-          if [[ -z "$(echo "$MSG" | tr -d '[:space:]')" ]]; then
+          if [[ "$(git cat-file -t "refs/tags/$TAG")" == tag ]]; then
+            # 固定发布入口的 annotation 就是已批准正文，不删改版本号开头的首行。
+            MSG="$(git tag -l --format='%(contents)' "$TAG" || true)"
+          else
+            # 仅保留旧 lightweight tag 的 commit-message 去标题行为。
             MSG="$(git log -1 --pretty=%B "$TAG")"
-          fi
-          # 删除 commit 头部那行 'vX.Y.Z: xxx' 标题（避免和 release 标题重复）
-          # 仅当首行以 v 开头并含冒号时去掉
-          FIRST_LINE="$(echo "$MSG" | head -n1)"
-          if [[ "$FIRST_LINE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            MSG="$(echo "$MSG" | tail -n +2)"
-            # 去掉紧随其后的空行
-            MSG="$(echo "$MSG" | sed -e '/./,$!d')"
+            FIRST_LINE="$(echo "$MSG" | head -n1)"
+            if [[ "$FIRST_LINE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              MSG="$(echo "$MSG" | tail -n +2)"
+              MSG="$(echo "$MSG" | sed -e '/./,$!d')"
+            fi
           fi
           # 通过 multiline output 安全传递
           {
@@ -87,9 +79,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          set -euo pipefail
+          if IS_DRAFT="$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft --jq '.isDraft')"; then
+            if [[ "$IS_DRAFT" != false ]]; then
+              echo "Release $TAG 是草稿或状态未知；请先处理，不能当作已公开版本，也不会自动公开。" >&2
+              exit 1
+            fi
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Release $TAG 已存在，跳过创建"
+            echo "✅ Release $TAG 已公开，跳过创建"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi

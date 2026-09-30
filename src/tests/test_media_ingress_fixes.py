@@ -120,6 +120,17 @@ def _override(context=1000, output=10):
     return {"fields": {"contextWindow": context, "maxInputTokens": context, "maxOutputTokens": output}}
 
 
+class _SingleResponseWebSocket(ws_fixtures.FakeWebSocket):
+    """This finite dispatch probe ends on errors as well as response terminals.
+
+    Keep the shared fixture's persistent-connection behavior for session tests.
+    """
+    async def send_text(self, text):
+        await super().send_text(text)
+        if json.loads(text).get("type") == "error":
+            self._terminal_seen = True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["ws", "sse"])
 @pytest.mark.parametrize("queued", [False, True])
@@ -135,14 +146,16 @@ async def test_ws_oversized_output_is_clamped_and_dispatched(monkeypatch, ws_mod
         monkeypatch.setattr(m["concurrency"], "acquire_from_candidates", acquired)
     cfg["modelMetadataOverrides"] = {"defaults": {"test-model": _override()}, "scoped": {}}
     frame = {"type": "response.create", "model": "test-model", "input": "hello", "max_output_tokens": 20}
-    ws = ws_fixtures.FakeWebSocket(frame)
+    ws = _SingleResponseWebSocket(frame)
     upstream = ws_fixtures.FakeUpstreamWebSocket([])
     async def fake_connect(*a, **k):
         return upstream
     sent_http = []
     async def fake_http(**kwargs):
         sent_http.append(json.loads(kwargs["upstream_req"].body))
-        return SimpleNamespace(error=m["responses_ws"]._WsAttemptResult(
+        from src.protocols.runtime import AttemptResult
+        from src.transports.http_runtime import OpenedHttpResponse
+        return OpenedHttpResponse(error=AttemptResult(
             outcome="transport_error", error_detail="fixture stop before network",
         ))
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
@@ -158,6 +171,8 @@ async def test_ws_oversized_output_is_clamped_and_dispatched(monkeypatch, ws_mod
         assert sent["max_output_tokens"] == 10 and "source=" not in sent.get("model", "")
     else:
         assert len(sent_http) == 1 and sent_http[0]["max_output_tokens"] == 10
+        assert row["http_status"] == 503
+        assert row["error_message"] == "fixture stop before network"
     assert row["http_status"] in (500, 502, 503, 504)  # upstream refusal, not a local pre-transport 400
 
 

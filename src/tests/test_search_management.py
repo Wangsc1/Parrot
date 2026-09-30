@@ -522,10 +522,12 @@ def test_probe_failure_operation_does_not_expose_exception(api, monkeypatch):
 
 
 def test_registration_and_openapi_write_only_request_keys():
-    from src.management_api.router import create_management_router
+    from src.management_api.routers.search import router
     from fastapi import FastAPI
     app = FastAPI()
-    app.include_router(create_management_router())
+    # Full production registration/order is covered by the 243-operation
+    # server composition contract; this test owns the search request schemas.
+    app.include_router(router, prefix="/api/management/v1")
     document = app.openapi()
     assert "/api/management/v1/search" in document["paths"]
     schemas = document["components"]["schemas"]

@@ -1,0 +1,184 @@
+name: Prepare Release Candidate
+
+on:
+  push:
+    branches:
+      - "release-candidate/**"
+
+permissions:
+  contents: read
+
+# Serialize candidate workflows, not parallel quality shards/build jobs.
+# This also prevents concurrent writers to the shared per-architecture cache.
+concurrency:
+  group: parrot-release-candidate
+  cancel-in-progress: false
+
+jobs:
+  quality-shard:
+    name: quality-shard (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          set -o pipefail
+          mkdir -p quality-logs
+          python -m pip install -r requirements.txt pytest pytest-asyncio 'pytest-xdist>=3.5' 2>&1 | tee quality-logs/install.log
+      - name: Compile and import
+        run: |
+          set -eo pipefail
+          {
+            python -m compileall -q server.py src
+            python -c "import server; from src import state_db; from src.state_store import StateStore"
+          } 2>&1 | tee quality-logs/compile-import.log
+      - name: Full isolated regression
+        run: |
+          set -o pipefail
+          WORKERS="$(nproc)"
+          echo "CI regression shard=${{ matrix.shard }}/2 workers=$WORKERS"
+          python src/tests/isolated_pytest.py -q -ra src/tests -n "$WORKERS" --dist=worksteal -p src.tests.sharding --shard-index ${{ matrix.shard }} --shard-count 2 --shard-report quality-logs/shard-${{ matrix.shard }}.json 2>&1 | tee quality-logs/regression.log
+      - name: Preserve quality logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: parrot-quality-${{ github.sha }}-${{ matrix.shard }}
+          path: quality-logs
+          if-no-files-found: warn
+          overwrite: true
+
+  quality:
+    # Keep the stable publication gate name. Never accept a skipped/failed shard.
+    if: ${{ always() }}
+    needs: quality-shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require every shard to pass
+        env:
+          SHARD_RESULT: ${{ needs.quality-shard.result }}
+        run: test "$SHARD_RESULT" = success
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: parrot-quality-${{ github.sha }}-*
+          path: quality-reports
+      - name: Verify full collection with no omitted or duplicate tests
+        run: python3 scripts/test_shards.py --count 2 quality-reports/*/shard-*.json
+
+  build:
+    name: build (${{ matrix.arch }})
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read candidate version and repository
+        id: info
+        run: |
+          python3 scripts/release.py ci-info --output "$GITHUB_OUTPUT"
+          echo "repository=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/parrot" >> "$GITHUB_OUTPUT"
+          echo "cache=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/parrot-buildcache" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and upload candidate by architecture
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.info.outputs.repository }}:candidate-${{ github.sha }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.info.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=registry,ref=${{ steps.info.outputs.cache }}:${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ steps.info.outputs.cache }}:${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
+      - name: Record immutable candidate digest
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_REPOSITORY: ${{ steps.info.outputs.repository }}
+          ARCHITECTURE: ${{ matrix.arch }}
+        run: |
+          python3 scripts/release.py ci-record --architecture "$ARCHITECTURE" --digest "$IMAGE_DIGEST" --repository "$IMAGE_REPOSITORY" --output "image-${ARCHITECTURE}.json"
+      - name: Upload candidate digest receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: parrot-candidate-${{ github.sha }}-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.json
+          if-no-files-found: error
+          overwrite: true
+
+  # This is only the explicit one-off acceptance path, never a release prerequisite.
+  rehearsal:
+    if: ${{ startsWith(github.ref_name, 'release-candidate/rehearsal-') }}
+    needs: [quality, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: parrot-candidate-${{ github.sha }}-*
+          merge-multiple: true
+          path: release-images
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify and promote rehearsal manifest only
+        run: |
+          python3 scripts/release.py ci-publish --rehearsal --images release-images --commit "$GITHUB_SHA" --repository "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/parrot"
+
+  rehearsal-cleanup:
+    if: ${{ startsWith(github.ref_name, 'release-candidate/rehearsal-') }}
+    needs: rehearsal
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Remove only this rehearsal's unshared package versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/release.py ci-cleanup-rehearsal --commit "$GITHUB_SHA"

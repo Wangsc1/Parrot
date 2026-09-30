@@ -262,9 +262,12 @@ class _Control:
 
     def list_models(self, _ctx=None, *, filters=None, page=1, page_size=50):
         self.query_calls.append((filters, page, page_size))
-        values = [replace(view, revision=self.revision) for view in self.views.values() if self._matches(view, filters)]
+        values = [view for view in self.views.values() if self._matches(view, filters)]
         start = (page - 1) * page_size
-        return ModelPage(tuple(values[start:start + page_size]), page, page_size, len(values), start + page_size < len(values), self.revision)
+        # Copy only the returned page; large-selection tests must not clone the
+        # full filtered catalog again for every page they request.
+        items = tuple(replace(view, revision=self.revision) for view in values[start:start + page_size])
+        return ModelPage(items, page, page_size, len(values), start + page_size < len(values), self.revision)
 
     def get_model(self, _ctx, resource_key):
         for view in self.views.values():

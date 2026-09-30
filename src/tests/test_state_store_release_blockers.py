@@ -60,18 +60,51 @@ def test_load_selects_highest_verified_main_or_backup(tmp_path):
 
 def test_close_barrier_rejects_late_mutation(tmp_path, monkeypatch):
     store = _store(tmp_path); store._mutate("performance_stats", lambda d: d.__setitem__("a", {"v": 1}))
-    entered, release = threading.Event(), threading.Event(); real = store.write_snapshot
+    entered, release, attempted = threading.Event(), threading.Event(), threading.Event()
+    real = store.write_snapshot
+    close_errors, write_errors = [], []
     def blocked(*args, **kwargs):
-        if args[1] == "runtime": entered.set(); release.wait(5)
+        if args[1] == "runtime":
+            entered.set()
+            assert release.wait(5), "test did not release the closing write barrier"
         return real(*args, **kwargs)
+    def close_store():
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+    def late_write():
+        attempted.set()
+        try:
+            store._mutate("performance_stats", lambda d: d.__setitem__("late", {"v": 2}))
+        except BaseException as exc:
+            write_errors.append(exc)
     monkeypatch.setattr(store, "write_snapshot", blocked)
-    closer = threading.Thread(target=store.close); closer.start(); assert entered.wait(2)
-    with pytest.raises(RuntimeError, match="not accepting"):
-        store._mutate("performance_stats", lambda d: d.__setitem__("late", {"v": 2}))
-    release.set(); closer.join(5); assert not closer.is_alive()
+    closer = threading.Thread(target=close_store)
+    writer = threading.Thread(target=late_write)
+    closer.start()
+    try:
+        assert entered.wait(2)
+        # Mutations acquire the same install lock as snapshot writes. Use a
+        # separate caller so the test can release the barrier without relying
+        # on its timeout to unlock the synchronous main thread.
+        writer.start()
+        assert attempted.wait(2)
+    finally:
+        release.set()
+        closer.join(5)
+        if writer.ident is not None:
+            writer.join(5)
+    assert not closer.is_alive() and not writer.is_alive()
+    assert not close_errors
+    assert len(write_errors) == 1 and isinstance(write_errors[0], RuntimeError)
+    assert "not accepting" in str(write_errors[0])
     restored = StateStore(str(tmp_path / "runtime.json"), str(tmp_path / "durable.json")); restored.start()
-    assert restored.get("performance_stats", "a") == {"v": 1}
-    assert restored.get("performance_stats", "late") is None
+    try:
+        assert restored.get("performance_stats", "a") == {"v": 1}
+        assert restored.get("performance_stats", "late") is None
+    finally:
+        restored.close()
 
 
 def test_process_lock_contention_and_release(tmp_path):

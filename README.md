@@ -141,7 +141,13 @@ python3 -m venv venv
 ./venv/bin/python server.py
 ```
 
-测试入口尊重显式 `-n` / `--numprocesses`、`--dist`、`--durations`（含 `PYTEST_ADDOPTS`），不会改写用户指定值；未安装 `pytest-xdist` 时会提示并退回串行。每个并行进程仍使用独立测试数据目录并禁止真实外网请求。日常修改先跑受影响测试，最终验收及发布保留全量与跨 Python 版本回归；CI 使用同一入口和默认并行策略。
+测试入口尊重显式 `-n` / `--numprocesses`、`--dist`、`--durations`（含 `PYTEST_ADDOPTS`），不会改写用户指定值；未安装 `pytest-xdist` 时会提示并退回串行。每个并行进程仍使用独立测试数据目录并禁止真实外网请求。日常修改先跑受影响测试，最终验收及发布保留全量与跨 Python 版本回归。
+
+### 固定发布入口
+
+发布统一使用 `scripts/release.py start <版本> --notes <说明文件> --files <已审阅文件...>`，失败后使用 `resume <运行ID>` 续跑。脚本固定执行候选检查、并发回归与双架构候选构建、重启授权与验证、推送和发布验收；源码未变时复用已通过结果，源码变化后自动失效。回归只保留本机实际 Python 和 GitHub 干净 CI 各一份，不再额外运行本机 CI 容器；候选构建并行上传GHCR并记录不可变digest，缓存跨候选分支复用；正式工作流仅核验并发布多架构manifest，不重复测试、构建或搬运完整镜像。
+
+本机发布默认最多 8 worker（不超过可用核数，可用 `--workers` 固定），CI 使用实际可用核数；日常测试的默认并行策略不变。重启及失败 Tag 覆盖仍需用户授权。完整入口、错误报告、授权和恢复方法见 [固定发布说明](docs/releasing.md)。`rehearse` 可做不改正式版本、不重启、不更新正式标签或Release的真实验收，并输出阶段耗时；它只用于一次性验证发布工具，不是日常发布前置步骤。
 
 ### Codex 协议 profile（OpenAI OAuth）
 
@@ -690,8 +696,10 @@ Parrot/
 ├── docker-entrypoint.sh         ← root→app 降权入口
 ├── .dockerignore
 ├── deploy.sh                    ← 一键部署脚本（交互式）
+├── scripts/release.py           ← 固定发布入口：start / resume / status
 ├── .github/workflows/
-│   └── docker-publish.yml       ← GitHub Actions：push → 构建多架构镜像 → GHCR
+│   ├── release-prepare.yml      ← 候选回归与双架构原生构建并行
+│   └── docker-publish.yml       ← 复用候选产物 → GHCR → Release
 ├── server.py                    ← FastAPI 入口
 ├── requirements.txt
 ├── data/                        ← 运行时持久化（容器挂载点；源码模式不存在）

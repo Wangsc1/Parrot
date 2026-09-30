@@ -66,3 +66,6 @@ backups/
 
 # Local debug/probe outputs
 _debug/
+
+# Fixed release entrypoint: receipts, logs and temporary candidate worktrees
+.release-runs/

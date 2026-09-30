@@ -1,63 +1,92 @@
-name: Build and Publish Docker Image
+name: Publish Prepared Docker Image
 
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "已通过候选门禁的 tag（如 v0.34.5）；运行 ref 必须选择同一个 tag"
+        required: true
+        type: string
+
+concurrency:
+  group: parrot-formal-publication
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
-  # 注意：GHCR 镜像名必须全小写；本仓库发布为 ghcr.io/<owner>/parrot
-  IMAGE_NAME: ${{ github.repository_owner }}/parrot
 
 jobs:
-  quality:
+  publish:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Architecture gates compare against historical baselines.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - name: Install test dependencies
-        run: python -m pip install -r requirements.txt pytest pytest-asyncio 'pytest-xdist>=3.5'
-      - name: Compile and import
-        run: |
-          python -m compileall -q server.py src
-          python -c "import server; from src import state_db; from src.state_store import StateStore"
-      - name: Full isolated regression
-        run: python src/tests/isolated_pytest.py -q src/tests
-
-  build-and-push:
-    needs: quality
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+      actions: read
       packages: write
-
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Checkout
+      - name: Resolve tag name
+        id: tag
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" != v* ]] || ! git check-ref-format "refs/tags/$TAG"; then
+            echo "Expected an explicit v* release tag" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" != "refs/tags/$TAG" ]]; then
+            echo "Manual recovery must run from the target tag ref: refs/tags/$TAG (not main)." >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release tag
         uses: actions/checkout@v4
         with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
           fetch-depth: 0
+
+      - name: Resolve source commit and image repository
+        id: source
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          # GHCR requires a lowercase owner, including on manually dispatched runs.
+          echo "repository=${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/parrot" >> "$GITHUB_OUTPUT"
+
+      - name: Verify successful candidate gates for this commit
+        id: candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: python3 scripts/release.py ci-verify-candidate --commit "$SOURCE_SHA" --output "$GITHUB_OUTPUT"
+
+      - name: Download verified candidate digest receipts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.candidate.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pattern: parrot-candidate-${{ steps.source.outputs.sha }}-*
+          merge-multiple: true
+          path: release-images
 
       - name: Fetch tags
         run: git fetch --tags --force
 
       - name: Decide whether this tag moves latest
         id: latest
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          VALUE="$(python3 scripts/is_latest_release_tag.py "${GITHUB_REF_NAME}" --from-git)"
+          VALUE="$(python3 scripts/is_latest_release_tag.py "$TAG" --from-git)"
           echo "is_latest=${VALUE}" >> "$GITHUB_OUTPUT"
-          echo "tag=${GITHUB_REF_NAME} latest=${VALUE}"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+          echo "tag=${TAG} latest=${VALUE}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -73,34 +102,35 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # vX.Y.Z → vX.Y.Z + X.Y.Z / X.Y / X；仅当该 tag 是当前最新正式版时才写 latest
+          # Dispatch must use the target tag ref; metadata still follows the checkout.
+          context: git
+          images: ${{ steps.source.outputs.repository }}
+          # Disable implicit latest; only the explicit, gated latest rule may add it.
+          flavor: latest=false
+          # vX.Y.Z → vX.Y.Z + X.Y.Z / X.Y / X, plus the checked-out source SHA.
           tags: |
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=raw,value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.tag.outputs.tag }}
             type=sha,prefix=sha-
             type=raw,value=latest,enable=${{ steps.latest.outputs.is_latest == 'true' }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Promote verified digests without rebuilding or re-uploading
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          IMAGE_REPOSITORY: ${{ steps.source.outputs.repository }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          printf '%s\n' "$IMAGE_TAGS" > tags.txt
+          python3 scripts/release.py ci-publish --images release-images --commit "$SOURCE_SHA" --repository "$IMAGE_REPOSITORY" --tags-file tags.txt
 
-  # Only advertise a version once quality passed and both image platforms were pushed.
+  # Only advertise a version after all candidate gates and the official image push succeed.
   release:
-    needs: build-and-push
-    if: ${{ success() && startsWith(github.ref, 'refs/tags/v') }}
+    needs: publish
+    if: ${{ success() }}
     permissions:
       contents: write
     uses: ./.github/workflows/release.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.publish.outputs.tag }}
