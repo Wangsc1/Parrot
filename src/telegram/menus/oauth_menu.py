@@ -41,6 +41,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from ... import model_names, quota_errors
+from ...oauth.plan_labels import openai_plan_label, xai_plan_label
 from ...management_control.oauth import CchMode, OAuthUsageDisplayMode
 from ...management_control.oauth.menu_bridge import (
     OpenAIImportParseError,
@@ -309,7 +310,8 @@ def _overwrite_summary(entry: dict) -> str:
             lines.append(f"Project: <code>{ui.escape_html(project_id)}</code>")
     plan = entry.get("plan_type")
     if plan:
-        lines.append(f"套餐: <code>{ui.escape_html(str(plan))}</code>")
+        label = openai_plan_label(plan) if provider == "openai" else str(plan)
+        lines.append(f"套餐: <code>{ui.escape_html(label)}</code>")
     lines.extend(("", "取消或会话过期不会修改现有账户。"))
     return "\n".join(lines)
 
@@ -1421,7 +1423,7 @@ def _xai_tier_label(xai: dict) -> str:
     settings = xai.get("settings") if isinstance(xai.get("settings"), dict) else {}
     vals = []
     for v in (user.get("subscription_tier"), settings.get("subscription_tier_display")):
-        s = str(v or "").strip()
+        s = xai_plan_label(v)
         if s and s not in vals:
             vals.append(s)
     return " / ".join(vals)
@@ -1926,7 +1928,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     elif prov == "workbuddy":
         lines.append(workbuddy_menu.provider_line(acc))
     elif prov == "openai":
-        plan = acc.get("plan_type") or ""
+        plan = openai_plan_label(acc.get("plan_type"))
         workspace = _openai_workspace_label(acc)
         ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace else ""
         plan_parts = []
@@ -3411,7 +3413,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     elif prov == "workbuddy":
         provider_line = workbuddy_menu.provider_line(acc, detail=True) + "\n"
     elif prov == "openai":
-        plan = acc.get("plan_type") or "?"
+        plan = openai_plan_label(acc.get("plan_type")) or "?"
         workspace = _openai_workspace_label(acc, force=True)
         ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace and _openai_same_email_count(acc) > 1 else ""
         provider_line = f"🏷️ 套餐: <code>{ui.escape_html(plan)}{ws_suffix}</code>\n"
@@ -3973,7 +3975,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         if isinstance(metadata_action, dict) and metadata_action.get("action") == "updated":
             fields = metadata_action.get("fields") or {}
             if fields.get("plan_type"):
-                head += f"\n🏷 套餐信息已刷新: <code>{ui.escape_html(fields.get('plan_type'))}</code>"
+                head += f"\n🏷 套餐信息已刷新: <code>{ui.escape_html(openai_plan_label(fields.get('plan_type')))}</code>"
         if quota_action and quota_action.get("action") in ("disabled", "wham_limit_disabled"):
             hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
             head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
@@ -6140,7 +6142,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
                     parts.append(f"{label} {util:.0f}%")
             quota_note = "\n额度: <code>" + ui.escape_html(" / ".join(parts) or "已获取") + "</code>"
 
-    plan = meta.get("plan_type") or "?"
+    plan = openai_plan_label(meta.get("plan_type")) or "?"
     workspace = meta.get("workspace_name") or meta.get("workspace_type") or ""
     ws_line = f"工作区: <code>{ui.escape_html(workspace)}</code>\n" if workspace else ""
     sub_exp = meta.get("subscription_expires_at") or ""

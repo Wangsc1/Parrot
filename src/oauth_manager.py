@@ -53,6 +53,7 @@ from .oauth import xai as xai_provider
 from .oauth import workbuddy as workbuddy_provider
 from .oauth.workbuddy import runtime as workbuddy_runtime
 from .oauth import zhipu as zhipu_provider
+from .oauth.plan_labels import openai_plan_label
 from .oauth.zhipu import runtime as zhipu_runtime
 from .openai.codex_constants import (
     codex_backend_base_url,
@@ -2210,16 +2211,8 @@ def openai_plan_workspace_label(acc: dict | None) -> str:
     """
     if not acc:
         return "OpenAI"
-    plan_raw = str(acc.get("plan_type") or "").strip()
+    plan = openai_plan_label(acc.get("plan_type"))
     workspace = str(acc.get("workspace_name") or "").strip()
-    plan_map = {
-        "team": "Team",
-        "plus": "Plus",
-        "pro": "Pro",
-        "free": "Free",
-        "enterprise": "Enterprise",
-    }
-    plan = plan_map.get(plan_raw.lower(), plan_raw[:1].upper() + plan_raw[1:] if plan_raw else "")
     if plan and workspace and workspace.lower() != "personal":
         return f"OpenAI · {plan}（{workspace}）"
     if plan:
@@ -6606,7 +6599,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
                 _rf_pl = claude_plan_label(acc)
                 _rf_plan_tag = f"\n{notifier.provider_tag('claude')} · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
             elif provider_of(ak) == "openai":
-                _rf_pl = acc.get("plan_type") or ""
+                _rf_pl = openai_plan_label(acc.get("plan_type"))
                 _rf_plan_tag = f"\n{notifier.provider_tag('openai')} · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
             elif provider_of(ak) == "cursor":
                 _rf_pl = acc.get("plan_type") or ""
@@ -6685,7 +6678,7 @@ async def quota_monitor_once() -> dict:
         utils = result["utils"]
         action = result["action"]
 
-        # 通知里追加套餐标签（Claude 显示套餐/tier，OpenAI 显示 plan_type）
+        # 通知使用套餐显示标签，账号仍保留上游原始套餐代码。
         _plan_tag = ""
         if provider == "claude":
             _pl = claude_plan_label(acc)

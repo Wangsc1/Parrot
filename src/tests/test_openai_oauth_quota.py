@@ -387,7 +387,7 @@ def test_oauth_menu_detail_openai_shows_provider_and_codex_usage(m):
     # provider 行：正文使用 Telegram custom emoji HTML + 明文 provider label。
     assert "tg-emoji" in text and "6141162084857031383" in text and "OpenAI" in text, text[:500]
     # plan 行
-    assert "plus" in text
+    assert "套餐: <code>Plus</code>" in text
     # 归一化 5h / 7d
     assert "5h" in text and "77" in text
     # 不再展示低价值的 Codex 原始窗口块
@@ -1315,7 +1315,7 @@ def test_openai_plan_workspace_label_disambiguates_same_email(m):
         "workspace_name": "us",
         "workspace_id": "d5611c34-1909-44f5-ac0a-9ef630e41c85",
     })
-    assert label == "OpenAI · Team（us）"
+    assert label == "OpenAI · Business（us）"
     assert "d5611c34" not in label
     plus_label = m["oauth_manager"].openai_plan_workspace_label({
         "plan_type": "plus",

@@ -1343,7 +1343,7 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
     rec = _install_recorder(m)
     m["oauth_menu"].show(42, 100)
     listing = rec.last("editMessageText")
-    assert listing and "🏷 套餐: <code>pro</code> · ♻️ 官方重置次数: <code>2 次</code>" in listing["text"]
+    assert listing and "🏷 套餐: <code>Pro 200</code> · ♻️ 官方重置次数: <code>2 次</code>" in listing["text"]
 
     rec.clear()
     short = m["ui"].register_code(ak)
