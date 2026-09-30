@@ -20,6 +20,7 @@ import httpx
 from . import network
 from .upstream_client import SharedClientPool
 from .protocols import errors as protocol_errors
+from .protocols.output_repetition import observe_output_repetition, output_repetition_error_event
 from .protocols.sse import split_sse_events as _split_sse_events_bytes, TerminalEventFilter
 from .protocols.usage import (
     UsageAccumulator,
@@ -213,6 +214,8 @@ class SSEUsageTracker:
         return self._relay_filter.feed(chunk_bytes)
 
     def feed(self, chunk_bytes: bytes) -> None:
+        if output_repetition_error_event(self) is not None:
+            return
         chunk_bytes = self._record_filter.feed(chunk_bytes)
         if not chunk_bytes:
             return
@@ -226,6 +229,8 @@ class SSEUsageTracker:
                 evt = json.loads(data)
             except Exception:
                 continue
+            if observe_output_repetition(self, evt):
+                break
             t = evt.get("type", "")
             if t == "error" or isinstance(evt.get("error"), dict):
                 self.saw_stream_error = True
@@ -526,7 +531,7 @@ class ChatSSEUsageTracker:
         return self._relay_done_received
 
     def feed(self, chunk_bytes: bytes) -> None:
-        if not chunk_bytes or self._done_received:
+        if not chunk_bytes or self._done_received or output_repetition_error_event(self) is not None:
             return
         self._record_buf += chunk_bytes
         self._record_buf, record_blocks = _split_sse_events_bytes(self._record_buf)
@@ -550,6 +555,8 @@ class ChatSSEUsageTracker:
             except Exception:
                 continue
             if isinstance(evt, dict):
+                if observe_output_repetition(self, evt):
+                    break
                 if isinstance(evt.get("error"), dict):
                     self.saw_stream_error = True
                     self.stream_error_code, self.stream_error_message = _format_stream_error_info(evt)
@@ -792,6 +799,8 @@ class ResponsesSSEUsageTracker:
         return self._relay_filter.feed(chunk_bytes)
 
     def feed(self, chunk_bytes: bytes) -> None:
+        if output_repetition_error_event(self) is not None:
+            return
         chunk_bytes = self._record_filter.feed(chunk_bytes)
         if not chunk_bytes:
             return
@@ -802,6 +811,8 @@ class ResponsesSSEUsageTracker:
             event_name, data = _parse_event_block(block)
             if data is None:
                 continue
+            if observe_output_repetition(self, {**data, "type": data.get("type") or event_name}):
+                break
             if event_name == "error" or (isinstance(data, dict) and data.get("type") == "error"):
                 self.saw_stream_error = True
                 self.stream_error_code, self.stream_error_message = _format_stream_error_info(data)

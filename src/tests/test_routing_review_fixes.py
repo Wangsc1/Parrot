@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import json
+import random
 import time
 from types import SimpleNamespace
 import pytest
@@ -314,15 +315,20 @@ async def test_search_ws_sequential_terminal_handoff(monkeypatch):
 
 
 def _observation_events(terminal):
+    # Exercise display truncation, not the output-loop cutoff. Keep the original
+    # 300k-character size and all terminal/observation assertions, but use varied
+    # deterministic text instead of 300k identical characters.
+    rng = random.Random(20260930)
+    text = ''.join(chr(0x4e00 + rng.randrange(0x3000)) for _ in range(300000))
     response = {'id':'observed', 'model':'rerouted-model', 'status':terminal,
-                'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'x'*300000}]}],
+                'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':text}]}],
                 'usage':{'input_tokens':3,'output_tokens':2}}
     if terminal == 'failed':
         response['error'] = {'code':'server_error','message':'fixture failure'}
     events = [
         {'type':'response.metadata','metadata':{'type':'safety_buffering','reasons':['prefix-review']}},
         {'type':'response.in_progress','response':{'id':'observed','model':'rerouted-model'}},
-        {'type':'response.output_text.delta','output_index':0,'content_index':0,'delta':'x'*300000},
+        {'type':'response.output_text.delta','output_index':0,'content_index':0,'delta':text},
     ]
     if terminal != 'cancelled':
         events.append({'type':'response.'+terminal,'response':response,

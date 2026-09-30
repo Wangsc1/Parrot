@@ -59,6 +59,7 @@ from ..openai.transform.responses_to_chat import resolve_current_input_items
 from ..proxy.connector import SS2022Connector, SOCKS5Connector
 from ..protocols import finalize as finalize_policy
 from ..protocols import errors as protocol_errors
+from ..protocols.output_repetition import OUTPUT_REPETITION_CODE
 from ..protocols.runtime import (
     configured_transient_retry_delays,
     format_responses_ws_error,
@@ -390,7 +391,7 @@ class _WsTracker:
         self._output_builder = upstream.ResponsesSSEAssistantBuilder()
 
     def feed_text(self, text: str) -> None:
-        if not text:
+        if not text or upstream.output_repetition_error_event(self) is not None:
             return
         self._frames.append(text)
         try:
@@ -404,7 +405,6 @@ class _WsTracker:
             self.response_signals, model_reroute.extract_response_signals(evt),
         )
         typ = str(evt.get("type") or "")
-        self._output_builder.feed((f"event: {typ}\ndata: " + json.dumps(evt, ensure_ascii=False) + "\n\n").encode("utf-8"))
         normalized = model_pricing.normalize_response_billing(evt)
         # Use the canonical envelope walk, not a separate root/response-only
         # gate. Presence is independent of invalid service-tier metadata.
@@ -429,6 +429,9 @@ class _WsTracker:
                 "cache_creation": 0,
                 "cache_read": 0,
             }
+        if upstream.observe_output_repetition(self, evt):
+            return
+        self._output_builder.feed((f"event: {typ}\ndata: " + json.dumps(evt, ensure_ascii=False) + "\n\n").encode("utf-8"))
         if typ == "error" or isinstance(evt.get("error"), dict):
             self.response_failed = True
             self.stream_error_message = _format_ws_error(evt)
@@ -2043,6 +2046,7 @@ async def _try_ws_channel(
                     await turn_capacity.release()
                 can_continue = bool(
                     relay_result.request_finalized
+                    and relay_result.error_code != OUTPUT_REPETITION_CODE
                     and (
                         relay_result.ok
                         or relay_result.outcome in {
@@ -3169,11 +3173,21 @@ async def _try_sse_channel(
         result.request_finalized = True
         return result
 
+    repetition_resources_closed = False
+
     async def finalize_and_return() -> _WsAttemptResult:
         if on_terminal is not None:
             await on_terminal()
         # Protect route, retry and request writes as one owner, not individually.
-        return await await_ws_owned(_persist_accepted_sse_request())
+        async def settle():
+            nonlocal repetition_resources_closed
+            settled = await _persist_accepted_sse_request()
+            if upstream.output_repetition_error_event(tracker) is not None and not repetition_resources_closed:
+                repetition_resources_closed = True
+                await close_response_context(opened.ctx)
+                await close_proxy_client(opened.proxy_client)
+            return settled
+        return await await_ws_owned(settle())
 
     async def commit_pending() -> None:
         nonlocal committed
@@ -3258,6 +3272,9 @@ async def _try_sse_channel(
                 frame_text = _dump_frame(data)
                 _capture_codex_response_event(ch, upstream_req.translator_ctx, frame_text)
                 tracker.feed_text(frame_text)
+                if repetition_error := upstream.output_repetition_error_event(tracker):
+                    data = repetition_error
+                    frame_text = _dump_frame(repetition_error)
                 event_type = _ws_event_type(frame_text)
                 if event_type == "response.created":
                     dispatch_committed = True
@@ -3783,8 +3800,20 @@ async def _relay_ws_session(
         release_request_turn_serialization(body)
         return result
 
+    repetition_upstream_closed = False
+
     async def finalize_accepted_request() -> _WsAttemptResult:
-        return await await_ws_owned(_persist_accepted_ws_request())
+        async def settle():
+            nonlocal repetition_upstream_closed
+            settled = await _persist_accepted_ws_request()
+            if upstream.output_repetition_error_event(tracker) is not None and not repetition_upstream_closed:
+                repetition_upstream_closed = True
+                try:
+                    await upstream_ws.close(code=1011)
+                except Exception:
+                    pass
+            return settled
+        return await await_ws_owned(settle())
 
     # Send first frame upstream before accepting downstream. If upstream rejects
     # before a downstream-visible event, the attempt can still fail over.

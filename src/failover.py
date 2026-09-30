@@ -3030,7 +3030,7 @@ class _WsResponsesTracker:
         self._response_obj: Optional[dict] = None
 
     def feed_text(self, text: str) -> None:
-        if not text:
+        if not text or upstream.output_repetition_error_event(self) is not None:
             return
         try:
             evt = json.loads(text)
@@ -3053,7 +3053,6 @@ class _WsResponsesTracker:
             _maybe_record_codex_rate_limits_event(self.channel, evt)
             return
         self._frames.append(text)
-        self._output_builder.feed((f"event: {typ}\ndata: " + json.dumps(evt, ensure_ascii=False) + "\n\n").encode("utf-8"))
         response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
         usage_present = any(
             "usage" in container for container in openai_envelope_containers(evt)
@@ -3078,6 +3077,9 @@ class _WsResponsesTracker:
                 "cache_creation": 0,
                 "cache_read": 0,
             }
+        if upstream.observe_output_repetition(self, evt):
+            return
+        self._output_builder.feed((f"event: {typ}\ndata: " + json.dumps(evt, ensure_ascii=False) + "\n\n").encode("utf-8"))
         if typ == "error" or isinstance(evt.get("error"), dict):
             self.response_failed = True
             _status, self.stream_error_message = _ws_error_detail(text)
@@ -4159,10 +4161,21 @@ async def _consume_oauth_responses_ws_stream(
             affinity_hit, start_time, start_monotonic, connect_ms, first_byte_ms,
             tracker, proxy_name, proxy_bytes, identity_state, timing,
         )
+        if upstream.output_repetition_error_event(tracker) is not None:
+            try:
+                await upstream_ws.close(code=1011)
+            except Exception:
+                pass
         state["finalized"] = True
 
     async def finalize_disconnect() -> None:
         if state["finalized"]:
+            return
+        if repetition_error := upstream.output_repetition_error_event(tracker):
+            await finalize_error(AttemptResult(
+                outcome="stream_upstream_error", error_detail=tracker.stream_error_message,
+                error_code=repetition_error["error"]["code"], http_status=503,
+            ))
             return
         timing_snapshot = await persist_terminal(
             "client_disconnected", "client disconnected",
@@ -5622,7 +5635,7 @@ async def _consume_stream(
                     else:
                         err_type = errors.ErrType.API
                     msg = step.message or "stream error"
-                    if _responses_terminal_error_received():
+                    if _responses_terminal_error_received() or step.error_code is not None:
                         await _finalize_terminal_error(
                             err_type,
                             msg,
@@ -5638,7 +5651,7 @@ async def _consume_stream(
                         ingress_protocol,
                         err_type,
                         msg,
-                        code=(
+                        code=step.error_code or (
                             protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
                             if step.outcome == "request_invalid" and _is_context_length_exceeded_error(msg)
                             else None

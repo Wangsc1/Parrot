@@ -7,6 +7,7 @@ semantics in callers while moving reusable WS transport mechanics here.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -18,6 +19,7 @@ from websockets.asyncio.client import connect as AsyncConnect
 from .. import blacklist
 from ..async_owned import await_owned
 from ..protocols import errors as protocol_errors
+from ..protocols.output_repetition import output_repetition_error_event
 from ..openai.recovery import capture_error_advice, WS_RESET_CODES
 from ..protocols.runtime import (
     connection_lifecycle_outcome,
@@ -480,6 +482,9 @@ async def read_until_first_responses_ws_visible_event(
             if on_text_frame is not None:
                 on_text_frame(data)
             tracker.feed_text(data)
+            if repetition_error := output_repetition_error_event(tracker):
+                data = json.dumps(repetition_error, ensure_ascii=False)
+                event_type = "error"
             # response.created proves the upstream accepted and instantiated this
             # logical request, but remains metadata buffered from the client.
             if is_responses_ws_dispatch_commit_event_type(event_type) and not is_responses_ws_visible_event_type(event_type):
@@ -517,7 +522,7 @@ async def read_until_first_responses_ws_visible_event(
                 if getattr(tracker, "request_failed", False):
                     result.outcome = "request_rejected"
                     result.http_status = 400
-                if use_tracker_error_detail:
+                if use_tracker_error_detail or output_repetition_error_event(tracker) is not None:
                     result.error_detail = getattr(tracker, "stream_error_message", None) or data[:2000]
                 else:
                     status, detail = responses_ws_error_detail(data)
@@ -720,6 +725,10 @@ async def read_next_responses_ws_step(
     if isinstance(data, str):
         step.event_type = ws_event_type(data)
         tracker.feed_text(data)
+        if repetition_error := output_repetition_error_event(tracker):
+            data = step.data = json.dumps(repetition_error, ensure_ascii=False)
+            step.event_type = "error"
+            step.error_code = getattr(tracker, "stream_error_code", None)
         if step.event_type in skip_event_types:
             step.skip_downstream = True
             return step

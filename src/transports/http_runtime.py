@@ -21,6 +21,7 @@ from .. import blacklist, log_db, network, upstream
 from ..async_owned import await_owned
 from ..providers import registry as provider_registry
 from ..protocols import errors as protocol_errors
+from ..protocols.output_repetition import OUTPUT_REPETITION_CODE, output_repetition_error_event
 from ..protocols.commit_gate import SseCommitGate
 from ..protocols.runtime import (
     AttemptResult,
@@ -115,6 +116,7 @@ class HttpStreamReadStep:
     message: str | None = None
     err_type: str | None = None
     outcome: str | None = None
+    error_code: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -289,6 +291,7 @@ def _stream_tracker_error_result(
         first_byte_ms=first_byte_ms,
         http_status=response_status,
         error_detail=detail[:2000],
+        error_code=(OUTPUT_REPETITION_CODE if output_repetition_error_event(tracker) is not None else None),
         translator_ctx=translator_ctx,
     )
 
@@ -569,8 +572,9 @@ async def aggregate_stream_as_non_stream_response(
         builder = toolkit["stream_builder"]()
     tracker = toolkit["stream_tracker"]()
     tracker.preserve_incomplete = (translator_ctx or {}).get("response_translator") == "anthropic_to_responses"
-    builder.feed(first_chunk_restored)
     tracker.feed(first_chunk_restored)
+    if output_repetition_error_event(tracker) is None:
+        builder.feed(first_chunk_restored)
     raw_buf.extend(
         first_chunk_restored
         if isinstance(first_chunk_restored, (bytes, bytearray))
@@ -657,8 +661,9 @@ async def aggregate_stream_as_non_stream_response(
                     translator_ctx=translator_ctx,
                 )))
             )
-        builder.feed(restored_chunk)
         tracker.feed(restored_chunk)
+        if output_repetition_error_event(tracker) is None:
+            builder.feed(restored_chunk)
         raw_buf.extend(
             restored_chunk
             if isinstance(restored_chunk, (bytes, bytearray))
@@ -773,6 +778,8 @@ async def _read_until_first_downstream_chunk(
             if not restored:
                 return [], None
         tracker.feed(restored)
+        if repetition_error := output_repetition_error_event(tracker):
+            return [], repetition_error
         builder.feed(restored)
         result = commit_gate.feed(restored)
         upstream.observe_downstream_error(tracker, result.downstream_chunks)
@@ -969,6 +976,7 @@ async def prepare_stream_response_start(
                     connect_ms=connect_ms,
                     first_byte_ms=first_byte_ms,
                     error_detail=json.dumps(pre_visible_error.get("error", pre_visible_error), ensure_ascii=False)[:2000],
+                    error_code=(OUTPUT_REPETITION_CODE if output_repetition_error_event(tracker) is not None else None),
                     translator_ctx=translator_ctx,
                 ))
             )
@@ -1000,6 +1008,13 @@ async def prepare_stream_response_start(
         if relay_filter is not None:
             first_chunk_restored = relay_filter(first_chunk_restored)
         tracker.feed(first_chunk_restored)
+        if repetition_error := output_repetition_error_event(tracker):
+            await close_response_context(ctx)
+            return HttpStreamStartResult(error=_attach_precommit_response(AttemptResult(
+                outcome="upstream_error_json", connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=repetition_error["error"]["message"], error_code=OUTPUT_REPETITION_CODE,
+                translator_ctx=translator_ctx,
+            )))
         builder.feed(first_chunk_restored)
         first_event = toolkit["first_event_parser"](first_chunk_restored)
         if first_event and (
@@ -1132,6 +1147,11 @@ async def read_next_stream_step(
             if not restored:
                 continue
         tracker.feed(restored)
+        if output_repetition_error_event(tracker) is not None:
+            return HttpStreamReadStep(
+                kind="error", err_type="api_error", outcome="stream_upstream_error",
+                message=tracker.stream_error_message, error_code=OUTPUT_REPETITION_CODE,
+            )
         builder.feed(restored)
         if stream_translator is not None:
             downstream_chunks = list(stream_translator.feed(restored))
