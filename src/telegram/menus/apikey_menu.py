@@ -50,6 +50,23 @@ from .sort_primitives import (
 _CONTROL = ApiKeyControl()
 
 
+def _clear_rekey_input(chat_id: int) -> None:
+    """Leave only the custom rekey flow; preserve another menu's state."""
+    state = states.get_state(chat_id)
+    if state and state.get("action") == "ak_rekey_input":
+        states.pop_state_if_current(chat_id, state["data"])
+
+
+def before_callback(chat_id: int, data: str) -> None:
+    """Navigation leaves the rekey prompt before any early menu return."""
+    _clear_rekey_input(chat_id)
+
+
+def before_command(chat_id: int, text: str) -> None:
+    if text.startswith("/") and text.split()[0].split("@", 1)[0].lower() != "/cancel":
+        _clear_rekey_input(chat_id)
+
+
 def _control_context(chat_id: int = 0) -> ManagementContext:
     return ManagementContext(
         request_id=f"telegram-apikey:{chat_id}",
@@ -1768,6 +1785,8 @@ def on_sort_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
 # ─── 路由分发 ─────────────────────────────────────────────────────
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
+    # Also cover direct adapter callers; the real bot invokes this before routing.
+    before_callback(chat_id, data)
     if data == "menu:apikey":
         show(chat_id, message_id, cb_id)
         return True
@@ -1908,6 +1927,11 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
     """返回 True 表示本模块消费了该输入。"""
+    if (action == "ak_rekey_input" and text.startswith("/")
+            and text.split()[0].split("@", 1)[0].lower() == "/cancel"):
+        _clear_rekey_input(chat_id)
+        ui.send(chat_id, "✅ 已取消自定义新 key。发送 /keys 返回 API Key 列表。")
+        return True
     if action.startswith(_LIMIT_STATE_PREFIX):
         on_limit_input(chat_id, action, text)
         return True
