@@ -109,9 +109,12 @@ def _operation_keyboard(chat_id: int, operation_id: str, back_callback: str) -> 
 def _metadata_sync_render(
     chat_id: int, back_callback: str = "mc:list",
 ) -> tuple[str, dict]:
+    ctx = menu._ctx(chat_id)
     page = menu._CONTROL.mapping.search_catalog(
-        menu._ctx(chat_id), provider=None, query=None, sort="name", page=1, page_size=1,
+        ctx, provider=None, query=None, sort="name", page=1, page_size=1,
     )
+    # Full sync is guarded by the metadata CAS domain, not the catalog page token.
+    sync_revision = menu._CONTROL.mapping.get_metadata_revision(ctx)
     metadata_callback = menu._freeze(
         chat_id, "metadata_sync", back_callback=back_callback,
     )
@@ -123,7 +126,7 @@ def _metadata_sync_render(
     ]
     rows = [
         [ui.btn("同步全部元数据", menu._freeze(
-            chat_id, "sync_full", revision=page.revision,
+            chat_id, "sync_full", revision=sync_revision,
             page_back=metadata_callback,
         ))],
         [ui.btn("返回模型列表", back_callback)],
@@ -134,9 +137,21 @@ def _metadata_sync_render(
 def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
     name, data = action.name, action.data
     if name == "metadata_sync":
-        menu._show_rendered(chat_id, message_id, cb_id, lambda: menu._metadata_sync_render(
-            chat_id, str(data.get("back_callback") or "mc:list"),
-        ))
+        # Send a separate page: keep the original list intact instead of relying
+        # on clients displaying an in-place edit of the model-list message.
+        try:
+            text, kb = menu._metadata_sync_render(
+                chat_id, str(data.get("back_callback") or "mc:list"),
+            )
+        except ManagementError as exc:
+            menu._answer_error(cb_id, exc)
+            return True
+        ui.answer_cb(cb_id)
+        ui.api("sendMessage", {
+            "chat_id": chat_id,
+            "text": ui._strip_html_tags(text),
+            "reply_markup": kb,
+        })
         return True
 
     if name == "operation":
