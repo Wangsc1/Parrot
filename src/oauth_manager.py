@@ -2178,7 +2178,8 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
             account_key, usage, threshold=threshold, fresh=False,
         )
     utils = extract_utils_percent(usage)
-    if not any(u is not None and u >= threshold for u in utils) and not _explicit_openai_wham_limit(usage):
+    wham_limit = _cached_openai_wham_limit(account_key, usage, threshold, row=row)
+    if not any(u is not None and u >= threshold for u in utils) and not wham_limit:
         return {"action": "cached_below_threshold", "utils": utils,
                 "any_over": False, "hit_windows": [],
                 "disabled_until": None}
@@ -2277,6 +2278,55 @@ def _explicit_openai_wham_limit(usage: dict, *, allow_credits: bool = False) -> 
     return (_openai_credit_hard_limit(usage)
             or (not allow_credits and
                 (openai.get("allowed") is False or openai.get("limit_reached") is True)))
+
+
+def _cached_openai_wham_limit(account_key: str, usage: dict, threshold: float,
+                              *, row: dict | None = None, allow_credits: bool = False) -> bool:
+    """Retire an old subscription gate only after complete newer low windows.
+
+    A merged cache can contain new response percentages and older WHAM flags.
+    Use each Codex window's own clock, never the row-wide clock refreshed by
+    unrelated credit/reserve fragments. Hard spend/credit caps stay authoritative;
+    real request refusals remain independently checked by the Codex error gate.
+    """
+    if not _explicit_openai_wham_limit(usage, allow_credits=allow_credits):
+        return False
+    if _openai_credit_hard_limit(usage):
+        return True
+    row = row if row is not None else state_db.quota_load(account_key) or {}
+    active_ms = _ms_timestamp(
+        row.get("codex_active_observed_at")
+        if row.get("codex_active_observed_at") is not None else row.get("fetched_at")
+    )
+    if active_ms is None:
+        return True
+    try:
+        active_usage = json.loads(row.get("raw_data") or "{}")
+    except (TypeError, ValueError):
+        return True
+    active_windows = _fresh_wham_window_utils(active_usage)
+    if not any(value is not None for value in active_windows.values()):
+        return True
+    # A global flag with another metered family is not solely a subscription gate.
+    if any(item.get("limit_id") not in (None, "", "codex")
+           for item in (active_usage.get("openai") or {}).get("rate_limits") or []
+           if isinstance(item, dict)):
+        return True
+    required = {"five_hour", "seven_day"} | {
+        name for name, value in active_windows.items() if value is not None
+    }
+    windows = _codex_window_candidates(account_key, row)
+    now_ms = state_db.now_ms()
+    for name in required:
+        candidates = windows.get(name) or []
+        if not candidates or any(
+            item["observed_ms"] is None or item["observed_ms"] <= active_ms
+            or item["pct"] >= threshold
+            or (item["reset_ms"] is not None and item["reset_ms"] <= now_ms)
+            for item in candidates
+        ):
+            return True
+    return False
 
 
 def openai_plan_workspace_label(acc: dict | None) -> str:
@@ -3154,7 +3204,10 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
     if use_credits:
         hit_windows = []
         any_over = False
-    wham_limit = provider == "openai" and _explicit_openai_wham_limit(usage, allow_credits=use_credits)
+    wham_limit = provider == "openai" and (
+        _explicit_openai_wham_limit(usage, allow_credits=use_credits) if fresh else
+        _cached_openai_wham_limit(account_key, usage, threshold, allow_credits=use_credits)
+    )
     if wham_limit:
         spend = (usage.get("openai") or {}).get("spend_control") or {}
         hit_windows.append("Workspace spend limit" if spend.get("reached") is True else "WHAM limit")
