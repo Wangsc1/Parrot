@@ -121,7 +121,7 @@ def _metadata_sync_render(
     lines = [
         "🧬 <b>元数据同步</b>", "",
         f"当前公共目录：<code>{page.total} 条</code>",
-        f"目录版本：<code>{ui.escape_html(page.revision)}</code>", "",
+        "",
         "同步全部会刷新公共目录并重新匹配模型；人工匹配、字段手工值及来源单独匹配保持。",
     ]
     rows = [
@@ -137,21 +137,9 @@ def _metadata_sync_render(
 def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
     name, data = action.name, action.data
     if name == "metadata_sync":
-        # Send a separate page: keep the original list intact instead of relying
-        # on clients displaying an in-place edit of the model-list message.
-        try:
-            text, kb = menu._metadata_sync_render(
-                chat_id, str(data.get("back_callback") or "mc:list"),
-            )
-        except ManagementError as exc:
-            menu._answer_error(cb_id, exc)
-            return True
-        ui.answer_cb(cb_id)
-        ui.api("sendMessage", {
-            "chat_id": chat_id,
-            "text": ui._strip_html_tags(text),
-            "reply_markup": kb,
-        })
+        menu._show_rendered(chat_id, message_id, cb_id, lambda: menu._metadata_sync_render(
+            chat_id, str(data.get("back_callback") or "mc:list"),
+        ))
         return True
 
     if name == "operation":

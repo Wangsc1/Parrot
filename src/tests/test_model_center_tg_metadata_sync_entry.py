@@ -37,37 +37,39 @@ def test_full_sync_button_uses_metadata_not_catalog_revision(sync_env):
     action = menu._thaw(7, _button(kb, "同步全部元数据")["callback_data"].split(":")[-1])
     assert action.data["revision"] == "metadata-1"
     assert action.data["revision"] != control.mapping.catalog_revision
-    assert "cat1" in text  # Catalog label remains a catalog label.
+    assert "cat1" not in text and "metadata-1" not in text
+    assert "目录版本" not in text  # Revisions belong in callback state, not the UI.
+    assert "当前公共目录" in text
     assert _button(kb, "返回模型列表")["callback_data"] == "mc:list"
 
 
-def test_entry_sends_plaintext_new_page_without_editing_list(sync_env):
+def test_entry_keeps_original_navigation_without_exposing_revision(sync_env):
     _, edits, answers, requests = sync_env
     _, kb = menu.render(7)
     menu.handle_callback(7, 10, "open", _button(kb, "同步元数据")["callback_data"])
-    assert len(requests) == 1
-    method, data = requests[0]
-    assert method == "sendMessage" and data["chat_id"] == 7
-    assert "parse_mode" not in data
-    assert "元数据同步" in data["text"] and "人工匹配" in data["text"]
-    assert "<b>" not in data["text"] and "<code>" not in data["text"]
-    assert len(data["reply_markup"]["inline_keyboard"]) == 2
-    assert edits == [] and answers == [("open", None, False)]
+    assert requests == []  # No ad-hoc new-message transport.
+    assert len(edits) == 1
+    chat, message, text, keyboard = edits[0]
+    assert chat == 7 and message == 10
+    assert "元数据同步" in text and "人工匹配" in text
+    assert "目录版本" not in text and "metadata-1" not in text and "cat1" not in text
+    assert len(keyboard["inline_keyboard"]) == 2
+    assert answers == [("open", None, False)]
 
 
-def test_new_page_button_starts_full_sync_with_frozen_metadata_revision(sync_env):
-    control, _, _, requests = sync_env
+def test_page_button_starts_full_sync_with_frozen_metadata_revision(sync_env):
+    control, edits, _, _ = sync_env
     callback = menu._freeze(7, "metadata_sync", back_callback="mc:list")
     menu.handle_callback(7, 10, "open", callback)
-    kb = requests[-1][1]["reply_markup"]
-    menu.handle_callback(7, 11, "start", _button(kb, "同步全部元数据")["callback_data"])
+    kb = edits[-1][3]
+    menu.handle_callback(7, 10, "start", _button(kb, "同步全部元数据")["callback_data"])
     call = control.mapping.sync_calls[-1]
     assert call["mode"].value == "full" and call["targets"] == ()
     assert call["source"] is None and call["refresh_catalog"] is True
     assert call["expected_revision"] == "metadata-1"
 
 
-def test_stale_new_page_keeps_revision_conflict_protection(sync_env, monkeypatch):
+def test_stale_page_keeps_revision_conflict_protection(sync_env, monkeypatch):
     control, _, answers, _ = sync_env
     _, kb = menu._metadata_sync_render(7)
     control.mapping.metadata_revision = "metadata-2"

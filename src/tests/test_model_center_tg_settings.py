@@ -290,12 +290,6 @@ def env(monkeypatch):
     monkeypatch.setattr(ui, "send", lambda chat, text, reply_markup=None, parse_mode="HTML": sends.append((chat, text, reply_markup)))
     monkeypatch.setattr(ui, "send_result", lambda chat, text, **kwargs: sends.append((chat, text, kwargs)))
 
-    def api(method, data):
-        assert method == "sendMessage" and "parse_mode" not in data
-        sends.append((data["chat_id"], data["text"], data["reply_markup"]))
-        return {"ok": True, "result": {"message_id": 11}}
-
-    monkeypatch.setattr(ui, "api", api)
     menu.reset_for_tests()
     states.clear_all()
     yield control, edits, answers, sends
@@ -393,7 +387,7 @@ def test_image_panel_does_not_use_old_list_filters(env):
 
 
 def test_metadata_round_trip_preserves_existing_cross_page_selection(env):
-    _control, edits, _answers, sends = env
+    _control, edits, _answers, _sends = env
     state = menu._session(7)
     state.tab = "chat"
     state.page = 2
@@ -402,10 +396,9 @@ def test_metadata_round_trip_preserves_existing_cross_page_selection(env):
     state.selected_resources = {"model-01": "rk-1", "model-09": "rk-9"}
     _text, list_kb = menu.render(7)
     menu.handle_callback(7, 10, "settings", _button(list_kb, "同步元数据")["callback_data"])
-    assert edits == []  # The original model list remains untouched.
-    settings_kb = sends[-1][2]
+    settings_kb = edits[-1][3]
     menu.handle_callback(
-        7, 11, "back", _button(settings_kb, "返回模型列表")["callback_data"],
+        7, 10, "back", _button(settings_kb, "返回模型列表")["callback_data"],
     )
     assert state.page == 2 and state.multiple is True
     assert state.selected == ["model-01", "model-09"]
