@@ -2118,9 +2118,10 @@ def usage_from_quota_row(row: dict) -> dict:
     reached_ms = row.get("codex_rate_limit_reached_at")
     if (reached_ms if reached_ms is not None else passive_ms) >= active_ms:
         reached = passive_reached or active_reached
-    elif "rate_limit_reached_type" in raw_openai:
-        # A newer official WHAM read is authoritative, including an explicit
-        # null: an older response-header refusal must not revive after reset.
+    elif active_reached or raw_openai.get("rate_limit_reached_type_explicit_null") is True:
+        # A newer refusal remains authoritative. Clearing one requires literal
+        # upstream null provenance: missing/invalid values and legacy cached
+        # None were also normalized to null, so key presence is not evidence.
         reached = active_reached
     else:
         reached = passive_reached

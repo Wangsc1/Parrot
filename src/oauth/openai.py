@@ -963,6 +963,13 @@ def normalize_wham_usage(payload: dict) -> dict:
             "rate_limit_reached_type": _rate_limit_reached_kind(
                 payload.get("rate_limit_reached_type") if isinstance(payload, dict) else None
             ),
+            # Normalization also maps missing/invalid values to None. Only a
+            # literal upstream null can discharge an older cached refusal.
+            "rate_limit_reached_type_explicit_null": (
+                isinstance(payload, dict)
+                and "rate_limit_reached_type" in payload
+                and payload["rate_limit_reached_type"] is None
+            ),
             "credits": {
                 "has_credits": credits.get("has_credits")
                 if isinstance(credits.get("has_credits"), bool) else None,
