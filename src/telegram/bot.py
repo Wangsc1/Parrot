@@ -581,10 +581,11 @@ def _handle_callback(cb: dict) -> None:
         zhipu_oauth_menu.handle_callback(chat_id, msg_id, cb_id, data)
         return
 
-    # Revoke only model-center input before any early navigation return.
+    # Leave owned input flows before any early navigation return.
     model_center_menu.before_callback(chat_id, data)
     search_menu.before_callback(chat_id, data)
     zhipu_oauth_menu.before_callback(chat_id, data)
+    apikey_menu.before_callback(chat_id, data)
     # 任意新 callback 都让该消息此前的后台统计更新失效，防止旧页面覆盖新菜单。
     menu_cache.begin_view(chat_id, msg_id)
 
@@ -696,6 +697,7 @@ def _handle_message(msg: dict) -> None:
     model_center_menu.before_command(chat_id, text)
     search_menu.before_command(chat_id, text)
     zhipu_oauth_menu.before_command(chat_id, text)
+    apikey_menu.before_command(chat_id, text)
     # 状态机输入
     state = states.get_state(chat_id)
     print(f"[tg] state for {chat_id}: {_summarize_state(state)}")        # DEBUG
