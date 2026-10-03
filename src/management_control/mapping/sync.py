@@ -39,6 +39,11 @@ class MetadataSyncMixin:
     def _metadata_revision(cls, inventory: list[Any] | None = None) -> str:
         return stable_revision(cls._metadata_snapshot(inventory))
 
+    def get_metadata_revision(self, context: ManagementContext) -> str:
+        """Return the CAS token accepted by ``start_metadata_sync``."""
+        self._read(context)
+        return self._metadata_revision()
+
     def perform_metadata_sync(self, context: ManagementContext | None = None) -> dict[str, Any]:
         actual = self._write(context)
         with self._sync_lock:

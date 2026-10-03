@@ -218,6 +218,7 @@ class _SettingsControl(_Control):
         self.mapping.compression_revision = "c1"
         self.mapping.compression_calls = []
         self.mapping.catalog_revision = "cat1"
+        self.mapping.get_metadata_revision = lambda _ctx: "metadata1"
         self.mapping.get_compression = lambda _ctx: (
             self.mapping.compression, self.mapping.compression_revision,
         )
@@ -288,6 +289,7 @@ def env(monkeypatch):
     monkeypatch.setattr(ui, "answer_cb", lambda cb, text=None, show_alert=False: answers.append((cb, text, show_alert)))
     monkeypatch.setattr(ui, "send", lambda chat, text, reply_markup=None, parse_mode="HTML": sends.append((chat, text, reply_markup)))
     monkeypatch.setattr(ui, "send_result", lambda chat, text, **kwargs: sends.append((chat, text, kwargs)))
+
     menu.reset_for_tests()
     states.clear_all()
     yield control, edits, answers, sends

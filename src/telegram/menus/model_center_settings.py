@@ -109,21 +109,24 @@ def _operation_keyboard(chat_id: int, operation_id: str, back_callback: str) -> 
 def _metadata_sync_render(
     chat_id: int, back_callback: str = "mc:list",
 ) -> tuple[str, dict]:
+    ctx = menu._ctx(chat_id)
     page = menu._CONTROL.mapping.search_catalog(
-        menu._ctx(chat_id), provider=None, query=None, sort="name", page=1, page_size=1,
+        ctx, provider=None, query=None, sort="name", page=1, page_size=1,
     )
+    # Full sync is guarded by the metadata CAS domain, not the catalog page token.
+    sync_revision = menu._CONTROL.mapping.get_metadata_revision(ctx)
     metadata_callback = menu._freeze(
         chat_id, "metadata_sync", back_callback=back_callback,
     )
     lines = [
         "🧬 <b>元数据同步</b>", "",
         f"当前公共目录：<code>{page.total} 条</code>",
-        f"目录版本：<code>{ui.escape_html(page.revision)}</code>", "",
+        "",
         "同步全部会刷新公共目录并重新匹配模型；人工匹配、字段手工值及来源单独匹配保持。",
     ]
     rows = [
         [ui.btn("同步全部元数据", menu._freeze(
-            chat_id, "sync_full", revision=page.revision,
+            chat_id, "sync_full", revision=sync_revision,
             page_back=metadata_callback,
         ))],
         [ui.btn("返回模型列表", back_callback)],
