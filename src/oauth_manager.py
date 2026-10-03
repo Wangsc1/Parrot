@@ -1355,6 +1355,11 @@ async def _fetch_openai_usage(account_key: str, *, access_token: str | None = No
         )
         usage = await openai_provider.fetch_wham_usage(access_token, **kwargs)
         codex = usage.get("openai") if isinstance(usage, dict) else None
+        if isinstance(codex, dict):
+            # Use the request's conservative observation boundary, not the later
+            # reset-card enrichment / cache-save time, for quota/refusal ordering.
+            codex = {**codex, "quota_observed_at": started_at}
+            usage = {**usage, "openai": codex}
         credits = codex.get("credits") if isinstance(codex, dict) else None
         if isinstance(credits, dict):
             observed_at = state_db.now_ms()
@@ -1945,6 +1950,7 @@ def flatten_usage(usage: dict) -> dict:
 
     return {
         "fetched_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+        "codex_active_observed_at": (usage.get("openai") or {}).get("quota_observed_at"),
         "five_hour_util": _util_pct(fh),
         "five_hour_reset": fh.get("resets_at"),
         "seven_day_util": _util_pct(sd),
@@ -2113,24 +2119,14 @@ def usage_from_quota_row(row: dict) -> dict:
             codex_credits[key] = value
             credits_observed_at[key] = credit_times.get(key, passive_ms)
             credits_sources[key] = "response"
-    passive_reached = row.get("codex_rate_limit_reached_type")
-    active_reached = raw_openai.get("rate_limit_reached_type")
-    reached_ms = row.get("codex_rate_limit_reached_at")
-    if (reached_ms if reached_ms is not None else passive_ms) >= active_ms:
-        reached = passive_reached or active_reached
-    elif active_reached or raw_openai.get("rate_limit_reached_type_explicit_null") is True:
-        # A newer refusal remains authoritative. Clearing one requires literal
-        # upstream null provenance: missing/invalid values and legacy cached
-        # None were also normalized to null, so key presence is not evidence.
-        reached = active_reached
-    else:
-        reached = passive_reached
+    reached = state_db.quota_openai_refusal(row)
 
     result = {
         "five_hour": _block(row.get("five_hour_util"), row.get("five_hour_reset")),
         "seven_day": _block(row.get("seven_day_util"), row.get("seven_day_reset")),
         "openai": {
             **raw_openai,
+            "quota_observed_at": active_ms,
             "thirty_day": _block(row.get("thirty_day_util"), row.get("thirty_day_reset")),
             "rate_limits": codex_rate_limits,
             "additional_rate_limits": [
@@ -2250,6 +2246,7 @@ def openai_credits_usable(account_key: str, usage: dict | None = None,
     cached_usage = usage_from_quota_row(row)
     cached = cached_usage.get("openai") or {}
     block = dict((usage.get("openai") or {}) if usage is not None else cached)
+    block["rate_limit_reached_type"] = state_db.quota_openai_refusal(row, usage)
     credits = {k: v for k, v in (block.get("credits") or {}).items() if v is not None}
     if usage is not None and not credits:
         return False
@@ -2298,6 +2295,8 @@ def _cached_openai_wham_limit(account_key: str, usage: dict, threshold: float,
     if _openai_credit_hard_limit(usage):
         return True
     row = row if row is not None else state_db.quota_load(account_key) or {}
+    if row.get("codex_wham_gate_retired") is True:
+        return False
     active_ms = _ms_timestamp(
         row.get("codex_active_observed_at")
         if row.get("codex_active_observed_at") is not None else row.get("fetched_at")
@@ -2316,9 +2315,14 @@ def _cached_openai_wham_limit(account_key: str, usage: dict, threshold: float,
            for item in (active_usage.get("openai") or {}).get("rate_limits") or []
            if isinstance(item, dict)):
         return True
-    required = {"five_hour", "seven_day"} | {
-        name for name, value in active_windows.items() if value is not None
+    # WHAM supports 5h+7d, 5h+30d and 7d+30d. Retain known omitted
+    # windows, but do not invent a weekly window for a complete monthly pair.
+    required = {
+        name for name, value in active_windows.items()
+        if value is not None or row.get(f"{name}_util") is not None
     }
+    if len(required) < 2:
+        required |= {"five_hour", "seven_day"}
     windows = _codex_window_candidates(account_key, row)
     now_ms = state_db.now_ms()
     for name in required:
@@ -2330,7 +2334,12 @@ def _cached_openai_wham_limit(account_key: str, usage: dict, threshold: float,
             for item in candidates
         ):
             return True
-    return False
+    try:
+        # A later expiry is not new refusal evidence. Remember that this exact
+        # old gate was disproven; a new active snapshot resets the marker.
+        return not state_db.quota_retire_openai_wham_gate(account_key, row)
+    except Exception:
+        return True
 
 
 def openai_plan_workspace_label(acc: dict | None) -> str:
@@ -3147,6 +3156,14 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
     if canonical:
         account_key = canonical
     provider = provider_of(account_key)
+    if provider == "openai" and fresh:
+        # Fresh /usage can finish after a newer response refusal, or omit a
+        # field whose last explicit value is still authoritative.
+        row = state_db.quota_load(account_key) or {}
+        usage = {**usage, "openai": {
+            **(usage.get("openai") or {}),
+            "rate_limit_reached_type": state_db.quota_openai_refusal(row, usage),
+        }}
     utils = extract_utils_percent(usage)
     # Fable is a model-scoped weekly sub-cap.  It is evaluated separately below
     # and must never participate in the account-level disable decision.

@@ -306,7 +306,7 @@ def provider_usage_save_error(account_id:str,adapter_id:str,error:str,retry_afte
     _mut("api_provider_usage_cache",op)
 def provider_usage_delete(account_id:str)->None:_mut("api_provider_usage_cache",lambda d:d.pop(account_id,None))
 
-_QUOTA_COLUMNS = ("account_key","email","fetched_at","last_passive_update_at","five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data","codex_primary_used_pct","codex_primary_reset_sec","codex_primary_reset_at","codex_primary_window_min","codex_secondary_used_pct","codex_secondary_reset_sec","codex_secondary_reset_at","codex_secondary_window_min","codex_primary_over_secondary_pct","codex_window_observations","codex_rate_limits","codex_credits_has_credits","codex_credits_unlimited","codex_credits_balance","codex_rate_limit_reached_type","codex_active_observed_at","codex_credits_observed_at","codex_rate_limit_reached_at","codex_usage_failed_at")
+_QUOTA_COLUMNS = ("account_key","email","fetched_at","last_passive_update_at","five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data","codex_primary_used_pct","codex_primary_reset_sec","codex_primary_reset_at","codex_primary_window_min","codex_secondary_used_pct","codex_secondary_reset_sec","codex_secondary_reset_at","codex_secondary_window_min","codex_primary_over_secondary_pct","codex_window_observations","codex_rate_limits","codex_credits_has_credits","codex_credits_unlimited","codex_credits_balance","codex_rate_limit_reached_type","codex_active_observed_at","codex_credits_observed_at","codex_rate_limit_reached_at","codex_usage_failed_at","codex_wham_reached_type","codex_wham_reached_at","codex_wham_gate_retired")
 def _quota_defaults(row:dict[str,Any])->dict[str,Any]:return {column:row.get(column) for column in _QUOTA_COLUMNS}
 
 def _quota_display_email(account_key:str)->str:
@@ -339,10 +339,84 @@ def _quota_write(account_key:str, operation, *, expected_state_key:str|None=None
         resolved=target[len("oauth:"):] if target.startswith("oauth:") else account_key
         return _mut("oauth_quota_cache",lambda d:operation(d,resolved))
 
+def _quota_wham_block(raw_data: str | None) -> dict:
+    try:
+        payload = json.loads(raw_data or "{}")
+        block = payload.get("openai") if isinstance(payload, dict) else None
+        return block if isinstance(block, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _quota_merge_wham_refusal(row: dict, block: dict, observed_at: int) -> None:
+    """Remember explicit field observations; omitted/invalid fields are not clears."""
+    if block.get("source") != "wham_usage":
+        return
+    kind = block.get("rate_limit_reached_type")
+    if not kind and block.get("rate_limit_reached_type_explicit_null") is not True:
+        return
+    previous_at = row.get("codex_wham_reached_at")
+    if (previous_at is None or observed_at > previous_at
+            or (observed_at == previous_at and kind)):
+        row["codex_wham_reached_type"] = kind or None
+        row["codex_wham_reached_at"] = observed_at
+
+
+def _quota_remember_wham_refusal(row: dict) -> None:
+    # Lazy compatibility for caches written before the independent field clock.
+    observed = row.get("codex_active_observed_at")
+    if observed is None:
+        observed = row.get("fetched_at") or 0
+    _quota_merge_wham_refusal(row, _quota_wham_block(row.get("raw_data")), int(observed))
+
+
+def quota_openai_refusal(row: dict, usage: dict | None = None) -> str | None:
+    """Select the latest explicit refusal/clear, with refusal winning clock ties."""
+    effective = dict(row)
+    _quota_remember_wham_refusal(effective)
+    if usage is not None:
+        block = usage.get("openai") or {}
+        observed = block.get("quota_observed_at")
+        _quota_merge_wham_refusal(effective, block, int(observed if observed is not None else now_ms()))
+    active_at = effective.get("codex_wham_reached_at")
+    passive_at = row.get("codex_rate_limit_reached_at")
+    if passive_at is None:
+        passive_at = row.get("last_passive_update_at") or 0
+    passive = row.get("codex_rate_limit_reached_type")
+    if passive and (active_at is None or passive_at >= active_at):
+        return passive
+    return effective.get("codex_wham_reached_type")
+
+
+def quota_retire_openai_wham_gate(account_key: str, expected: dict) -> bool:
+    """Retire only the exact cache evaluated by the caller, never a newer gate."""
+    def op(d, target):
+        row = d.get(target)
+        if row is None or dict(row) != expected:
+            return False
+        row["codex_wham_gate_retired"] = True
+        return True
+    return bool(_quota_write(account_key, op))
+
+
 def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected_state_key:str|None=None)->None:
     cols=("five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data")
     def op(d,target):
         row=_quota_defaults(dict(d.get(target) or {}))
+        active_at = data.get("codex_active_observed_at")
+        if active_at is None:
+            active_at = data.get("fetched_at", now_ms())
+        active_at = int(active_at)
+        if target.startswith("openai:"):
+            _quota_remember_wham_refusal(row)
+            _quota_merge_wham_refusal(row, _quota_wham_block(data.get("raw_data")), active_at)
+            # A slow earlier request may add a missing explicit field, but must
+            # not replace a later snapshot/gate with its older windows or flags.
+            previous_at = row.get("codex_active_observed_at")
+            if previous_at is not None and active_at < previous_at:
+                d[target] = row
+                return
+            row["codex_wham_gate_retired"] = False
         updates={k:data.get(k) for k in cols}
         if target.startswith(("openai:", "claude:")):
             # A partial active read is not evidence that an omitted window
@@ -356,7 +430,7 @@ def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected
         row.update({"account_key":target,"email":email or _quota_display_email(target),"fetched_at":int(data.get("fetched_at",now_ms()))})
         row.update(updates)
         if target.startswith("openai:") or row.get("codex_window_observations"):
-            row["codex_active_observed_at"]=row["fetched_at"]
+            row["codex_active_observed_at"]=active_at
         if target.startswith("openai:"):
             row["codex_usage_failed_at"]=None
         d[target]=row
