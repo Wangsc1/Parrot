@@ -29,6 +29,7 @@ callback_data 前缀：`ak:...`
 from __future__ import annotations
 
 import math
+import re
 import secrets  # kept as the shared randomness module patched by frozen tests
 from datetime import datetime, timezone
 from typing import Optional
@@ -63,7 +64,12 @@ def before_callback(chat_id: int, data: str) -> None:
 
 
 def before_command(chat_id: int, text: str) -> None:
-    if text.startswith("/") and text.split()[0].split("@", 1)[0].lower() != "/cancel":
+    # Reserve command-shaped tokens, not every slash-prefixed valid key.
+    # Telegram command names contain 1-32 letters, digits or underscores;
+    # custom keys may additionally contain /, +, =, -, . and ~.
+    token = text.split(maxsplit=1)[0] if text.startswith("/") else ""
+    if (re.fullmatch(r"/[A-Za-z0-9_]{1,32}(?:@[A-Za-z0-9_]+)?", token)
+            and token.split("@", 1)[0].lower() != "/cancel"):
         _clear_rekey_input(chat_id)
 
 

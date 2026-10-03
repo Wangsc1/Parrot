@@ -114,11 +114,27 @@ def test_rejected_plain_key_retains_retry_state(rekey):
     assert modules["config"].get()["apiKeys"]["alpha"]["allowedModels"] == ["m1"]
 
 
-def test_unknown_long_command_is_not_saved_as_key(rekey):
+@pytest.mark.parametrize("command", [
+    "/unknown_command", "/unknown_command@TestBot", "/unknown_command argument",
+])
+def test_unknown_long_command_is_not_saved_as_key(rekey, command):
     modules, recorder, short, views, before = rekey
-    message("/unknown-command")
+    message(command)
     assert states.get_state(42) is None
     assert modules["config"].get()["apiKeys"] == before
+
+
+@pytest.mark.parametrize("api_key", [
+    "/abc+/=123", "/settings+/=123", "/abc-def123", "/abc.def123", "/abc/def123",
+])
+def test_slash_prefixed_non_command_key_is_saved(rekey, api_key):
+    modules, recorder, short, views, before = rekey
+    assert apikey_menu._validate_custom_key(api_key, []) is None
+    message(api_key)
+    assert states.get_state(42) is None
+    entry = modules["config"].get()["apiKeys"]["alpha"]
+    for field, value in before["alpha"].items():
+        assert entry[field] == (api_key if field == "key" else value)
 
 
 @pytest.mark.parametrize("action", ["ak_add_key_input", "ak_sort", "ak_perm", "other_input"])
