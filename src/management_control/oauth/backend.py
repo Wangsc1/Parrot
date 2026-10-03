@@ -110,6 +110,7 @@ class OAuthBackend:
         display_name: str | None = None,
         enabled: bool | None = None,
         max_concurrent: int | None = None,
+        allow_credits: bool | None = None,
     ) -> dict:
         def mutate(account: dict) -> None:
             if display_name is not None:
@@ -124,6 +125,8 @@ class OAuthBackend:
                 account.pop("quota_observation", None)
             if max_concurrent is not None:
                 account["maxConcurrent"] = max(0, int(max_concurrent or 0))
+            if allow_credits is not None:
+                account["allowCredits"] = allow_credits
 
         return oauth_manager.mutate_account_if_unchanged(
             account_id, expected_account, mutate,

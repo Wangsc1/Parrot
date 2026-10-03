@@ -3581,7 +3581,9 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     if prov == "claude":
         rows.append([ui.btn("♻️ 官方额度重置/状态", f"oa:claude_reset_ask:{payload}")])
     if prov == "openai":
-        rows.append([ui.btn("♻️ 重置额度", f"oa:reset_quota_ask:{payload}")])
+        credit_mark = "✅" if acc.get("allowCredits") is True else "⬜"
+        rows.append([ui.btn("♻️ 重置额度", f"oa:reset_quota_ask:{payload}"),
+                     ui.btn(f"{credit_mark} 允许使用积分", f"oa:credits:{payload}")])
     elif acc.get("disabled_reason") == "quota":
         # Context-only recovery action; it does not disturb the normal fixed rows.
         rows.append([ui.btn("♻️ 清本地配额禁用", f"oa:reset_quota:{payload}")])
@@ -4842,6 +4844,28 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int =
         ui.answer_cb(cb_id, "已启用")
 
     _edit_cached_detail(chat_id, message_id, ak, page, filter_key)
+
+
+def on_toggle_credits(chat_id: int, message_id: int, cb_id: str, short: str,
+                      page: int = 1, filter_key: str = _FILTER_ALL) -> None:
+    ak = _account_key_from_short(short)
+    if ak is None:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    acc = oauth_control.account_snapshot(ak)
+    if acc is None or oauth_control.provider_of_snapshot(ak) != "openai":
+        ui.answer_cb(cb_id, "仅 OpenAI 账户支持此设置")
+        return
+    # Acknowledge before the zero-token WHAM refresh, which may take seconds.
+    ui.answer_cb(cb_id, "正在切换积分设置并刷新额度…")
+    try:
+        result = oauth_control.toggle_openai_credits(_management_context(chat_id), ak)
+    except Exception:
+        ui.send(chat_id, "❌ 积分设置切换失败，请刷新详情后重试。")
+        return
+    _edit_cached_detail(chat_id, message_id, ak, page, filter_key)
+    if result.get("error"):
+        ui.send(chat_id, "⚠️ 积分开关已保存，但额度刷新失败；稍后刷新额度或等待自动检查。")
 
 
 # ─── 删除（二次确认） ─────────────────────────────────────────────
@@ -7197,6 +7221,10 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
                    "claude_reset_confirm": claude_reset_menu.confirm,
                    "claude_reset_execute": claude_reset_menu.execute}[action]
         handler(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
+        return True
+    if data.startswith("oa:credits:"):
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_toggle_credits(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:reset_quota_ask:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])

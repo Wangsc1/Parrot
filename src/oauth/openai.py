@@ -959,6 +959,7 @@ def normalize_wham_usage(payload: dict) -> dict:
             "allowed": rate.get("allowed"),
             "limit_reached": rate.get("limit_reached"),
             "spend_control": spend,
+            "overage_limit_reached": credits.get("overage_limit_reached") is True,
             "rate_limit_reached_type": _rate_limit_reached_kind(
                 payload.get("rate_limit_reached_type") if isinstance(payload, dict) else None
             ),

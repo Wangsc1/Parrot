@@ -190,6 +190,16 @@ def _maybe_record_codex_snapshot(
         components.update(f"credits:{key}" for key, value in credits.items() if value is not None)
         if snap.get("rate_limit_reached_type") is not None:
             components.add("reached")
+        # Do not retain an older positive credit sample for 30s after depletion.
+        # Positive balances still use normal sampling; only terminal credit
+        # facts bypass the throttle for opted-in accounts.
+        credit_depleted = credits.get("has_credits") is False
+        try:
+            balance = float(credits["balance"])
+            credit_depleted |= balance <= 0
+        except (KeyError, TypeError, ValueError):
+            pass
+        urgent_credits = credit_depleted and (oauth_manager.get_account(account_key) or {}).get("allowCredits") is True
         with _codex_snapshot_lock:
             last = _codex_snapshot_last.get(account_key)
             clocks = _codex_snapshot_family_last.get(account_key, {}) if last is not None else {}
@@ -198,6 +208,8 @@ def _maybe_record_codex_snapshot(
                 if key not in clocks or last is None
                 or now - min(last, clocks[key]) >= _CODEX_SNAPSHOT_WRITE_INTERVAL_S
             }
+            if urgent_credits:
+                sampled.update(key for key in components if key.startswith("credits:"))
             if not sampled or account_key in _codex_snapshot_inflight:
                 return
             _codex_snapshot_inflight.add(account_key)
@@ -399,11 +411,14 @@ def _maybe_auto_disable_by_headers(account_key: str, email: str,
 
 def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
                                           snap: dict) -> None:
-    """OpenAI 路径：primary/secondary used_percent 任一 ≥ 阈值 → 禁用。"""
+    """OpenAI window gate, with account-local credit opt-in and shared availability."""
     from . import oauth_manager
 
     acc = oauth_manager.get_account(account_key)
     if acc is None or acc.get("disabled_reason") not in (None, "quota"):
+        return
+
+    if oauth_manager.openai_credits_usable(account_key, snapshot=snap):
         return
 
     threshold = _get_quota_disable_threshold_pct()
@@ -423,6 +438,20 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
         over_threshold = True
         over_windows.append(f"secondary {secondary_pct:.0f}%")
     if not over_threshold:
+        # Credit-only depletion fragments must reapply a cached exhausted
+        # subscription gate immediately, before/independent of sample throttling.
+        if acc.get("allowCredits") is True and (snap.get("credits") or snap.get("rate_limit_reached_type")):
+            usage = oauth_manager.usage_from_quota_row(state_db.quota_load(account_key) or {})
+            block = usage["openai"]
+            times = block.setdefault("credits_observed_at", {})
+            observed = snap.get("fetched_at") or state_db.now_ms()
+            for key, value in (snap.get("credits") or {}).items():
+                if value is not None and observed >= times.get(key, 0):
+                    block["credits"][key] = value
+                    times[key] = observed
+            if snap.get("rate_limit_reached_type") is not None:
+                block["rate_limit_reached_type"] = snap["rate_limit_reached_type"]
+            oauth_manager.evaluate_and_toggle_by_usage(account_key, usage, fresh=False)
         return
 
     # 撞哪个窗口锁哪个窗口：只在实际超阈的窗口里取 reset_sec。

@@ -2182,7 +2182,9 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
         return {"action": "cached_below_threshold", "utils": utils,
                 "any_over": False, "hit_windows": [],
                 "disabled_until": None}
-    return evaluate_and_toggle_by_usage(account_key, usage, threshold=threshold)
+    return evaluate_and_toggle_by_usage(
+        account_key, usage, threshold=threshold, fresh=provider_of(account_key) != "openai",
+    )
 
 def _usage_has_any_quota_signal(usage: dict) -> bool:
     openai = usage.get("openai") or {}
@@ -2192,14 +2194,89 @@ def _usage_has_any_quota_signal(usage: dict) -> bool:
                 and isinstance(spend.get("reached"), bool)))
 
 
-def _explicit_openai_wham_limit(usage: dict) -> bool:
-    """Whether a WHAM response explicitly says routing is unavailable."""
+_OPENAI_CREDIT_HARD_LIMITS = frozenset({
+    "workspace_owner_credits_depleted", "workspace_member_credits_depleted",
+    "workspace_owner_usage_limit_reached", "workspace_member_usage_limit_reached",
+})
+
+
+def _openai_credit_hard_limit(usage: dict) -> bool:
+    block = usage.get("openai") or {}
+    return ((block.get("spend_control") or {}).get("reached") is True
+            or block.get("rate_limit_reached_type") in _OPENAI_CREDIT_HARD_LIMITS
+            or block.get("overage_limit_reached") is True
+            or (usage.get("extra_usage") or {}).get("overage_limit_reached") is True)
+
+
+def _openai_credits_available(block: dict) -> bool:
+    """Availability, not displayed balance or subscription tier, grants credit use."""
+    credits = block.get("credits") or {}
+    if credits.get("unlimited") is True:
+        return True
+    if credits.get("has_credits") is False:
+        return False
+    balance = credits.get("balance")
+    try:
+        balance = float(balance) if balance is not None and not isinstance(balance, bool) else None
+    except (ValueError, TypeError):
+        balance = None
+    if balance is not None and not math.isfinite(balance):
+        balance = None
+    times = block.get("credits_observed_at") or {}
+    # A newer zero/negative balance must win over an older availability flag;
+    # an older zero must not veto a newly replenished availability observation.
+    if balance is not None and balance <= 0 and times.get("balance", 0) >= times.get("has_credits", 0):
+        return False
+    return credits.get("has_credits") is True or (balance is not None and balance > 0)
+
+
+def openai_credits_usable(account_key: str, usage: dict | None = None,
+                          *, snapshot: dict | None = None) -> bool:
+    """Shared opt-in gate for WHAM, cached quota and response-header decisions.
+
+    Full reads need actual credit evidence. Sparse response headers may reuse
+    the cached fields, but never overwrite a newer observed field. This only
+    exempts subscription windows; actual request refusals remain independent.
+    """
+    acc = get_account(account_key)
+    if not acc or provider_of(acc) != "openai" or acc.get("allowCredits") is not True:
+        return False
+    row = state_db.quota_load(account_key) or {}
+    cached_usage = usage_from_quota_row(row)
+    cached = cached_usage.get("openai") or {}
+    block = dict((usage.get("openai") or {}) if usage is not None else cached)
+    credits = {k: v for k, v in (block.get("credits") or {}).items() if v is not None}
+    if usage is not None and not credits:
+        return False
+    now_ms = state_db.now_ms()
+    times = dict(block.get("credits_observed_at") or {})
+    for key in credits:
+        times.setdefault(key, now_ms if usage is not None else 0)
+    # A WHAM request can finish/save after a newer response observation.
+    for key, value in (cached.get("credits") or {}).items():
+        at = (cached.get("credits_observed_at") or {}).get(key, 0)
+        if value is not None and at > times.get(key, 0):
+            credits[key], times[key] = value, at
+    if snapshot is not None:
+        observed = _ms_timestamp(snapshot.get("fetched_at")) or now_ms
+        for key, value in (snapshot.get("credits") or {}).items():
+            if value is not None and observed >= times.get(key, 0):
+                credits[key], times[key] = value, observed
+        if snapshot.get("rate_limit_reached_type") is not None:
+            block["rate_limit_reached_type"] = snapshot["rate_limit_reached_type"]
+    block.update(credits=credits, credits_observed_at=times)
+    effective = {**(usage if usage is not None else cached_usage), "openai": block}
+    return not _openai_credit_hard_limit(effective) and _openai_credits_available(block)
+
+
+def _explicit_openai_wham_limit(usage: dict, *, allow_credits: bool = False) -> bool:
+    """Included-usage gates may be covered by credits; spend caps may not."""
     openai = usage.get("openai") if isinstance(usage, dict) else None
     if not isinstance(openai, dict) or openai.get("source") != "wham_usage":
         return False
-    spend = openai.get("spend_control")
-    return (openai.get("allowed") is False or openai.get("limit_reached") is True
-            or (isinstance(spend, dict) and spend.get("reached") is True))
+    return (_openai_credit_hard_limit(usage)
+            or (not allow_credits and
+                (openai.get("allowed") is False or openai.get("limit_reached") is True)))
 
 
 def openai_plan_workspace_label(acc: dict | None) -> str:
@@ -2527,7 +2604,7 @@ def _fresh_wham_window_utils(usage: dict | None) -> dict[str, float | None]:
 
 
 def _cached_openai_codex_quota_hit(account_key: str, threshold: float,
-                                    usage: dict | None = None) -> dict:
+                                    usage: dict | None = None, *, ignore_windows: bool = False) -> dict:
     """Return active Codex response-header quota hits cached for an OpenAI account.
 
     WHAM /usage and Codex response headers can disagree near reset boundaries.
@@ -2586,7 +2663,7 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float,
             hits.append(f"codex {limit_error.get('code') or 'usage_limit_reached'}")
             resets.append(_iso_from_ms(error_until))
 
-    for semantic, candidates in window_candidates.items():
+    for semantic, candidates in (() if ignore_windows else window_candidates.items()):
         for candidate in candidates:
             pct = candidate["pct"]
             if pct < threshold:
@@ -2978,7 +3055,8 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
 
     规则：
       • disabled_reason in ("user", "auth_error") → 完全不碰（手动禁用永远不自动恢复）
-      • 任一账号级窗口 util ≥ threshold → 需要禁用
+      • OpenAI 账号显式 allowCredits 且积分可用 → 豁免套餐窗口；真实请求拒绝和支出限制不豁免。
+      • 任一账号级窗口 util ≥ threshold → 需要禁用（上述积分豁免除外）
           - 账号已是 quota 禁用：保持不动（不刷新 disabled_until，避免目标移动）
           - 账号未禁用：set_disabled_by_quota，disabled_until = 撞到窗口的最大 reset
       • Claude Fable scoped 窗口只冷却该账号的 Fable 模型，不禁用整个账号
@@ -3070,10 +3148,13 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
             expected_quota_generation=expected_quota_generation,
         )
 
-    # WHAM's explicit gate is authoritative even when its percentage windows
-    # are absent or temporarily report a low number.  In particular, never turn
-    # "allowed: false" / "limit_reached: true" into quota recovery.
-    wham_limit = provider == "openai" and _explicit_openai_wham_limit(usage)
+    # Credit opt-in covers included-usage windows, not credit/spend caps or
+    # actual request refusals. No paid-plan/expiry check belongs in this gate.
+    use_credits = provider == "openai" and openai_credits_usable(account_key, usage)
+    if use_credits:
+        hit_windows = []
+        any_over = False
+    wham_limit = provider == "openai" and _explicit_openai_wham_limit(usage, allow_credits=use_credits)
     if wham_limit:
         spend = (usage.get("openai") or {}).get("spend_control") or {}
         hit_windows.append("Workspace spend limit" if spend.get("reached") is True else "WHAM limit")
@@ -3108,7 +3189,7 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
     cached_codex_hit = None
     if provider_of(account_key) == "openai":
         cached_codex_hit = _cached_openai_codex_quota_hit(
-            account_key, threshold, usage if fresh else None,
+            account_key, threshold, usage if fresh else None, ignore_windows=use_credits,
         )
         if cached_codex_hit.get("any_over"):
             any_over = True
@@ -3152,7 +3233,7 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
     # 活动的 Codex 超限快照，前面的 any_over 分支已经保持禁用；否则新鲜
     # WHAM 低用量应覆盖旧 disabled_until，因为后者只是上次超限时的预测。
     if reason == "quota":
-        if provider in ("openai", "claude"):
+        if provider in ("openai", "claude") and not use_credits:
             # quota_save preserves omitted windows. A low unrelated window (or
             # spend_control=false) cannot discharge a known weekly/monthly cap.
             row = state_db.quota_load(account_key) or {}
@@ -3166,7 +3247,7 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
                         "any_over": False, "hit_windows": [], "missing_windows": missing,
                         "disabled_until": acc.get("disabled_until")}
         if provider in ("openai", "claude", "xai"):
-            if not _usage_has_any_quota_signal(usage):
+            if not (_usage_has_any_quota_signal(usage) or use_credits):
                 return {"action": "quota_unknown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
@@ -3180,7 +3261,9 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
                     "disabled_until": acc.get("disabled_until"),
                     "error_code": "quota_observation_generation_invalid"}
         runtime_state = None
-        if provider == "openai" and fresh:
+        if provider == "openai" and fresh and not use_credits:
+            # Credit recovery only lifts the account's included-quota gate;
+            # it must not clear independent model entitlement/rate cooldowns.
             # Clear persistent/runtime routing blockers before enabling. The
             # cooldown clear itself is DB-first, so a failed delete leaves the
             # current process and a restarted process consistently blocked.
@@ -3665,6 +3748,9 @@ def _replace_exact_identity_in_config(
         from .openai.codex_identity import account_identity_from_account
 
         replacement.pop("codexDeviceConvergenceEnabled", None)
+        # Spending consent is local to this workspace, never a login default.
+        if "allowCredits" in current:
+            replacement["allowCredits"] = current["allowCredits"]
         for key in ("codexIdentity", "codexDeviceInstallationId"):
             if key not in entry and key in current:
                 replacement[key] = copy.deepcopy(current[key])
@@ -6671,7 +6757,8 @@ async def quota_monitor_once() -> dict:
         # Claude 仍沿用真实 usage API。
         fresh_for_resume = True
         if provider == "openai" and reason_before == "quota":
-            fresh_for_resume = _usage_has_any_quota_signal(usage)
+            fresh_for_resume = (_usage_has_any_quota_signal(usage)
+                                or openai_credits_usable(ak, usage))
 
         result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold, fresh=fresh_for_resume,
                                              expected_state_key=expected_state_key)

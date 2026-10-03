@@ -232,6 +232,28 @@ class OAuthControl(
         self.backend.update_max_concurrent(account_id, value)
         self._audit(context, "oauth.account.max-concurrent", account_id)
 
+    @audit_failures("oauth.account.allow-credits", target_arg="account_id")
+    def toggle_openai_credits(self, context: ManagementContext, account_id: str) -> dict:
+        """Toggle workspace-local spending consent, then re-evaluate quota."""
+        self._require(context, Capability.WRITE)
+        account = self._legacy_account(account_id)
+        if self.backend.provider_of(account) != "openai":
+            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+        allowed = account.get("allowCredits") is not True
+        result = self.backend.update_account_conditional(
+            self.backend.account_id(account), account, allow_credits=allowed,
+        )
+        self._raise_conditional_status(result)
+        if result.get("status") != "updated":
+            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+        self._audit(context, "oauth.account.allow-credits", account_id)
+        # Turning off applies the existing gate immediately, even if WHAM is
+        # unavailable. Turning on requires a fresh read before lifting a pause.
+        if not allowed:
+            self.backend.evaluate_cached_quota(account_id)
+        refreshed = self.refresh_usage_now(context, account_id)
+        return {**refreshed, "allowed": allowed}
+
     def reset_quota_now(self, context: ManagementContext, account_id: str) -> dict:
         self._require(context, Capability.DESTRUCTIVE)
         self._legacy_account(account_id)
