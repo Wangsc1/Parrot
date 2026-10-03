@@ -2116,11 +2116,14 @@ def usage_from_quota_row(row: dict) -> dict:
     passive_reached = row.get("codex_rate_limit_reached_type")
     active_reached = raw_openai.get("rate_limit_reached_type")
     reached_ms = row.get("codex_rate_limit_reached_at")
-    reached = (
-        passive_reached or active_reached
-        if (reached_ms if reached_ms is not None else passive_ms) >= active_ms
-        else active_reached or passive_reached
-    )
+    if (reached_ms if reached_ms is not None else passive_ms) >= active_ms:
+        reached = passive_reached or active_reached
+    elif "rate_limit_reached_type" in raw_openai:
+        # A newer official WHAM read is authoritative, including an explicit
+        # null: an older response-header refusal must not revive after reset.
+        reached = active_reached
+    else:
+        reached = passive_reached
 
     result = {
         "five_hour": _block(row.get("five_hour_util"), row.get("five_hour_reset")),
