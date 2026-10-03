@@ -736,7 +736,7 @@ def test_detail_fixed_rows_and_openai_reset_wording(account_config):
         ["管理模型", "🚦 并发上限"],
         ["🧹 清模型故障", "🔗 清亲和绑定"],
         ["⏸ 停用账户", "🗑 删除账户"],
-        ["♻️ 重置额度"],
+        ["♻️ 重置额度", "⬜ 允许使用积分"],
         ["🏠 主菜单", "◀ 返回列表"],
     ]
     manage = kb["inline_keyboard"][1][0]

@@ -11,7 +11,7 @@ from src.management_auth.principal import AuthMethod, Capability
 from src.management_control.context import ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 
-from .contracts import candidate_revision, credential_fingerprint, revision
+from .contracts import audit_failures, candidate_revision, credential_fingerprint, revision
 from .models import (
     CompleteOAuthLoginCommand,
     CreateOAuthAccountCommand,
@@ -43,6 +43,28 @@ class OAuthAccountMutationControlMixin:
             raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT)
         if status == "missing":
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+
+    @audit_failures("oauth.account.allow-credits", target_arg="account_id")
+    def toggle_openai_credits(self, context: ManagementContext, account_id: str) -> dict:
+        """Toggle workspace-local spending consent, then re-evaluate quota."""
+        self._require(context, Capability.WRITE)
+        account = self._legacy_account(account_id)
+        if self.backend.provider_of(account) != "openai":
+            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+        allowed = account.get("allowCredits") is not True
+        result = self.backend.update_account_conditional(
+            self.backend.account_id(account), account, allow_credits=allowed,
+        )
+        self._raise_conditional_status(result)
+        if result.get("status") != "updated":
+            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+        self._audit(context, "oauth.account.allow-credits", account_id)
+        # Turning off applies the existing gate immediately, even if WHAM is
+        # unavailable. Turning on requires a fresh read before lifting a pause.
+        if not allowed:
+            self.backend.evaluate_cached_quota(account_id)
+        refreshed = self.refresh_usage_now(context, account_id)
+        return {**refreshed, "allowed": allowed}
 
     def _replace_conflict(
         self,
