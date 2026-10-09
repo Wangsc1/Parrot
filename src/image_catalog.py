@@ -119,5 +119,8 @@ def models(cfg: dict | None = None, *, kind: str = 'image') -> set[str]:
     return {row.model for row in sources(cfg, kind=kind)} | {model for values in media_config.model_map(kind, cfg).values() for model in values}
 
 
-def available_models() -> list[str]:
-    return sorted({row.model for row in sources() if row.available and model_state.is_discovery_visible(row.model)})
+def available_models(*, api_key_name: str | None = None) -> list[str]:
+    from . import auth
+    return sorted({row.model for row in sources() if row.available
+                   and auth.channel_allowed(api_key_name, row.key)
+                   and model_state.is_discovery_visible(row.model)})
