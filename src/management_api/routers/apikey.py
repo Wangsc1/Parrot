@@ -222,6 +222,8 @@ def _key(value: ApiKeyView) -> ApiKeyData:
         allowMcp=value.allow_mcp,
         mcpTools=list(value.mcp_tools),
         allowedModels=list(value.allowed_models),
+        allowedChannels=list(value.allowed_channels),
+        channelBindingEnabled=value.channel_binding_enabled,
         limitOverride=override,
         limiter=_limiter(value.limiter),
         monthStats=_usage(value.month_stats),
@@ -395,6 +397,10 @@ def update_api_key(
         changes["mcp_tools"] = body.mcpTools
     if "allowedModels" in fields:
         changes["allowed_models"] = body.allowedModels
+    if "channelBindingEnabled" in fields:
+        changes["channel_binding_enabled"] = body.channelBindingEnabled
+    if "allowedChannels" in fields:
+        changes["allowed_channels"] = body.allowedChannels
     if "limitOverride" in fields:
         changes["limit_override"] = (
             None
