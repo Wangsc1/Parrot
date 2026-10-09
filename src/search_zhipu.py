@@ -128,6 +128,7 @@ def _parse(result, args, operation, cfg):
 async def adapter(backend, credential, args, operation, cfg):
     from .search_service import SearchError, _query_text
 
+    proxy_channel = ""
     if isinstance(credential, dict):
         from . import oauth_manager
         from .oauth_ids import account_key
@@ -139,6 +140,7 @@ async def adapter(backend, credential, args, operation, cfg):
             if not account or not account.get("model_key"):
                 raise SearchError("智谱账户缺少模型 Key", code="no_search_backend", retryable=False)
             origin, key = MODEL_ORIGINS[site_of(account)], account["model_key"]
+            proxy_channel = f"oauth:{account_key(account)}"
     else:
         origin, key = str(backend.get("endpoint") or MODEL_ORIGINS["bigmodel"]).rstrip("/"), credential
         if origin not in MODEL_ORIGINS.values():
@@ -162,7 +164,8 @@ async def adapter(backend, credential, args, operation, cfg):
                 "day": "oneDay", "week": "oneWeek", "month": "oneMonth", "year": "oneYear",
             }[args["freshness"]]
     async with network.async_client(timeout=httpx.Timeout(float(cfg["timeoutSeconds"])),
-                                    follow_redirects=False, proxy_purpose="oauth_zhipu") as client:
+                                    follow_redirects=False, proxy_purpose="oauth_zhipu",
+                                    proxy_channel=proxy_channel) as client:
         hello = await _rpc(client, url, headers, 1, "initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "parrot", "version": "1.0"},

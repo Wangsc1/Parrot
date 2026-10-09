@@ -240,7 +240,7 @@ def test_status_api_reports_failure_and_preserves_tg_fallback(actual_management,
     monkeypatch.setattr(status_monitor, "_active", {"claude": {}, "openai": copy.deepcopy(previous_active), "cloudflare": {}})
     monkeypatch.setattr(status_monitor.notifier, "notify_event", lambda *a, **kw: None)
 
-    def unavailable(url, *, timeout, headers):
+    def unavailable(url, *, timeout, headers, proxy_purpose=""):
         if "status.claude.com" in url:
             return httpx.Response(200, json={"incidents": []}, request=httpx.Request("GET", url))
         raise RuntimeError("synthetic status network failure")
@@ -301,7 +301,7 @@ def test_status_api_reports_failure_and_preserves_tg_fallback(actual_management,
     assert calls[-1][0] == "editMessageText" and "(空)" in calls[-1][1]["text"]
     config.update(lambda root: root["statusMonitor"].update({"targets": targets}))
 
-    def empty_feed(url, *, timeout, headers):
+    def empty_feed(url, *, timeout, headers, proxy_purpose=""):
         return httpx.Response(200, json={"incidents": []}, request=httpx.Request("GET", url))
 
     monkeypatch.setattr(status_monitor.network, "get_sync", empty_feed)

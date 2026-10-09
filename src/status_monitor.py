@@ -284,12 +284,14 @@ def get_active_summary() -> Optional[str]:
 # ─── HTTP fetch ──────────────────────────────────────────────────
 
 
-def _http_get_json(url: str, timeout: int = 15) -> Optional[dict]:
+def _http_get_json(url: str, timeout: int = 15, *,
+                   proxy_purpose: str = "") -> Optional[dict]:
     try:
         resp = network.get_sync(
             url,
             timeout=timeout,
             headers={"User-Agent": "parrot-status-monitor/0.1"},
+            proxy_purpose=proxy_purpose,
         )
         resp.raise_for_status()
         return resp.json()
@@ -302,7 +304,10 @@ def _fetch_incidents(provider: str) -> Optional[list[dict]]:
     base = _statuspage_base(provider)
     if not base:
         return None
-    data = _http_get_json(f"{base}/api/v2/incidents.json")
+    data = _http_get_json(
+        f"{base}/api/v2/incidents.json",
+        proxy_purpose={"claude": "oauth_anthropic", "openai": "oauth_openai"}.get(provider, ""),
+    )
     if not data:
         return None
     inc = data.get("incidents")

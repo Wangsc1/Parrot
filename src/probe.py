@@ -23,6 +23,7 @@ from . import channel_state, config, cooldown, network, quota_errors
 from .channel import registry
 from .channel.base import Channel
 from .protocols.terminal import non_stream_terminal_error
+from .proxy.routing_types import provider_for_channel
 
 
 ProgressCallback = Callable[[str], Awaitable[None]]
@@ -154,6 +155,7 @@ async def probe_channel_model(
         timeout=httpx.Timeout(timeout),
         proxy_channel=ch.key,
         proxy_model=model,
+        proxy_provider=provider_for_channel(ch),
     ) as client:
         try:
             resp = await asyncio.wait_for(
