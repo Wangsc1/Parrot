@@ -108,6 +108,8 @@ class ApiKeyView:
     # Compatibility-only privileged material. Management API adapters must never
     # request or serialize it; the frozen Telegram v0.31.13 renderer still does.
     secret: str | None = None
+    allowed_channels: tuple[str, ...] = ()
+    channel_binding_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
