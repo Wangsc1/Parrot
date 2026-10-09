@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import affinity, channel_state, concurrency, config, cooldown, fingerprint, load_balancing, model_state, quota_errors, scorer
+from . import auth, affinity, channel_state, concurrency, config, cooldown, fingerprint, load_balancing, model_state, quota_errors, scorer
 from .channel import registry
 from .channel.base import Channel
 from .protocols.matrix import (
@@ -81,6 +81,7 @@ def _filter_candidates(requested_model: str,
                        diagnostics: Optional[list[dict]] = None,
                        bound_channel_key: Optional[str] = None,
                        portable_body: Optional[dict] = None,
+                       api_key_name: Optional[str] = None,
                        ) -> tuple[list[tuple[Channel, str]], list[tuple[Channel, str]], dict[tuple[str, str], RoutePlan], list[str]]:
     """返回 (available, saturated, route_plans)：
        available = 可立即尝试的候选；
@@ -104,6 +105,9 @@ def _filter_candidates(requested_model: str,
         excluded.append({"channel": None, "reason": "global_model_disabled"})
         return available, saturated, route_plans, guard_errors
     for ch in registry.all_channels():
+        if not auth.channel_allowed(api_key_name, ch.key):
+            excluded.append({"channel": ch.key, "reason": "api_key_channel_denied"})
+            continue
         resolved = ch.supports_model(requested_model)
         if resolved is None:
             continue
@@ -274,6 +278,7 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
         diagnostics=exclusions,
         bound_channel_key=bound_channel_key,
         portable_body=portable_body,
+        api_key_name=api_key_name,
     )
     if compaction_refs:
         eligible_channels = [ch for ch, _ in candidates + saturated]

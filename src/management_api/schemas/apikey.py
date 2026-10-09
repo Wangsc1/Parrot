@@ -81,6 +81,8 @@ class ApiKeyData(StrictSchema):
     allowMcp: bool
     mcpTools: list[McpToolName]
     allowedModels: list[str]
+    allowedChannels: list[str] = Field(default_factory=list)
+    channelBindingEnabled: bool = False
     limitOverride: ApiKeyLimitOverrideData | None
     limiter: ApiKeyLimiterData
     monthStats: ApiKeyUsageData
@@ -153,13 +155,15 @@ class ApiKeyUpdateRequest(StrictSchema):
     allowMcp: bool | None = None
     mcpTools: list[McpToolName] | None = None
     allowedModels: list[ModelId] | None = None
+    allowedChannels: list[str] | None = None
+    channelBindingEnabled: bool | None = None
     limitOverride: ApiKeyLimitOverridePatch | None = None
 
     @model_validator(mode="after")
     def require_change(self):
         if not self.model_fields_set:
             raise ValueError("at least one field is required")
-        nullable = {"enabled", "allowImages", "allowVideos", "allowMcp", "mcpTools", "allowedModels"}
+        nullable = {"enabled", "allowImages", "allowVideos", "allowMcp", "mcpTools", "allowedModels", "allowedChannels", "channelBindingEnabled"}
         for field in self.model_fields_set & nullable:
             if getattr(self, field) is None:
                 raise ValueError(f"{field} must not be null")

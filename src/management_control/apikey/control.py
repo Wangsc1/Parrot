@@ -347,11 +347,13 @@ class ApiKeyControl:
     ) -> ApiKeyView:
         self._require(context, Capability.WRITE)
         known = {"enabled", "allow_images", "allow_videos", "allow_mcp", "mcp_tools",
-                 "allowed_models", "limit_override"}
+                 "allowed_models", "allowed_channels", "channel_binding_enabled", "limit_override"}
         unknown = set(changes) - known
         if unknown or not changes:
             path = sorted(unknown)[0] if unknown else "body"
             raise self._validation(path, "UNKNOWN_FIELD" if unknown else "EMPTY_UPDATE", "invalid update fields")
+        if "channel_binding_enabled" in changes and not isinstance(changes["channel_binding_enabled"], bool):
+            raise self._validation("channelBindingEnabled", "INVALID_TYPE", "channelBindingEnabled must be a boolean")
         allowed_models = changes.get("allowed_models")
         if "mcp_tools" in changes:
             self._validate_mcp_tools(changes["mcp_tools"])
@@ -372,6 +374,9 @@ class ApiKeyControl:
                 self._validate_allowed_models(
                     allowed_models, retained=entry.get("allowedModels") or (),
                 )
+            if "allowed_channels" in changes:
+                self._validate_allowed_channels(changes["allowed_channels"],
+                                                retained=entry.get("allowedChannels") or ())
             keys[key_id] = entry
             if "enabled" in changes:
                 entry["enabled"] = bool(changes["enabled"])
@@ -385,6 +390,12 @@ class ApiKeyControl:
                 entry["mcpTools"] = [str(item) for item in (changes["mcp_tools"] or ())]
             if "allowed_models" in changes:
                 entry["allowedModels"] = list(changes["allowed_models"] or ())
+            if "allowed_channels" in changes:
+                entry["allowedChannels"] = list(changes["allowed_channels"])
+            if "channel_binding_enabled" in changes:
+                entry["channelBindingEnabled"] = changes["channel_binding_enabled"]
+            if entry.get("channelBindingEnabled") is True and not entry.get("allowedChannels"):
+                raise self._validation("allowedChannels", "EMPTY_BINDING", "select at least one channel before enabling binding")
             if limit_change is None:
                 entry.pop("limits", None)
             elif isinstance(limit_change, Mapping):
@@ -714,6 +725,8 @@ class ApiKeyControl:
                 str(item) for item in (entry.get("mcpTools") or ()) if isinstance(item, str)
             ),
             allowed_models=tuple(entry.get("allowedModels") or ()),
+            allowed_channels=tuple(entry.get("allowedChannels") or ()),
+            channel_binding_enabled=entry.get("channelBindingEnabled", bool(entry.get("allowedChannels"))) is True,
             limit_override=override,
             limiter=self._limiter_snapshot(name),
             month_stats=self._usage(stats),
@@ -854,6 +867,21 @@ class ApiKeyControl:
             if model not in available:
                 raise self._validation(f"allowedModels[{index}]", "UNKNOWN_MODEL", "model is not currently available")
             seen.add(model)
+
+    def _validate_allowed_channels(self, values: Any, *, retained=()) -> None:
+        if not isinstance(values, (list, tuple)):
+            raise self._validation("allowedChannels", "INVALID_TYPE", "allowedChannels must be an array")
+        available = {ch.key for ch in registry.all_channels()} | set(retained)
+        seen = set()
+        for index, value in enumerate(values):
+            path = f"allowedChannels[{index}]"
+            if not isinstance(value, str) or not value.strip():
+                raise self._validation(path, "EMPTY_CHANNEL", "channel ID must not be empty")
+            if value in seen:
+                raise self._validation(path, "DUPLICATE_CHANNEL", "channel is duplicated")
+            if value not in available:
+                raise self._validation(path, "UNKNOWN_CHANNEL", "channel ID is not currently registered")
+            seen.add(value)
 
     def _validate_mcp_tools(self, values: Any) -> None:
         """校验该 Key 选用的 MCP 工具名。空列表 = 跟随全局开关。"""

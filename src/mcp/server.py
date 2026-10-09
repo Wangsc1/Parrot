@@ -572,6 +572,7 @@ async def _publish_video(request_id: str, upstream_url: str, *, key_name: Option
     channel = registry.get_channel(str(binding.get("channel_key") or ""))
     model = str(binding.get("model") or "")
     if (not isinstance(channel, XAIOAuthChannel)
+            or not auth.channel_allowed(key_name, str(binding.get("channel_key") or ""))
             or not channel.supports_media_model("video", model)
             or (binding.get("state_key") and binding["state_key"] != channel.state_key)):
         return None

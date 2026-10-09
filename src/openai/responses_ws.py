@@ -3497,6 +3497,17 @@ async def _receive_next_response_create(
                 param="type",
             )
             continue
+        # A new turn must honor live grants even when it reuses an upstream
+        # WS or Codex HTTP fallback session. Do not migrate its state to another
+        # channel, and do not interrupt the already-started preceding turn.
+        if channel is not None and not auth.channel_allowed(api_key_name, channel.key):
+            await _send_request_invalid_error_frame(
+                websocket,
+                "the active upstream channel is no longer allowed for this API key",
+                code="permission_denied",
+                status=403,
+            )
+            continue
         body = _request_body_from_ws_create(obj)
         body.pop("_parrot_search_round", None)
         body.pop("_parrot_search_original_tools", None)

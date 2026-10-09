@@ -78,6 +78,36 @@ def api_key_entry(key_name: Optional[str]) -> Optional[dict]:
     return entry if isinstance(entry, dict) else None
 
 
+def allowed_channels(key_name: Optional[str], *, cfg: Optional[dict] = None) -> Optional[frozenset[str]]:
+    """Exact source IDs permitted by this key; None means the legacy shared pool.
+
+    Missing/empty arrays preserve existing behavior unless explicitly enabled.
+    An explicit false switch retains the selection but uses the shared pool. A malformed nonempty
+    binding fails closed, as does a binding to a removed account. Never resolve
+    these IDs by model family, display name, affinity or provider prefix.
+    """
+    cfg = config.get() if cfg is None else cfg
+    entry = (cfg.get("apiKeys") or {}).get(key_name)
+    if not isinstance(entry, dict):
+        return None
+    enabled = entry.get("channelBindingEnabled")
+    if enabled is False:
+        return None
+    if "channelBindingEnabled" in entry and not isinstance(enabled, bool):
+        return frozenset()
+    raw = entry.get("allowedChannels", [])
+    if isinstance(raw, list) and not raw and enabled is not True:
+        return None
+    if not isinstance(raw, list) or any(not isinstance(v, str) or not v.strip() for v in raw):
+        return frozenset()
+    return frozenset(raw)
+
+
+def channel_allowed(key_name: Optional[str], channel_key: str, *, cfg: Optional[dict] = None) -> bool:
+    selected = allowed_channels(key_name, cfg=cfg)
+    return selected is None or channel_key in selected
+
+
 def mcp_allowed(key_name: Optional[str]) -> bool:
     """该 Key 是否允许访问 MCP 服务。默认 False，需显式开启。"""
     entry = api_key_entry(key_name)

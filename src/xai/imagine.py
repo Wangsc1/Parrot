@@ -524,9 +524,11 @@ def _permission_error(message: str) -> Response:
     )
 
 
-def _eligible_channels(kind: str, model: str) -> list[XAIOAuthChannel]:
+def _eligible_channels(kind: str, model: str, *, api_key_name: str | None = None) -> list[XAIOAuthChannel]:
     candidates: list[tuple[XAIOAuthChannel, str]] = []
     for channel in registry.all_channels():
+        if not auth.channel_allowed(api_key_name, channel.key):
+            continue
         if not isinstance(channel, XAIOAuthChannel):
             continue
         if not channel.supports_media_model(kind, model):
@@ -585,9 +587,10 @@ async def _post_with_safe_failover(
     model: str,
     path: str,
     payload: dict[str, Any],
+    api_key_name: str | None = None,
 ) -> _PostResult | Response:
     """POST once per explicitly rejecting account; never retry ambiguous I/O."""
-    candidates = _eligible_channels(kind, model)
+    candidates = _eligible_channels(kind, model, api_key_name=api_key_name)
     if not candidates:
         return errors.json_error_openai(
             503,
@@ -759,6 +762,7 @@ async def handle_image(
     started = time.monotonic()
     result = await _post_with_safe_failover(
         kind="image",
+        api_key_name=key_name,
         model=model,
         path=path,
         payload=payload,
@@ -945,6 +949,7 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
         started = time.monotonic()
         result = await _post_with_safe_failover(
             kind="video",
+            api_key_name=key_name,
             model=model,
             path=path,
             payload=payload,
@@ -1089,6 +1094,7 @@ async def handle_video_result(request: Request, request_id: str) -> Response:
 
     channel = registry.get_channel(str(binding.get("channel_key") or ""))
     if (not isinstance(channel, XAIOAuthChannel)
+            or not auth.channel_allowed(key_name, str(binding.get("channel_key") or ""))
             or not channel.supports_media_model('video', str(binding.get('model') or ''))
             or (binding.get('state_key') and binding['state_key'] != channel.state_key)):
         await _update_video_log(

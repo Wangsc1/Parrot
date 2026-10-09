@@ -255,6 +255,11 @@ def media_sources(kind: str, key_name: str | None = None) -> list[str]:
     entry = auth.api_key_entry(key_name)
     if not entry or entry.get("enabled") is False:
         return []
+    if auth.allowed_channels(key_name) is not None:
+        from .. import image_catalog
+        permitted = {source.model for source in image_catalog.sources(kind=kind)
+                     if source.available and auth.channel_allowed(key_name, source.key)}
+        options = [model for model in options if model in permitted]
     allowed = set(model_names.expand_legacy_permissions(list(entry.get("allowedModels") or [])))
     if not allowed:
         return options

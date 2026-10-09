@@ -84,6 +84,10 @@ def _control_context(chat_id: int = 0) -> ManagementContext:
     )
 
 
+def view_binding_enabled(entry: dict) -> bool:
+    return entry.get("channelBindingEnabled", bool(entry.get("allowedChannels"))) is True
+
+
 def _entry_from_view(view) -> dict:
     entry = {
         "key": view.secret or "",
@@ -94,6 +98,9 @@ def _entry_from_view(view) -> dict:
         "allowMcp": view.allow_mcp,
         "mcpTools": list(view.mcp_tools),
     }
+    if view.allowed_channels:
+        entry["allowedChannels"] = list(view.allowed_channels)
+        entry["channelBindingEnabled"] = view.channel_binding_enabled
     if view.limit_override is not None:
         limits = {}
         for key, value in (
@@ -668,6 +675,11 @@ def _render_detail(name: str, page: int = 1, *,
         f"🎬 视频接口: <code>{'允许' if video else '禁止（默认）'}</code>",
         f"🚦 Key 限流: <code>{ui.escape_html(_limit_brief(name))}</code>",
     ]
+    if entry.get("allowedChannels"):
+        lines.append(("🔗 绑定渠道: " if view_binding_enabled(entry) else "🔗 已选渠道（绑定关闭）: ") + ", ".join(
+            f"<code>{ui.escape_html(str(source))}</code>"
+            for source in entry["allowedChannels"]
+        ))
     if allowed:
         for m in allowed:
             lines.append(f"    • <code>{ui.escape_html(m)}</code>")
