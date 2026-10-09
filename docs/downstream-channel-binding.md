@@ -12,8 +12,13 @@ to the shared pool. Multiple IDs permit failover only between those sources.
 
 The management API accepts `allowedChannels` in API-key updates and returns it
 in key views. It rejects newly added unknown, duplicate and empty IDs. Existing
-bindings to unavailable/deleted sources may be retained; clear explicitly with
-`[]` to restore the shared pool. API-key secrets remain masked in management views.
+bindings to unavailable/deleted sources may be retained. While
+`channelBindingEnabled` is explicitly `true`, setting `allowedChannels` to `[]`
+is rejected. Send `{"channelBindingEnabled": false}` to restore the shared pool
+while keeping the selected IDs. To also discard the selection, send
+`{"allowedChannels": [], "channelBindingEnabled": false}`. Without an explicit
+switch, an empty selection retains the legacy shared-pool behavior.
+API-key secrets remain masked in management views.
 
 `/v1/models` intersects source-bound discovery with the existing `allowedModels`
 grants. Text Messages, Chat, Responses (HTTP/WS), Realtime, images and video
@@ -25,6 +30,10 @@ A Cursor-bound key can expose Claude, GPT, Gemini and Grok names unchanged.
 The same model ID may appear in each independent OpenBear provider. OAuth token
 refresh does not change the binding. Account deletion/identity changes require
 an explicit rebind. This feature does not revoke already-running requests.
+Each subsequent Responses WebSocket `response.create` rechecks the current key
+binding, including Codex HTTP fallback sessions. If the fixed channel is no
+longer allowed, that new request is rejected; the stateful session is not moved
+to another channel.
 
 ## Manual enable/disable
 
