@@ -9,7 +9,7 @@ import uuid
 from urllib.parse import urlsplit, urlunsplit
 import httpx
 from fastapi.responses import JSONResponse
-from .. import channel_state, concurrency, config, cooldown, image_artifacts, image_catalog, load_balancing, media_cache, network, oauth_manager, scorer
+from .. import auth, channel_state, concurrency, config, cooldown, image_artifacts, image_catalog, load_balancing, media_cache, network, oauth_manager, scorer
 from ..antigravity import images as antigravity_images
 from ..channel import registry
 from ..async_owned import await_owned
@@ -188,7 +188,9 @@ async def _send(source, parsed, *, action: str, n: int, cfg: dict) -> httpx.Resp
 
 
 async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> JSONResponse:
-    sources = [s for s in image_catalog.sources() if s.model == parsed.model and s.available and not cooldown.is_blocked(channel_state.effect_key(s), s.upstream)]
+    sources = [s for s in image_catalog.sources() if s.model == parsed.model and s.available
+               and auth.channel_allowed(key_name, s.key)
+               and not cooldown.is_blocked(channel_state.effect_key(s), s.upstream)]
     if not sources:
         return JSONResponse({'error': {'message': 'no available image source for this model', 'type':'model_not_available'}}, status_code=503)
     pairs = [(registry.get_channel(s.key), s.upstream) for s in sources]

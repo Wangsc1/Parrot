@@ -179,11 +179,13 @@ async def _build_realtime_headers(
     return headers
 
 
-def _eligible_oauth_channels(model: str | None) -> list[OpenAIOAuthChannel]:
+def _eligible_oauth_channels(model: str | None, *, api_key_name: str | None = None) -> list[OpenAIOAuthChannel]:
     """Choose from the existing OpenAI OAuth pool without treating realtime as Responses."""
     candidates: list[tuple[OpenAIOAuthChannel, str]] = []
     marker = _route_model(model)
     for channel in registry.all_channels():
+        if not auth.channel_allowed(api_key_name, channel.key):
+            continue
         if not isinstance(channel, OpenAIOAuthChannel):
             continue
         if not channel.enabled or channel.disabled_reason:
@@ -404,6 +406,8 @@ async def _resolve_bound_channel(
         return None, None, "realtime call_id belongs to a different API key"
 
     channel = registry.get_channel(binding.channel_key)
+    if not auth.channel_allowed(api_key_name, binding.channel_key):
+        return None, None, "realtime call account is no longer allowed for this API key"
     if not isinstance(channel, OpenAIOAuthChannel):
         return None, None, "realtime call OAuth account is no longer available"
     if not channel.enabled or channel.disabled_reason:
@@ -448,7 +452,7 @@ async def handle_realtime_ws(
         if not _model_allowed(model, allowed_models):
             await _reject_ws(websocket, 4403, "model is not allowed for this API key")
             return
-        candidates = _eligible_oauth_channels(model)
+        candidates = _eligible_oauth_channels(model, api_key_name=key_name)
 
     key_lease = None
     channel_acquired = False
@@ -552,7 +556,7 @@ async def handle_realtime_call(request: Request) -> Response:
             "model is not allowed for this API key",
         )
 
-    channel = await _acquire_first_available(_eligible_oauth_channels(model))
+    channel = await _acquire_first_available(_eligible_oauth_channels(model, api_key_name=key_name))
     if channel is None:
         return errors.json_error_openai(
             503,
