@@ -1066,10 +1066,13 @@ async def list_models(request: Request):
         return errors.json_error_response(401, errors.ErrType.AUTH, err)
 
     from src import image_catalog
-    image_models = image_catalog.available_models() if auth.images_allowed(key_name) else []
+    scoped = auth.allowed_channels(key_name) is not None
+    image_models = (image_catalog.available_models(api_key_name=key_name) if scoped
+                    else image_catalog.available_models()) if auth.images_allowed(key_name) else []
+    text_models = registry.available_models(api_key_name=key_name) if scoped else registry.available_models()
     known_image_models = image_catalog.models()
     all_models = sorted({
-        model for model in registry.available_models() + image_models
+        model for model in text_models + image_models
         if model_state.is_discovery_visible(model)
         and (model not in known_image_models or model in image_models)
     })
