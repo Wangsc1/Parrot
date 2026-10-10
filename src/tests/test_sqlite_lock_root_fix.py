@@ -1643,6 +1643,7 @@ async def test_delete_cancels_pre_acquire_waiter_and_rejects_disabled_limit_path
         cfg["concurrency"]["defaultMaxConcurrent"] = 1
 
     config.update(seed)
+    state_db.init()
     registry.rebuild_from_config()
     old_generation = channel_state.effect_key(registry.get_channel(key))
     assert await concurrency.try_acquire(old_generation)
@@ -1713,6 +1714,7 @@ async def test_rename_still_allows_old_generation_waiter_to_drain():
         cfg["concurrency"]["defaultMaxConcurrent"] = 1
 
     config.update(seed)
+    state_db.init()
     registry.rebuild_from_config()
     assert await concurrency.try_acquire(old_key)
     waiter = asyncio.create_task(

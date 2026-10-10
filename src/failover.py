@@ -2000,6 +2000,7 @@ class _PendingStreamResponseOwner:
 
 def _set_pending_stream_owner(result: AttemptResult, abort_callback) -> AttemptResult:
     result._pending_stream_owner = _PendingStreamResponseOwner(abort_callback)
+    result.response._parrot_abort_unconsumed_stream = abort_callback
     return result
 
 
@@ -2818,6 +2819,14 @@ def _attach_release_to_response(response: Response, release_fn) -> None:
             pass
         return
     original = response.body_iterator
+    abort_unconsumed = getattr(response, "_parrot_abort_unconsumed_stream", None)
+    if abort_unconsumed is not None:
+        async def _abort_unconsumed():
+            try:
+                await await_ws_owned(abort_unconsumed())
+            finally:
+                release_fn()
+        response._parrot_abort_unconsumed_stream = _abort_unconsumed
 
     async def _wrapped():
         try:

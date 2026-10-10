@@ -33,6 +33,7 @@ from .base import metadata_from_response
 from .fingerprint import create_impersonated_client, supports_route as fingerprint_supports_route
 from .http import HttpStreamRequest, open_stream
 from .policy import proxy_byte_snapshot, proxy_route_kwargs
+from .precommit_sse import notify_buffered_response_start
 from .timing import (
     BusinessTimeoutError,
     HttpAttemptTiming,
@@ -782,6 +783,14 @@ async def _read_until_first_downstream_chunk(
             return [], repetition_error
         builder.feed(restored)
         result = commit_gate.feed(restored)
+        if (
+            protocol == "openai-responses"
+            and getattr(channel, "protocol", "anthropic") == "anthropic"
+            and result.error_event is None
+            and not result.downstream_chunks
+            and commit_gate.has_buffered_metadata
+        ):
+            notify_buffered_response_start()
         upstream.observe_downstream_error(tracker, result.downstream_chunks)
         return result.downstream_chunks, result.error_event
 

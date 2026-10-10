@@ -97,6 +97,11 @@ class SseCommitGate:
             return CommitGateFeedResult(downstream_chunks, None)
         return CommitGateFeedResult([], None)
 
+    @property
+    def has_buffered_metadata(self) -> bool:
+        """Metadata is available, but the output/failover boundary is unchanged."""
+        return bool(self._buffered_downstream_chunks)
+
     def _feed_downstream_event(self, event_bytes: bytes) -> list[bytes]:
         if self.stream_translator is not None:
             return list(self.stream_translator.feed(event_bytes))

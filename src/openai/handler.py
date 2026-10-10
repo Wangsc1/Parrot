@@ -38,6 +38,7 @@ from .. import (
 )
 from ..client_ip import get_client_ip
 from ..channel import registry
+from ..transports.precommit_sse import run_with_keepalive
 from ..transform.cc_mimicry import (
     PARROT_DOWNSTREAM_BETAS_KEY,
     PARROT_CC_SESSION_ID_KEY,
@@ -717,26 +718,32 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     body = await translation.translate_body(body, ingress_protocol=ingress_protocol, route=result)
 
     # 7. failover
-    try:
-        response = await failover.run_failover(
-            result, body, request_id, key_name or "", client_ip,
-            is_stream=is_stream, start_time=start_time,
-            ingress_protocol=ingress_protocol,
-            start_monotonic=start_monotonic,
-        )
-    except Exception as exc:
-        traceback.print_exc()
-        total_ms = int((time.monotonic() - start_monotonic) * 1000)
-        await asyncio.to_thread(
-            log_db.finish_error, request_id, f"unexpected: {exc}", 0,
-            http_status=500, total_ms=total_ms,
-            affinity_hit=(1 if result.affinity_hit else 0),
-        )
-        return errors.json_error_openai(
-            500, errors.ErrTypeOpenAI.SERVER, f"internal: {exc}",
-        )
+    async def invoke_failover():
+        try:
+            return await failover.run_failover(
+                result, body, request_id, key_name or "", client_ip,
+                is_stream=is_stream, start_time=start_time,
+                ingress_protocol=ingress_protocol,
+                start_monotonic=start_monotonic,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            total_ms = int((time.monotonic() - start_monotonic) * 1000)
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, f"unexpected: {exc}", 0,
+                http_status=500, total_ms=total_ms,
+                affinity_hit=(1 if result.affinity_hit else 0),
+            )
+            return errors.json_error_openai(
+                500, errors.ErrTypeOpenAI.SERVER, f"internal: {exc}",
+            )
 
-    return response
+    if ingress_protocol == "responses" and is_stream and any(
+        getattr(channel, "protocol", "anthropic") == "anthropic"
+        for channel, _model in list(result.candidates) + list(result.saturated)
+    ):
+        return await run_with_keepalive(invoke_failover)
+    return await invoke_failover()
 
 
 def _model_never_supported(model: str) -> bool:
